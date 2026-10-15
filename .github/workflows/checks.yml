@@ -1,0 +1,235 @@
+# checks.yml — the repository's checks on every push: the process guards, lint, the five gates of CLAUDE.md.
+#
+# Checks only. Nothing is built for anyone, deployed, published or uploaded: no Pages, no artifacts, no secrets, no cache of
+# anything but pip wheels. Every test runs on the tiny stack and synthetic data; no MIMIC-derived byte is needed or fetched (R7).
+#
+#   guards    the push itself: only main is pushed; every pushed commit passes scripts/check_no_restricted_files.sh (the
+#             pre-commit hook), adds no local-only file and carries the noreply identity and no Co-Authored-By: Claude line;
+#             the whole tree passes the hook; the job wrappers carry @SLURM_*@ placeholders, never site values; checks.yml is
+#             the only workflow
+#   lint      flake8's fatal set (syntax errors, undefined names), bash -n over every tracked script, JSON and YAML parse
+#   validate  bash scripts/validate.sh (Hydra invariants, pytest -m "not cuda and not slow", node --test, model smoke)
+#   browser   tests/e2e, then the layout, browser and features checks, in the runner's Google Chrome
+name: Checks
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  guards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Only main is pushed
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "::error::only main is pushed to this repository, not ${GITHUB_REF#refs/heads/}"; exit 1; }
+
+      - name: Pushed commits and the tree (hook, local-only files, identity, placeholders, workflows)
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          NOREPLY="233544217+krishankb-de@users.noreply.github.com"
+          check="$RUNNER_TEMP/check_no_restricted_files.sh"
+          cp scripts/check_no_restricted_files.sh "$check"   # the head's hook, whatever HEAD points at below
+          head="$(git rev-parse HEAD)"
+          # The commits this push added; all of them on a first push, a force push or a manual run.
+          if [[ -n "${BEFORE:-}" && ! "$BEFORE" =~ ^0+$ ]] && git merge-base --is-ancestor "$BEFORE" "$head" 2>/dev/null; then
+            range="$BEFORE..$head"
+          else
+            range="$head"
+          fi
+          # Paths that stay on the laptop (CLAUDE.md, .gitignore); .claude/settings.json is the shared project settings file.
+          local_only() {
+            grep -E '^(\.local/|\.staging/|CLAUDE\.local\.md$|scripts/chat_cluster\.env$|\.sync_stamp$|venv/|\.venv/|graphify-out/|node_modules/|\.claude/)|(^|/)\.?physionet_session$' \
+              | grep -v -x -F '.claude/settings.json' || true
+          }
+          # HEAD = the commit's parent (unborn for a root commit) and the index = the commit: the hook then sees what committing it
+          # staged. The working tree is not touched, so the hook and this script stay the head's.
+          stage() {
+            local parent
+            if parent="$(git rev-parse -q --verify "$1^")"; then git update-ref --no-deref HEAD "$parent"
+            else git symbolic-ref HEAD refs/heads/ci-unborn; fi
+            git read-tree "$1"
+          }
+          fail=0
+          n=0
+          for c in $(git rev-list --reverse "$range"); do
+            n=$((n + 1)); s="${c:0:7}"
+            stage "$c"
+            bash "$check" || { echo "::error::$s stages a restricted (MIMIC-derived or binary) file"; fail=1; }
+            hits="$(git diff --cached --name-only --diff-filter=ACMRT --no-relative | local_only)"
+            [[ -z "$hits" ]] || { echo "::error::$s commits local-only files:"; echo "$hits"; fail=1; }
+            [[ "$(git log -1 --format=%ae "$c")" == "$NOREPLY" ]] || { echo "::error::$s: the author is not the noreply address"; fail=1; }
+            ce="$(git log -1 --format=%ce "$c")"
+            [[ "$ce" == "$NOREPLY" || "$ce" == noreply@github.com ]] || { echo "::error::$s: the committer is not the noreply address"; fail=1; }
+            msg="$(git log -1 --format=%B "$c")"
+            if grep -qiE '^co-authored-by:.*(claude|anthropic)' <<<"$msg"; then
+              echo "::error::$s carries a Co-Authored-By: Claude line"; fail=1
+            fi
+          done
+          echo "commits checked: $n ($range)"
+          # The whole tree, as if committed at once.
+          git symbolic-ref HEAD refs/heads/ci-unborn
+          git read-tree "$head"
+          bash "$check" || { echo "::error::the tree holds a restricted (MIMIC-derived or binary) file"; fail=1; }
+          git update-ref --no-deref HEAD "$head"
+          git read-tree "$head"
+          hits="$(git ls-files | local_only)"
+          [[ -z "$hits" ]] || { echo "::error::the tree holds local-only files:"; echo "$hits"; fail=1; }
+          # Site values live in the private scripts/chat_cluster.env; only the file names are printed, never a value.
+          site="$(git ls-files -z '*.sh' | xargs -0 awk '/^#SBATCH --(partition|account|qos|exclude)=/ && !/^#SBATCH --[a-z]+=@SLURM_[A-Z_]+@/ { print FILENAME; nextfile }')"
+          [[ -z "$site" ]] || { echo "::error::job wrappers with a site value instead of an @SLURM_*@ placeholder:"; echo "$site"; fail=1; }
+          workflows="$(git ls-files .github/workflows)"
+          [[ "$workflows" == .github/workflows/checks.yml ]] || { echo "::error::checks.yml is the only workflow (no deployment):"; echo "$workflows"; fail=1; }
+          exit "$fail"
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.14.3"
+      - run: python -m pip install flake8==7.3.0 PyYAML==6.0.3
+
+      - name: flake8 (syntax errors, undefined names)
+        run: python -m flake8 --count --select=E9,F63,F7,F82 --show-source --statistics app hybrid_xmamba scripts tests setup.py
+
+      - name: bash -n (every tracked shell script)
+        if: ${{ !cancelled() }}
+        run: |
+          fail=0
+          while IFS= read -r -d '' f; do bash -n "$f" || { echo "::error file=$f::bash -n failed"; fail=1; }; done < <(git ls-files -z '*.sh')
+          exit "$fail"
+
+      - name: JSON and YAML parse
+        if: ${{ !cancelled() }}
+        run: |
+          python - <<'EOF'
+          import json, subprocess, sys
+          import yaml
+          bad = 0
+          for path in subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True).stdout.splitlines():
+              try:
+                  if path.endswith(".json"):
+                      json.load(open(path, encoding="utf-8"))
+                  elif path.endswith((".yaml", ".yml")):
+                      list(yaml.safe_load_all(open(path, encoding="utf-8")))
+              except Exception as exc:
+                  print("::error file={}::{}".format(path, type(exc).__name__))
+                  bad += 1
+          sys.exit(1 if bad else 0)
+          EOF
+
+  validate:
+    needs: [guards, lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.14.3"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements_eval.txt
+            app/requirements.txt
+            requirements-e2e.txt
+            setup.py
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install (CLAUDE.md; torch from the CPU index)
+        run: |
+          git config --global user.name "checks"
+          git config --global user.email "checks@example.invalid"
+          printf 'torch==2.11.0\ntorchvision==0.26.0\n' > "$RUNNER_TEMP/constraints.txt"
+          python -m venv venv
+          venv/bin/pip install --upgrade pip
+          venv/bin/pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu
+          venv/bin/pip install -c "$RUNNER_TEMP/constraints.txt" -r requirements.txt -r requirements_eval.txt -r app/requirements.txt -r requirements-e2e.txt
+          venv/bin/pip install -c "$RUNNER_TEMP/constraints.txt" -e .
+
+      - name: bash scripts/validate.sh
+        run: |
+          bash scripts/validate.sh 2>&1 | tee "$RUNNER_TEMP/validate.log"
+          grep -q 'node: frontend tests passed' "$RUNNER_TEMP/validate.log" || { echo "::error::the node gate did not run"; exit 1; }
+
+  browser:
+    needs: [guards, lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.14.3"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements_eval.txt
+            app/requirements.txt
+            requirements-e2e.txt
+            setup.py
+
+      - name: Install (CLAUDE.md; torch from the CPU index)
+        id: install
+        run: |
+          git config --global user.name "checks"
+          git config --global user.email "checks@example.invalid"
+          printf 'torch==2.11.0\ntorchvision==0.26.0\n' > "$RUNNER_TEMP/constraints.txt"
+          python -m venv venv
+          venv/bin/pip install --upgrade pip
+          venv/bin/pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu
+          venv/bin/pip install -c "$RUNNER_TEMP/constraints.txt" -r requirements.txt -r requirements_eval.txt -r app/requirements.txt -r requirements-e2e.txt
+          venv/bin/pip install -c "$RUNNER_TEMP/constraints.txt" -e .
+          google-chrome --version
+          echo "CHROME=$(command -v google-chrome)" >> "$GITHUB_ENV"
+
+      - name: e2e (pytest tests/e2e -m e2e; a skip is a failure here)
+        run: |
+          venv/bin/python -m pytest tests/e2e -m e2e -q -rs 2>&1 | tee "$RUNNER_TEMP/e2e.log"
+          if grep -qE '[0-9]+ skipped' "$RUNNER_TEMP/e2e.log"; then echo "::error::e2e tests were skipped (Chrome or Playwright missing)"; exit 1; fi
+
+      - name: Layout check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: venv/bin/python scripts/chat_ui_layout_check.py
+
+      - name: Browser check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: venv/bin/python scripts/chat_ui_browser_check.py --no-evidence
+
+      - name: Features check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: venv/bin/python scripts/chat_ui_features_check.py --no-evidence

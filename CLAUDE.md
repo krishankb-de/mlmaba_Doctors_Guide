@@ -33,6 +33,9 @@ venv/bin/python scripts/chat_ui_browser_check.py --no-evidence
 venv/bin/python scripts/chat_ui_features_check.py --no-evidence
 ```
 
+GitHub runs the same checks on every push, plus lint and the push guards (only `main`; each pushed commit passes the hook,
+adds no local-only file and carries the noreply identity): `.github/workflows/checks.yml`.
+
 When you add a module or a config key, add an assertion to `tests/test_willi_parity.py`.
 
 ## Rules
@@ -48,7 +51,8 @@ When you add a module or a config key, add an assertion to `tests/test_willi_par
   - never publish the GitHub Pages copy (`scripts/pages_build.py`, `scripts/pages_publish.sh`) or enable GitHub Pages;
   - never open a public link (`app/tunnel/public_demo.sh`);
   - never start a server in public mode, with a `BIND` other than `127.0.0.1`, or with `CORS_ORIGINS`;
-  - never add CI, deploy or hosting configuration.
+  - never add deploy or hosting configuration. The one workflow, `.github/workflows/checks.yml`, only runs the checks on every
+    push (no deploy, no secrets, no uploads).
   The server runs in private mode on its compute node's loopback, reached only through your own SSH tunnel; the laptop dev server
   listens on 127.0.0.1.
 - **Ports:** 8000 is the laptop dev server and 8010 the tunnel to the cluster server. Tests start their own servers on free ports.

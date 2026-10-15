@@ -131,7 +131,7 @@ def _make_distill_module(
     distill_warmup: int = 500,
     distill_ramp: int = 1500,
     max_steps: int = 50,
-) -> "DistillContrastiveLightningModule":  # type: ignore[name-defined]
+) -> "DistillContrastiveLightningModule":  # type: ignore[name-defined]  # noqa: F821 (imported in the body)
     from hybrid_xmamba.training.lightning_module import DistillContrastiveLightningModule
     enc = _make_text_encoder(embed_dim=64)
     teacher = MockPubMedBERT()
