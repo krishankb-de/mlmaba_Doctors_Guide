@@ -1,0 +1,130 @@
+#!/bin/bash
+# ============================================================================
+# Phase 11A --checkpoint mode (H100_SCALING_PLAN.md) — qualitative check of a
+# trained Phase 10E report-generation checkpoint against real held-out images.
+# SLURM wrapper for scripts/evaluate_report_generation.py --checkpoint, since
+# the login node refuses this ("resource-intensive... use srun/a Slurm job")
+# — same login-node constraint documented in build_mimic_cxr_local.sh, hit
+# live 2026-08-23. Mirrors train_report_generation_h100.sh's env-lever /
+# --exclude / offline-HF conventions so this is a drop-in sibling.
+#
+# Lightweight (a handful of forward passes, no training) — deliberately a
+# short --time and no --gpus request beyond 1, not the full 16h training cap.
+# ============================================================================
+#SBATCH --partition=@SLURM_PARTITION@
+#SBATCH --account=@SLURM_ACCOUNT@
+#SBATCH --gpus=1
+#SBATCH --exclude=@SLURM_EXCLUDE@   # arm03: ARM node, x86 .venv incompatible;
+                                        # node13v1: faulty GPU (cudaErrorContained, 2026-07-19)
+#SBATCH --mem=32G
+#SBATCH --cpus-per-task=4
+#SBATCH --time=06:30:00
+#SBATCH --job-name=inspect_report_gen
+#SBATCH --output=logs/%x_%j.log
+#SBATCH --error=logs/%x_%j.log
+
+set -euo pipefail
+
+SCRATCH_ROOT="${SCRATCH_ROOT:-/sc/scratch/$USER/hybrid_xmamba_h100}"
+VENV_ACTIVATE="${VENV_ACTIVATE:-.venv/bin/activate}"
+
+# 2026-08-30: both defaults below pointed at the arm0/ subset artifacts long
+# after full-data Phase 8 pack + Phase 10E training (job 2491338,
+# EXPERIMENT=h100_report_gen_full) landed -- every real full-data run so far
+# has depended on the invoker remembering to override CHECKPOINT and PARQUET
+# by hand. arm0 is CLOSED/historical per CLAUDE.md's Phase 9 note -- full
+# data is the active target, so the default should point there. Override
+# back to the arm0/... paths explicitly if an arm0-specific check is needed.
+CHECKPOINT="${CHECKPOINT:-./outputs/h100_report_gen_full/checkpoints/last.ckpt}"
+MODEL_CONFIG="${MODEL_CONFIG:-hybrid_150m_v2_rrg}"
+# Phase 14 (2026-09-10): prefix_k is normally AUTO-DETECTED from the
+# run_metadata.json beside the checkpoint. Set PREFIX_K only when that file is
+# missing. A wrong k cannot be caught from the state dict -- k sets the output
+# width of adaptive_avg_pool1d, which has no parameters, so a k=8 checkpoint
+# loads into a k=32 module reporting "Missing keys: 0" and then generates from
+# the wrong number of image-prefix tokens.
+PREFIX_K="${PREFIX_K:-}"
+# MAMBA3_PLAN_V2.md V4: opt into the O(1) recurrent cache for beam search. 5.19x faster per token
+# and token-identical to the default path by test, but only available when every mixer has a
+# step() -- mamba3 + mlstm at tfla_impl=exact qualifies, mamba-1 and attention do not, and the
+# script fails loudly rather than silently falling back. OFF by default: every published number
+# came from the uncached path, and a five-hour eval is worth less than a comparable one.
+CACHED_DECODE="${CACHED_DECODE:-false}"
+# V5-A: evaluate a TRAINED checkpoint under a different recurrence than it was trained with, to
+# measure what the operator defect is worth on the reported metrics. Empty = use whatever the
+# model yaml pins, which is what every published number used.
+SCAN_IMPL="${SCAN_IMPL:-}"
+TFLA_IMPL="${TFLA_IMPL:-}"
+CHUNK_SIZE="${CHUNK_SIZE:-}"   # EFFICIENCY_PLAN.md E6
+# EFFICIENCY_PLAN.md E7: decode under torch.compile. The efficiency headline is
+# measured compiled, but until E7 compile was only ever verified on LOGITS. This
+# is INFERENCE ONLY -- no training configuration in this project turns compile on.
+# The eval aborts if Dynamo captured nothing, so a silent eager fallback cannot
+# masquerade as agreement.
+COMPILE="${COMPILE:-false}"
+# Default to VALIDATION images, not train -- generations on train images look
+# artificially good even under genuine overfitting; validation is the honest check.
+PARQUET="${PARQUET:-/sc/home/$USER/dataset/mimic_full/validate.parquet}"
+NUM_SAMPLES="${NUM_SAMPLES:-10}"
+DECODE="${DECODE:-greedy}"
+BEAM_SIZE="${BEAM_SIZE:-3}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-100}"
+# Phase 11B (2026-08-28, fixed 2026-08-29 against the real f1chexbert API):
+# opt-in CheXbert F1 alongside ROUGE-L/BLEU, off by default since it needs
+# the f1chexbert package (pip install f1chexbert) + network to download
+# chexbert.pth on first use -- see evaluate_report_generation.py's
+# compute_chexbert_metrics docstring.
+CHEXBERT="${CHEXBERT:-false}"
+# Phase 11B (2026-08-29): dump hyps.txt/refs.txt for later CheXbert scoring in
+# the isolated venv (see score_chexbert_h100.sh) instead of/in addition to
+# --chexbert above. Off by default.
+DUMP_DIR="${DUMP_DIR:-}"
+
+echo "=== Phase 11A checkpoint inspection: ${CHECKPOINT} ==="
+echo "=== parquet=${PARQUET} num_samples=${NUM_SAMPLES} decode=${DECODE} ==="
+echo "=== chunk_size=${CHUNK_SIZE:-<yaml>} compile=${COMPILE} ==="
+date; hostname
+mkdir -p logs
+
+cd "${SLURM_SUBMIT_DIR}/hybrid_model_mamba_xlstm" 2>/dev/null || cd "${SLURM_SUBMIT_DIR:-.}"
+
+export HF_HOME="${SCRATCH_ROOT}/.hf"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export PYTHONUNBUFFERED=1
+
+source "${VENV_ACTIVATE}"
+python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+
+if [ ! -f "${CHECKPOINT}" ]; then
+  echo "ERROR: Checkpoint not found: ${CHECKPOINT}"
+  exit 1
+fi
+
+CHEXBERT_ARGS=()
+if [ "${CHEXBERT}" = "true" ]; then
+  CHEXBERT_ARGS+=(--chexbert)
+fi
+if [ -n "${DUMP_DIR}" ]; then
+  CHEXBERT_ARGS+=(--dump-dir "${DUMP_DIR}")
+fi
+
+python scripts/evaluate_report_generation.py \
+  --checkpoint "${CHECKPOINT}" \
+  --model-config "${MODEL_CONFIG}" \
+  ${PREFIX_K:+--prefix-k "${PREFIX_K}"} \
+  $([ "${CACHED_DECODE}" = "true" ] && echo "--cached-decode") \
+  ${SCAN_IMPL:+--scan-impl "${SCAN_IMPL}"} \
+  ${TFLA_IMPL:+--tfla-impl "${TFLA_IMPL}"} \
+  ${CHUNK_SIZE:+--chunk-size "${CHUNK_SIZE}"} \
+  $([ "${COMPILE}" = "true" ] && echo "--compile") \
+  --parquet "${PARQUET}" \
+  --num-samples "${NUM_SAMPLES}" \
+  --decode "${DECODE}" \
+  --beam-size "${BEAM_SIZE}" \
+  --max-new-tokens "${MAX_NEW_TOKENS}" \
+  ${CHEXBERT_ARGS[@]+"${CHEXBERT_ARGS[@]}"}
+
+echo "=== END ==="
+date

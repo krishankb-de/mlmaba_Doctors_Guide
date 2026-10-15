@@ -1,0 +1,2404 @@
+{
+ "environment": {
+  "torch": "2.11.0",
+  "cpu": "arm"
+ },
+ "sse": [
+  {
+   "event": "message_start",
+   "data": {
+    "message_id": "<m1>",
+    "user_message_id": "<m2>",
+    "session_id": "<s1>",
+    "mode": "private",
+    "model": {
+     "name": "tiny",
+     "checkpoint": null,
+     "checkpoint_sha256": null,
+     "prefix_k": 4,
+     "scan_impl": "legacy",
+     "tfla_impl": "exact",
+     "mamba3_chunk_size": 8,
+     "layer_pattern": [
+      "mamba3",
+      "mlstm"
+     ],
+     "cached_decode_available": true,
+     "train_experiment": null,
+     "eos_trained": false,
+     "torch": "2.11.0",
+     "device": "cpu",
+     "threads": null,
+     "cpu": "arm",
+     "drift_note": "tiny random-init model",
+     "git_sha": null,
+     "git_dirty": null,
+     "git_source": null
+    },
+    "options": {
+     "model": "tiny",
+     "decode": "beam",
+     "beam_size": 3,
+     "max_new_tokens": 16,
+     "cached_decode": true,
+     "compile": false,
+     "k_images": 4,
+     "k_reports": 3,
+     "label": true,
+     "reference": "Findings: The heart is enlarged. Small left pleural effusion. Impression: Cardiomegaly.",
+     "display_repair": false,
+     "stop_on_repeat": false,
+     "test_row": null
+    },
+    "image": {
+     "sha256": "6984124968a6154a82ee0a32057c2e8029e176ee959abd3784e63351d8f5fa24",
+     "filename": "chest.png",
+     "source": "upload",
+     "urls": {
+      "original": "/v1/messages/<m2>/image?variant=original",
+      "thumb": "/v1/messages/<m2>/image?variant=thumb",
+      "model_input": "/v1/messages/<m2>/image?variant=model_input"
+     }
+    },
+    "seq": 1
+   }
+  },
+  {
+   "event": "stage_start",
+   "data": {
+    "stage": "preprocess",
+    "index": 0,
+    "seq": 2
+   }
+  },
+  {
+   "event": "stage_end",
+   "data": {
+    "stage": "preprocess",
+    "ms": null,
+    "detail": {
+     "format": "PNG",
+     "mode": "L",
+     "input_px": [
+      320,
+      320
+     ],
+     "exif_transposed": false,
+     "image_sha256": "6984124968a6154a82ee0a32057c2e8029e176ee959abd3784e63351d8f5fa24",
+     "resized_to": [
+      224,
+      224
+     ],
+     "grayscale_to_3ch": true,
+     "normalize": "biomedclip_clip_mean_std",
+     "source": "upload"
+    },
+    "seq": 3
+   }
+  },
+  {
+   "event": "stage_start",
+   "data": {
+    "stage": "encode",
+    "index": 1,
+    "seq": 4
+   }
+  },
+  {
+   "event": "stage_end",
+   "data": {
+    "stage": "encode",
+    "ms": null,
+    "detail": {
+     "patch_grid": [
+      197,
+      32
+     ],
+     "pooled_dim": 16,
+     "prefix_tokens": 4,
+     "device": "cpu",
+     "one_pass": true
+    },
+    "seq": 5
+   }
+  },
+  {
+   "event": "stage_start",
+   "data": {
+    "stage": "retrieve",
+    "index": 2,
+    "seq": 6
+   }
+  },
+  {
+   "event": "stage_end",
+   "data": {
+    "stage": "retrieve",
+    "ms": null,
+    "detail": {
+     "image_neighbors": [
+      {
+       "rank": 1,
+       "similarity": 0.6809265613555908,
+       "gallery_row": 10,
+       "study_id": 50000010,
+       "txt_row": 10,
+       "image_url": "/v1/gallery/images/10",
+       "labels": {
+        "Enlarged Cardiomediastinum": 0,
+        "Cardiomegaly": 1,
+        "Lung Opacity": 0,
+        "Lung Lesion": 0,
+        "Edema": 0,
+        "Consolidation": 0,
+        "Pneumonia": 0,
+        "Atelectasis": 1,
+        "Pneumothorax": 0,
+        "Pleural Effusion": 0,
+        "Pleural Other": 0,
+        "Fracture": 1,
+        "Support Devices": 1,
+        "No Finding": 0
+       }
+      },
+      {
+       "rank": 2,
+       "similarity": 0.5787297487258911,
+       "gallery_row": 74,
+       "study_id": 50000074,
+       "txt_row": 74,
+       "image_url": "/v1/gallery/images/74",
+       "labels": {
+        "Enlarged Cardiomediastinum": 0,
+        "Cardiomegaly": 0,
+        "Lung Opacity": 0,
+        "Lung Lesion": 1,
+        "Edema": 0,
+        "Consolidation": 1,
+        "Pneumonia": 1,
+        "Atelectasis": 0,
+        "Pneumothorax": 0,
+        "Pleural Effusion": 0,
+        "Pleural Other": 0,
+        "Fracture": 0,
+        "Support Devices": 1,
+        "No Finding": 0
+       }
+      },
+      {
+       "rank": 3,
+       "similarity": 0.5327335596084595,
+       "gallery_row": 158,
+       "study_id": 50000158,
+       "txt_row": 158,
+       "image_url": "/v1/gallery/images/158",
+       "labels": {
+        "Enlarged Cardiomediastinum": 1,
+        "Cardiomegaly": 0,
+        "Lung Opacity": 0,
+        "Lung Lesion": 0,
+        "Edema": 1,
+        "Consolidation": 1,
+        "Pneumonia": 0,
+        "Atelectasis": 1,
+        "Pneumothorax": 1,
+        "Pleural Effusion": 0,
+        "Pleural Other": 0,
+        "Fracture": 0,
+        "Support Devices": 0,
+        "No Finding": 0
+       }
+      },
+      {
+       "rank": 4,
+       "similarity": 0.5127274394035339,
+       "gallery_row": 63,
+       "study_id": 50000063,
+       "txt_row": 63,
+       "image_url": "/v1/gallery/images/63",
+       "labels": {
+        "Enlarged Cardiomediastinum": 0,
+        "Cardiomegaly": 0,
+        "Lung Opacity": 0,
+        "Lung Lesion": 0,
+        "Edema": 0,
+        "Consolidation": 0,
+        "Pneumonia": 0,
+        "Atelectasis": 0,
+        "Pneumothorax": 0,
+        "Pleural Effusion": 1,
+        "Pleural Other": 1,
+        "Fracture": 1,
+        "Support Devices": 0,
+        "No Finding": 1
+       }
+      }
+     ],
+     "report_matches": [
+      {
+       "rank": 1,
+       "similarity": 0.5668269395828247,
+       "group": 77,
+       "group_size": 1,
+       "txt_row": 231,
+       "report": "Findings: middle calcified basilar pneumothorax limits bilateral lower. Impression: low lungs or.",
+       "labels": {
+        "Enlarged Cardiomediastinum": 0,
+        "Cardiomegaly": 0,
+        "Lung Opacity": 0,
+        "Lung Lesion": 1,
+        "Edema": 0,
+        "Consolidation": 0,
+        "Pneumonia": 0,
+        "Atelectasis": 0,
+        "Pneumothorax": 0,
+        "Pleural Effusion": 0,
+        "Pleural Other": 0,
+        "Fracture": 1,
+        "Support Devices": 0,
+        "No Finding": 0
+       }
+      },
+      {
+       "rank": 2,
+       "similarity": 0.5510461926460266,
+       "group": 51,
+       "group_size": 2,
+       "txt_row": 93,
+       "report": "Findings: spine no limits atelectasis limits sternotomy or. Impression: limits calcified heart.",
+       "labels": {
+        "Enlarged Cardiomediastinum": 1,
+        "Cardiomegaly": 0,
+        "Lung Opacity": 0,
+        "Lung Lesion": 0,
+        "Edema": 0,
+        "Consolidation": 1,
+        "Pneumonia": 0,
+        "Atelectasis": 1,
+        "Pneumothorax": 1,
+        "Pleural Effusion": 0,
+        "Pleural Other": 0,
+        "Fracture": 0,
+        "Support Devices": 0,
+        "No Finding": 0
+       }
+      },
+      {
+       "rank": 3,
+       "similarity": 0.4777106046676636,
+       "group": 64,
+       "group_size": 1,
+       "txt_row": 164,
+       "report": "Findings: consolidation cardiac edema contours normal lobe spine lungs catheter. Impression: focal be nodule ..",
+       "labels": {
+        "Enlarged Cardiomediastinum": 0,
+        "Cardiomegaly": 0,
+        "Lung Opacity": 0,
+        "Lung Lesion": 0,
+        "Edema": 0,
+        "Consolidation": 1,
+        "Pneumonia": 0,
+        "Atelectasis": 0,
+        "Pneumothorax": 0,
+        "Pleural Effusion": 0,
+        "Pleural Other": 0,
+        "Fracture": 1,
+        "Support Devices": 0,
+        "No Finding": 0
+       }
+      }
+     ],
+     "gallery": {
+      "build_id": "tiny",
+      "images": 200,
+      "report_rows": 240,
+      "report_groups": 78,
+      "towers_identical": true
+     }
+    },
+    "seq": 7
+   }
+  },
+  {
+   "event": "stage_start",
+   "data": {
+    "stage": "generate",
+    "index": 3,
+    "seq": 8
+   }
+  },
+  {
+   "event": "content_block_start",
+   "data": {
+    "index": 0,
+    "content_block": {
+     "type": "report",
+     "text": ""
+    },
+    "seq": 9
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 0,
+     "text": "and"
+    },
+    "seq": 10
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 1,
+     "text": "and heart"
+    },
+    "seq": 11
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 2,
+     "text": "and heart lungs"
+    },
+    "seq": 12
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 3,
+     "text": "and heart lungs of"
+    },
+    "seq": 13
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 4,
+     "text": "and heart without. catheter"
+    },
+    "seq": 14
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 5,
+     "text": "and heart without. catheter acute"
+    },
+    "seq": 15
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 6,
+     "text": "and heart without. catheter acute right"
+    },
+    "seq": 16
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 7,
+     "text": "and heart and heart without. catheter acute"
+    },
+    "seq": 17
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 8,
+     "text": "and heart and heart without. catheter acute right"
+    },
+    "seq": 18
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 9,
+     "text": "and heart and heart without. catheter acute stable is"
+    },
+    "seq": 19
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 10,
+     "text": "and heart and heart without. catheter acute right large heart"
+    },
+    "seq": 20
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 11,
+     "text": "and heart and heart without. catheter acute right large and heart"
+    },
+    "seq": 21
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 12,
+     "text": "and heart and heart without. catheter acute right large heart lungs of"
+    },
+    "seq": 22
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 13,
+     "text": "and heart and heart without. catheter acute right large heart without. catheter"
+    },
+    "seq": 23
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 14,
+     "text": "and heart and heart without. catheter acute right large heart without. catheter acute"
+    },
+    "seq": 24
+   }
+  },
+  {
+   "event": "content_block_delta",
+   "data": {
+    "index": 0,
+    "delta": {
+     "type": "beam_snapshot",
+     "step": 15,
+     "text": "and heart and heart without. catheter acute right large heart without. catheter acute right"
+    },
+    "seq": 25
+   }
+  },
+  {
+   "event": "content_block_stop",
+   "data": {
+    "index": 0,
+    "seq": 26
+   }
+  },
+  {
+   "event": "stage_end",
+   "data": {
+    "stage": "generate",
+    "ms": null,
+    "detail": {
+     "decode": "beam",
+     "beam_size": 3,
+     "tokens": 16,
+     "stopped": "budget",
+     "cached_decode": true,
+     "compiled": false,
+     "prefill_ms": null,
+     "per_token_ms": null,
+     "device": "cpu",
+     "threads": null,
+     "drift_note": "tiny random-init model"
+    },
+    "seq": 27
+   }
+  },
+  {
+   "event": "stage_start",
+   "data": {
+    "stage": "label",
+    "index": 4,
+    "seq": 28
+   }
+  },
+  {
+   "event": "stage_end",
+   "data": {
+    "stage": "label",
+    "ms": null,
+    "detail": {
+     "chexbert_14": {
+      "Enlarged Cardiomediastinum": 0,
+      "Cardiomegaly": 0,
+      "Lung Opacity": 0,
+      "Lung Lesion": 0,
+      "Edema": 0,
+      "Consolidation": 0,
+      "Pneumonia": 0,
+      "Atelectasis": 0,
+      "Pneumothorax": 0,
+      "Pleural Effusion": 0,
+      "Pleural Other": 0,
+      "Fracture": 0,
+      "Support Devices": 1,
+      "No Finding": 0
+     },
+     "positives": [
+      "Support Devices"
+     ],
+     "neighbor_agreement": [
+      {
+       "rank": 1,
+       "agree": 11,
+       "of": 14,
+       "both_positive": [
+        "Support Devices"
+       ],
+       "neighbor_only": [
+        "Cardiomegaly",
+        "Atelectasis",
+        "Fracture"
+       ],
+       "generated_only": []
+      },
+      {
+       "rank": 2,
+       "agree": 11,
+       "of": 14,
+       "both_positive": [
+        "Support Devices"
+       ],
+       "neighbor_only": [
+        "Lung Lesion",
+        "Consolidation",
+        "Pneumonia"
+       ],
+       "generated_only": []
+      },
+      {
+       "rank": 3,
+       "agree": 8,
+       "of": 14,
+       "both_positive": [],
+       "neighbor_only": [
+        "Enlarged Cardiomediastinum",
+        "Edema",
+        "Consolidation",
+        "Atelectasis",
+        "Pneumothorax"
+       ],
+       "generated_only": [
+        "Support Devices"
+       ]
+      },
+      {
+       "rank": 4,
+       "agree": 9,
+       "of": 14,
+       "both_positive": [],
+       "neighbor_only": [
+        "Pleural Effusion",
+        "Pleural Other",
+        "Fracture",
+        "No Finding"
+       ],
+       "generated_only": [
+        "Support Devices"
+       ]
+      }
+     ]
+    },
+    "seq": 29
+   }
+  },
+  {
+   "event": "stage_start",
+   "data": {
+    "stage": "score",
+    "index": 5,
+    "seq": 30
+   }
+  },
+  {
+   "event": "stage_end",
+   "data": {
+    "stage": "score",
+    "ms": null,
+    "detail": {
+     "rouge_l": 0.08176943699731902,
+     "bleu_1": 0.07142857142857141,
+     "bleu_4": 0.0,
+     "chexbert_14_micro_f1": 0.0,
+     "exact_match_14": false,
+     "reference_source": "user",
+     "reference_chexbert_14": {
+      "Enlarged Cardiomediastinum": 0,
+      "Cardiomegaly": 1,
+      "Lung Opacity": 0,
+      "Lung Lesion": 0,
+      "Edema": 0,
+      "Consolidation": 0,
+      "Pneumonia": 0,
+      "Atelectasis": 0,
+      "Pneumothorax": 0,
+      "Pleural Effusion": 1,
+      "Pleural Other": 0,
+      "Fracture": 0,
+      "Support Devices": 0,
+      "No Finding": 0
+     }
+    },
+    "seq": 31
+   }
+  },
+  {
+   "event": "message_stop",
+   "data": {
+    "message_id": "<m1>",
+    "status": "done",
+    "total_ms": null,
+    "report": "and heart and heart without. catheter acute right large heart without. catheter acute right",
+    "display_report": "and heart and heart without. catheter acute right large heart without. catheter acute right",
+    "truncated_mid_sentence": true,
+    "disclaimer": "Research prototype; not for clinical use.",
+    "seq": 32
+   }
+  }
+ ],
+ "message": {
+  "id": "<m1>",
+  "session_id": "<s1>",
+  "seq_in_session": 2,
+  "role": "assistant",
+  "created_at": null,
+  "text": "",
+  "mode": "private",
+  "image_sha256": null,
+  "image_filename": null,
+  "test_row": null,
+  "status": "done",
+  "report": "and heart and heart without. catheter acute right large heart without. catheter acute right",
+  "display_report": "and heart and heart without. catheter acute right large heart without. catheter acute right",
+  "total_ms": null,
+  "options": {
+   "model": "tiny",
+   "decode": "beam",
+   "beam_size": 3,
+   "max_new_tokens": 16,
+   "cached_decode": true,
+   "compile": false,
+   "k_images": 4,
+   "k_reports": 3,
+   "label": true,
+   "reference": "Findings: The heart is enlarged. Small left pleural effusion. Impression: Cardiomegaly.",
+   "display_repair": false,
+   "stop_on_repeat": false,
+   "test_row": null
+  },
+  "provenance": {
+   "name": "tiny",
+   "checkpoint": null,
+   "checkpoint_sha256": null,
+   "prefix_k": 4,
+   "scan_impl": "legacy",
+   "tfla_impl": "exact",
+   "mamba3_chunk_size": 8,
+   "layer_pattern": [
+    "mamba3",
+    "mlstm"
+   ],
+   "cached_decode_available": true,
+   "train_experiment": null,
+   "eos_trained": false,
+   "torch": "2.11.0",
+   "device": "cpu",
+   "threads": null,
+   "cpu": "arm",
+   "drift_note": "tiny random-init model",
+   "git_sha": null,
+   "git_dirty": null,
+   "git_source": null
+  },
+  "events": [
+   {
+    "seq": 1,
+    "event": "message_start",
+    "data": {
+     "message_id": "<m1>",
+     "user_message_id": "<m2>",
+     "session_id": "<s1>",
+     "mode": "private",
+     "model": {
+      "name": "tiny",
+      "checkpoint": null,
+      "checkpoint_sha256": null,
+      "prefix_k": 4,
+      "scan_impl": "legacy",
+      "tfla_impl": "exact",
+      "mamba3_chunk_size": 8,
+      "layer_pattern": [
+       "mamba3",
+       "mlstm"
+      ],
+      "cached_decode_available": true,
+      "train_experiment": null,
+      "eos_trained": false,
+      "torch": "2.11.0",
+      "device": "cpu",
+      "threads": null,
+      "cpu": "arm",
+      "drift_note": "tiny random-init model",
+      "git_sha": null,
+      "git_dirty": null,
+      "git_source": null
+     },
+     "options": {
+      "model": "tiny",
+      "decode": "beam",
+      "beam_size": 3,
+      "max_new_tokens": 16,
+      "cached_decode": true,
+      "compile": false,
+      "k_images": 4,
+      "k_reports": 3,
+      "label": true,
+      "reference": "Findings: The heart is enlarged. Small left pleural effusion. Impression: Cardiomegaly.",
+      "display_repair": false,
+      "stop_on_repeat": false,
+      "test_row": null
+     },
+     "image": {
+      "sha256": "6984124968a6154a82ee0a32057c2e8029e176ee959abd3784e63351d8f5fa24",
+      "filename": "chest.png",
+      "source": "upload",
+      "urls": {
+       "original": "/v1/messages/<m2>/image?variant=original",
+       "thumb": "/v1/messages/<m2>/image?variant=thumb",
+       "model_input": "/v1/messages/<m2>/image?variant=model_input"
+      }
+     },
+     "seq": 1
+    }
+   },
+   {
+    "seq": 2,
+    "event": "stage_start",
+    "data": {
+     "stage": "preprocess",
+     "index": 0,
+     "seq": 2
+    }
+   },
+   {
+    "seq": 3,
+    "event": "stage_end",
+    "data": {
+     "stage": "preprocess",
+     "ms": null,
+     "detail": {
+      "format": "PNG",
+      "mode": "L",
+      "input_px": [
+       320,
+       320
+      ],
+      "exif_transposed": false,
+      "image_sha256": "6984124968a6154a82ee0a32057c2e8029e176ee959abd3784e63351d8f5fa24",
+      "resized_to": [
+       224,
+       224
+      ],
+      "grayscale_to_3ch": true,
+      "normalize": "biomedclip_clip_mean_std",
+      "source": "upload"
+     },
+     "seq": 3
+    }
+   },
+   {
+    "seq": 4,
+    "event": "stage_start",
+    "data": {
+     "stage": "encode",
+     "index": 1,
+     "seq": 4
+    }
+   },
+   {
+    "seq": 5,
+    "event": "stage_end",
+    "data": {
+     "stage": "encode",
+     "ms": null,
+     "detail": {
+      "patch_grid": [
+       197,
+       32
+      ],
+      "pooled_dim": 16,
+      "prefix_tokens": 4,
+      "device": "cpu",
+      "one_pass": true
+     },
+     "seq": 5
+    }
+   },
+   {
+    "seq": 6,
+    "event": "stage_start",
+    "data": {
+     "stage": "retrieve",
+     "index": 2,
+     "seq": 6
+    }
+   },
+   {
+    "seq": 7,
+    "event": "stage_end",
+    "data": {
+     "stage": "retrieve",
+     "ms": null,
+     "detail": {
+      "image_neighbors": [
+       {
+        "rank": 1,
+        "similarity": 0.6809265613555908,
+        "gallery_row": 10,
+        "study_id": 50000010,
+        "txt_row": 10,
+        "image_url": "/v1/gallery/images/10",
+        "labels": {
+         "Enlarged Cardiomediastinum": 0,
+         "Cardiomegaly": 1,
+         "Lung Opacity": 0,
+         "Lung Lesion": 0,
+         "Edema": 0,
+         "Consolidation": 0,
+         "Pneumonia": 0,
+         "Atelectasis": 1,
+         "Pneumothorax": 0,
+         "Pleural Effusion": 0,
+         "Pleural Other": 0,
+         "Fracture": 1,
+         "Support Devices": 1,
+         "No Finding": 0
+        }
+       },
+       {
+        "rank": 2,
+        "similarity": 0.5787297487258911,
+        "gallery_row": 74,
+        "study_id": 50000074,
+        "txt_row": 74,
+        "image_url": "/v1/gallery/images/74",
+        "labels": {
+         "Enlarged Cardiomediastinum": 0,
+         "Cardiomegaly": 0,
+         "Lung Opacity": 0,
+         "Lung Lesion": 1,
+         "Edema": 0,
+         "Consolidation": 1,
+         "Pneumonia": 1,
+         "Atelectasis": 0,
+         "Pneumothorax": 0,
+         "Pleural Effusion": 0,
+         "Pleural Other": 0,
+         "Fracture": 0,
+         "Support Devices": 1,
+         "No Finding": 0
+        }
+       },
+       {
+        "rank": 3,
+        "similarity": 0.5327335596084595,
+        "gallery_row": 158,
+        "study_id": 50000158,
+        "txt_row": 158,
+        "image_url": "/v1/gallery/images/158",
+        "labels": {
+         "Enlarged Cardiomediastinum": 1,
+         "Cardiomegaly": 0,
+         "Lung Opacity": 0,
+         "Lung Lesion": 0,
+         "Edema": 1,
+         "Consolidation": 1,
+         "Pneumonia": 0,
+         "Atelectasis": 1,
+         "Pneumothorax": 1,
+         "Pleural Effusion": 0,
+         "Pleural Other": 0,
+         "Fracture": 0,
+         "Support Devices": 0,
+         "No Finding": 0
+        }
+       },
+       {
+        "rank": 4,
+        "similarity": 0.5127274394035339,
+        "gallery_row": 63,
+        "study_id": 50000063,
+        "txt_row": 63,
+        "image_url": "/v1/gallery/images/63",
+        "labels": {
+         "Enlarged Cardiomediastinum": 0,
+         "Cardiomegaly": 0,
+         "Lung Opacity": 0,
+         "Lung Lesion": 0,
+         "Edema": 0,
+         "Consolidation": 0,
+         "Pneumonia": 0,
+         "Atelectasis": 0,
+         "Pneumothorax": 0,
+         "Pleural Effusion": 1,
+         "Pleural Other": 1,
+         "Fracture": 1,
+         "Support Devices": 0,
+         "No Finding": 1
+        }
+       }
+      ],
+      "report_matches": [
+       {
+        "rank": 1,
+        "similarity": 0.5668269395828247,
+        "group": 77,
+        "group_size": 1,
+        "txt_row": 231,
+        "report": "Findings: middle calcified basilar pneumothorax limits bilateral lower. Impression: low lungs or.",
+        "labels": {
+         "Enlarged Cardiomediastinum": 0,
+         "Cardiomegaly": 0,
+         "Lung Opacity": 0,
+         "Lung Lesion": 1,
+         "Edema": 0,
+         "Consolidation": 0,
+         "Pneumonia": 0,
+         "Atelectasis": 0,
+         "Pneumothorax": 0,
+         "Pleural Effusion": 0,
+         "Pleural Other": 0,
+         "Fracture": 1,
+         "Support Devices": 0,
+         "No Finding": 0
+        }
+       },
+       {
+        "rank": 2,
+        "similarity": 0.5510461926460266,
+        "group": 51,
+        "group_size": 2,
+        "txt_row": 93,
+        "report": "Findings: spine no limits atelectasis limits sternotomy or. Impression: limits calcified heart.",
+        "labels": {
+         "Enlarged Cardiomediastinum": 1,
+         "Cardiomegaly": 0,
+         "Lung Opacity": 0,
+         "Lung Lesion": 0,
+         "Edema": 0,
+         "Consolidation": 1,
+         "Pneumonia": 0,
+         "Atelectasis": 1,
+         "Pneumothorax": 1,
+         "Pleural Effusion": 0,
+         "Pleural Other": 0,
+         "Fracture": 0,
+         "Support Devices": 0,
+         "No Finding": 0
+        }
+       },
+       {
+        "rank": 3,
+        "similarity": 0.4777106046676636,
+        "group": 64,
+        "group_size": 1,
+        "txt_row": 164,
+        "report": "Findings: consolidation cardiac edema contours normal lobe spine lungs catheter. Impression: focal be nodule ..",
+        "labels": {
+         "Enlarged Cardiomediastinum": 0,
+         "Cardiomegaly": 0,
+         "Lung Opacity": 0,
+         "Lung Lesion": 0,
+         "Edema": 0,
+         "Consolidation": 1,
+         "Pneumonia": 0,
+         "Atelectasis": 0,
+         "Pneumothorax": 0,
+         "Pleural Effusion": 0,
+         "Pleural Other": 0,
+         "Fracture": 1,
+         "Support Devices": 0,
+         "No Finding": 0
+        }
+       }
+      ],
+      "gallery": {
+       "build_id": "tiny",
+       "images": 200,
+       "report_rows": 240,
+       "report_groups": 78,
+       "towers_identical": true
+      }
+     },
+     "seq": 7
+    }
+   },
+   {
+    "seq": 8,
+    "event": "stage_start",
+    "data": {
+     "stage": "generate",
+     "index": 3,
+     "seq": 8
+    }
+   },
+   {
+    "seq": 9,
+    "event": "content_block_start",
+    "data": {
+     "index": 0,
+     "content_block": {
+      "type": "report",
+      "text": ""
+     },
+     "seq": 9
+    }
+   },
+   {
+    "seq": 10,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 0,
+      "text": "and"
+     },
+     "seq": 10
+    }
+   },
+   {
+    "seq": 11,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 1,
+      "text": "and heart"
+     },
+     "seq": 11
+    }
+   },
+   {
+    "seq": 12,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 2,
+      "text": "and heart lungs"
+     },
+     "seq": 12
+    }
+   },
+   {
+    "seq": 13,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 3,
+      "text": "and heart lungs of"
+     },
+     "seq": 13
+    }
+   },
+   {
+    "seq": 14,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 4,
+      "text": "and heart without. catheter"
+     },
+     "seq": 14
+    }
+   },
+   {
+    "seq": 15,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 5,
+      "text": "and heart without. catheter acute"
+     },
+     "seq": 15
+    }
+   },
+   {
+    "seq": 16,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 6,
+      "text": "and heart without. catheter acute right"
+     },
+     "seq": 16
+    }
+   },
+   {
+    "seq": 17,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 7,
+      "text": "and heart and heart without. catheter acute"
+     },
+     "seq": 17
+    }
+   },
+   {
+    "seq": 18,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 8,
+      "text": "and heart and heart without. catheter acute right"
+     },
+     "seq": 18
+    }
+   },
+   {
+    "seq": 19,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 9,
+      "text": "and heart and heart without. catheter acute stable is"
+     },
+     "seq": 19
+    }
+   },
+   {
+    "seq": 20,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 10,
+      "text": "and heart and heart without. catheter acute right large heart"
+     },
+     "seq": 20
+    }
+   },
+   {
+    "seq": 21,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 11,
+      "text": "and heart and heart without. catheter acute right large and heart"
+     },
+     "seq": 21
+    }
+   },
+   {
+    "seq": 22,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 12,
+      "text": "and heart and heart without. catheter acute right large heart lungs of"
+     },
+     "seq": 22
+    }
+   },
+   {
+    "seq": 23,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 13,
+      "text": "and heart and heart without. catheter acute right large heart without. catheter"
+     },
+     "seq": 23
+    }
+   },
+   {
+    "seq": 24,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 14,
+      "text": "and heart and heart without. catheter acute right large heart without. catheter acute"
+     },
+     "seq": 24
+    }
+   },
+   {
+    "seq": 25,
+    "event": "content_block_delta",
+    "data": {
+     "index": 0,
+     "delta": {
+      "type": "beam_snapshot",
+      "step": 15,
+      "text": "and heart and heart without. catheter acute right large heart without. catheter acute right"
+     },
+     "seq": 25
+    }
+   },
+   {
+    "seq": 26,
+    "event": "content_block_stop",
+    "data": {
+     "index": 0,
+     "seq": 26
+    }
+   },
+   {
+    "seq": 27,
+    "event": "stage_end",
+    "data": {
+     "stage": "generate",
+     "ms": null,
+     "detail": {
+      "decode": "beam",
+      "beam_size": 3,
+      "tokens": 16,
+      "stopped": "budget",
+      "cached_decode": true,
+      "compiled": false,
+      "prefill_ms": null,
+      "per_token_ms": null,
+      "device": "cpu",
+      "threads": null,
+      "drift_note": "tiny random-init model"
+     },
+     "seq": 27
+    }
+   },
+   {
+    "seq": 28,
+    "event": "stage_start",
+    "data": {
+     "stage": "label",
+     "index": 4,
+     "seq": 28
+    }
+   },
+   {
+    "seq": 29,
+    "event": "stage_end",
+    "data": {
+     "stage": "label",
+     "ms": null,
+     "detail": {
+      "chexbert_14": {
+       "Enlarged Cardiomediastinum": 0,
+       "Cardiomegaly": 0,
+       "Lung Opacity": 0,
+       "Lung Lesion": 0,
+       "Edema": 0,
+       "Consolidation": 0,
+       "Pneumonia": 0,
+       "Atelectasis": 0,
+       "Pneumothorax": 0,
+       "Pleural Effusion": 0,
+       "Pleural Other": 0,
+       "Fracture": 0,
+       "Support Devices": 1,
+       "No Finding": 0
+      },
+      "positives": [
+       "Support Devices"
+      ],
+      "neighbor_agreement": [
+       {
+        "rank": 1,
+        "agree": 11,
+        "of": 14,
+        "both_positive": [
+         "Support Devices"
+        ],
+        "neighbor_only": [
+         "Cardiomegaly",
+         "Atelectasis",
+         "Fracture"
+        ],
+        "generated_only": []
+       },
+       {
+        "rank": 2,
+        "agree": 11,
+        "of": 14,
+        "both_positive": [
+         "Support Devices"
+        ],
+        "neighbor_only": [
+         "Lung Lesion",
+         "Consolidation",
+         "Pneumonia"
+        ],
+        "generated_only": []
+       },
+       {
+        "rank": 3,
+        "agree": 8,
+        "of": 14,
+        "both_positive": [],
+        "neighbor_only": [
+         "Enlarged Cardiomediastinum",
+         "Edema",
+         "Consolidation",
+         "Atelectasis",
+         "Pneumothorax"
+        ],
+        "generated_only": [
+         "Support Devices"
+        ]
+       },
+       {
+        "rank": 4,
+        "agree": 9,
+        "of": 14,
+        "both_positive": [],
+        "neighbor_only": [
+         "Pleural Effusion",
+         "Pleural Other",
+         "Fracture",
+         "No Finding"
+        ],
+        "generated_only": [
+         "Support Devices"
+        ]
+       }
+      ]
+     },
+     "seq": 29
+    }
+   },
+   {
+    "seq": 30,
+    "event": "stage_start",
+    "data": {
+     "stage": "score",
+     "index": 5,
+     "seq": 30
+    }
+   },
+   {
+    "seq": 31,
+    "event": "stage_end",
+    "data": {
+     "stage": "score",
+     "ms": null,
+     "detail": {
+      "rouge_l": 0.08176943699731902,
+      "bleu_1": 0.07142857142857141,
+      "bleu_4": 0.0,
+      "chexbert_14_micro_f1": 0.0,
+      "exact_match_14": false,
+      "reference_source": "user",
+      "reference_chexbert_14": {
+       "Enlarged Cardiomediastinum": 0,
+       "Cardiomegaly": 1,
+       "Lung Opacity": 0,
+       "Lung Lesion": 0,
+       "Edema": 0,
+       "Consolidation": 0,
+       "Pneumonia": 0,
+       "Atelectasis": 0,
+       "Pneumothorax": 0,
+       "Pleural Effusion": 1,
+       "Pleural Other": 0,
+       "Fracture": 0,
+       "Support Devices": 0,
+       "No Finding": 0
+      }
+     },
+     "seq": 31
+    }
+   },
+   {
+    "seq": 32,
+    "event": "message_stop",
+    "data": {
+     "message_id": "<m1>",
+     "status": "done",
+     "total_ms": null,
+     "report": "and heart and heart without. catheter acute right large heart without. catheter acute right",
+     "display_report": "and heart and heart without. catheter acute right large heart without. catheter acute right",
+     "truncated_mid_sentence": true,
+     "disclaimer": "Research prototype; not for clinical use.",
+     "seq": 32
+    }
+   }
+  ]
+ },
+ "export_json": {
+  "session": {
+   "id": "<s1>",
+   "created_at": null,
+   "updated_at": null,
+   "title": "chest.png",
+   "mode": "private",
+   "turns": 1
+  },
+  "messages": [
+   {
+    "id": "<m2>",
+    "session_id": "<s1>",
+    "seq_in_session": 1,
+    "role": "user",
+    "created_at": null,
+    "text": "",
+    "mode": "private",
+    "image_sha256": "6984124968a6154a82ee0a32057c2e8029e176ee959abd3784e63351d8f5fa24",
+    "image_filename": "chest.png",
+    "test_row": null,
+    "status": "done",
+    "report": null,
+    "display_report": null,
+    "total_ms": null,
+    "options": null,
+    "provenance": null,
+    "events": []
+   },
+   {
+    "id": "<m1>",
+    "session_id": "<s1>",
+    "seq_in_session": 2,
+    "role": "assistant",
+    "created_at": null,
+    "text": "",
+    "mode": "private",
+    "image_sha256": null,
+    "image_filename": null,
+    "test_row": null,
+    "status": "done",
+    "report": "and heart and heart without. catheter acute right large heart without. catheter acute right",
+    "display_report": "and heart and heart without. catheter acute right large heart without. catheter acute right",
+    "total_ms": null,
+    "options": {
+     "model": "tiny",
+     "decode": "beam",
+     "beam_size": 3,
+     "max_new_tokens": 16,
+     "cached_decode": true,
+     "compile": false,
+     "k_images": 4,
+     "k_reports": 3,
+     "label": true,
+     "reference": "Findings: The heart is enlarged. Small left pleural effusion. Impression: Cardiomegaly.",
+     "display_repair": false,
+     "stop_on_repeat": false,
+     "test_row": null
+    },
+    "provenance": {
+     "name": "tiny",
+     "checkpoint": null,
+     "checkpoint_sha256": null,
+     "prefix_k": 4,
+     "scan_impl": "legacy",
+     "tfla_impl": "exact",
+     "mamba3_chunk_size": 8,
+     "layer_pattern": [
+      "mamba3",
+      "mlstm"
+     ],
+     "cached_decode_available": true,
+     "train_experiment": null,
+     "eos_trained": false,
+     "torch": "2.11.0",
+     "device": "cpu",
+     "threads": null,
+     "cpu": "arm",
+     "drift_note": "tiny random-init model",
+     "git_sha": null,
+     "git_dirty": null,
+     "git_source": null
+    },
+    "events": [
+     {
+      "seq": 1,
+      "ts": null,
+      "event": "message_start",
+      "data": {
+       "message_id": "<m1>",
+       "user_message_id": "<m2>",
+       "session_id": "<s1>",
+       "mode": "private",
+       "model": {
+        "name": "tiny",
+        "checkpoint": null,
+        "checkpoint_sha256": null,
+        "prefix_k": 4,
+        "scan_impl": "legacy",
+        "tfla_impl": "exact",
+        "mamba3_chunk_size": 8,
+        "layer_pattern": [
+         "mamba3",
+         "mlstm"
+        ],
+        "cached_decode_available": true,
+        "train_experiment": null,
+        "eos_trained": false,
+        "torch": "2.11.0",
+        "device": "cpu",
+        "threads": null,
+        "cpu": "arm",
+        "drift_note": "tiny random-init model",
+        "git_sha": null,
+        "git_dirty": null,
+        "git_source": null
+       },
+       "options": {
+        "model": "tiny",
+        "decode": "beam",
+        "beam_size": 3,
+        "max_new_tokens": 16,
+        "cached_decode": true,
+        "compile": false,
+        "k_images": 4,
+        "k_reports": 3,
+        "label": true,
+        "reference": "Findings: The heart is enlarged. Small left pleural effusion. Impression: Cardiomegaly.",
+        "display_repair": false,
+        "stop_on_repeat": false,
+        "test_row": null
+       },
+       "image": {
+        "sha256": "6984124968a6154a82ee0a32057c2e8029e176ee959abd3784e63351d8f5fa24",
+        "filename": "chest.png",
+        "source": "upload",
+        "urls": {
+         "original": "/v1/messages/<m2>/image?variant=original",
+         "thumb": "/v1/messages/<m2>/image?variant=thumb",
+         "model_input": "/v1/messages/<m2>/image?variant=model_input"
+        }
+       },
+       "seq": 1
+      }
+     },
+     {
+      "seq": 2,
+      "ts": null,
+      "event": "stage_start",
+      "data": {
+       "stage": "preprocess",
+       "index": 0,
+       "seq": 2
+      }
+     },
+     {
+      "seq": 3,
+      "ts": null,
+      "event": "stage_end",
+      "data": {
+       "stage": "preprocess",
+       "ms": null,
+       "detail": {
+        "format": "PNG",
+        "mode": "L",
+        "input_px": [
+         320,
+         320
+        ],
+        "exif_transposed": false,
+        "image_sha256": "6984124968a6154a82ee0a32057c2e8029e176ee959abd3784e63351d8f5fa24",
+        "resized_to": [
+         224,
+         224
+        ],
+        "grayscale_to_3ch": true,
+        "normalize": "biomedclip_clip_mean_std",
+        "source": "upload"
+       },
+       "seq": 3
+      }
+     },
+     {
+      "seq": 4,
+      "ts": null,
+      "event": "stage_start",
+      "data": {
+       "stage": "encode",
+       "index": 1,
+       "seq": 4
+      }
+     },
+     {
+      "seq": 5,
+      "ts": null,
+      "event": "stage_end",
+      "data": {
+       "stage": "encode",
+       "ms": null,
+       "detail": {
+        "patch_grid": [
+         197,
+         32
+        ],
+        "pooled_dim": 16,
+        "prefix_tokens": 4,
+        "device": "cpu",
+        "one_pass": true
+       },
+       "seq": 5
+      }
+     },
+     {
+      "seq": 6,
+      "ts": null,
+      "event": "stage_start",
+      "data": {
+       "stage": "retrieve",
+       "index": 2,
+       "seq": 6
+      }
+     },
+     {
+      "seq": 7,
+      "ts": null,
+      "event": "stage_end",
+      "data": {
+       "stage": "retrieve",
+       "ms": null,
+       "detail": {
+        "image_neighbors": [
+         {
+          "rank": 1,
+          "similarity": 0.6809265613555908,
+          "gallery_row": 10,
+          "study_id": 50000010,
+          "txt_row": 10,
+          "image_url": "/v1/gallery/images/10",
+          "labels": {
+           "Enlarged Cardiomediastinum": 0,
+           "Cardiomegaly": 1,
+           "Lung Opacity": 0,
+           "Lung Lesion": 0,
+           "Edema": 0,
+           "Consolidation": 0,
+           "Pneumonia": 0,
+           "Atelectasis": 1,
+           "Pneumothorax": 0,
+           "Pleural Effusion": 0,
+           "Pleural Other": 0,
+           "Fracture": 1,
+           "Support Devices": 1,
+           "No Finding": 0
+          }
+         },
+         {
+          "rank": 2,
+          "similarity": 0.5787297487258911,
+          "gallery_row": 74,
+          "study_id": 50000074,
+          "txt_row": 74,
+          "image_url": "/v1/gallery/images/74",
+          "labels": {
+           "Enlarged Cardiomediastinum": 0,
+           "Cardiomegaly": 0,
+           "Lung Opacity": 0,
+           "Lung Lesion": 1,
+           "Edema": 0,
+           "Consolidation": 1,
+           "Pneumonia": 1,
+           "Atelectasis": 0,
+           "Pneumothorax": 0,
+           "Pleural Effusion": 0,
+           "Pleural Other": 0,
+           "Fracture": 0,
+           "Support Devices": 1,
+           "No Finding": 0
+          }
+         },
+         {
+          "rank": 3,
+          "similarity": 0.5327335596084595,
+          "gallery_row": 158,
+          "study_id": 50000158,
+          "txt_row": 158,
+          "image_url": "/v1/gallery/images/158",
+          "labels": {
+           "Enlarged Cardiomediastinum": 1,
+           "Cardiomegaly": 0,
+           "Lung Opacity": 0,
+           "Lung Lesion": 0,
+           "Edema": 1,
+           "Consolidation": 1,
+           "Pneumonia": 0,
+           "Atelectasis": 1,
+           "Pneumothorax": 1,
+           "Pleural Effusion": 0,
+           "Pleural Other": 0,
+           "Fracture": 0,
+           "Support Devices": 0,
+           "No Finding": 0
+          }
+         },
+         {
+          "rank": 4,
+          "similarity": 0.5127274394035339,
+          "gallery_row": 63,
+          "study_id": 50000063,
+          "txt_row": 63,
+          "image_url": "/v1/gallery/images/63",
+          "labels": {
+           "Enlarged Cardiomediastinum": 0,
+           "Cardiomegaly": 0,
+           "Lung Opacity": 0,
+           "Lung Lesion": 0,
+           "Edema": 0,
+           "Consolidation": 0,
+           "Pneumonia": 0,
+           "Atelectasis": 0,
+           "Pneumothorax": 0,
+           "Pleural Effusion": 1,
+           "Pleural Other": 1,
+           "Fracture": 1,
+           "Support Devices": 0,
+           "No Finding": 1
+          }
+         }
+        ],
+        "report_matches": [
+         {
+          "rank": 1,
+          "similarity": 0.5668269395828247,
+          "group": 77,
+          "group_size": 1,
+          "txt_row": 231,
+          "report": "Findings: middle calcified basilar pneumothorax limits bilateral lower. Impression: low lungs or.",
+          "labels": {
+           "Enlarged Cardiomediastinum": 0,
+           "Cardiomegaly": 0,
+           "Lung Opacity": 0,
+           "Lung Lesion": 1,
+           "Edema": 0,
+           "Consolidation": 0,
+           "Pneumonia": 0,
+           "Atelectasis": 0,
+           "Pneumothorax": 0,
+           "Pleural Effusion": 0,
+           "Pleural Other": 0,
+           "Fracture": 1,
+           "Support Devices": 0,
+           "No Finding": 0
+          }
+         },
+         {
+          "rank": 2,
+          "similarity": 0.5510461926460266,
+          "group": 51,
+          "group_size": 2,
+          "txt_row": 93,
+          "report": "Findings: spine no limits atelectasis limits sternotomy or. Impression: limits calcified heart.",
+          "labels": {
+           "Enlarged Cardiomediastinum": 1,
+           "Cardiomegaly": 0,
+           "Lung Opacity": 0,
+           "Lung Lesion": 0,
+           "Edema": 0,
+           "Consolidation": 1,
+           "Pneumonia": 0,
+           "Atelectasis": 1,
+           "Pneumothorax": 1,
+           "Pleural Effusion": 0,
+           "Pleural Other": 0,
+           "Fracture": 0,
+           "Support Devices": 0,
+           "No Finding": 0
+          }
+         },
+         {
+          "rank": 3,
+          "similarity": 0.4777106046676636,
+          "group": 64,
+          "group_size": 1,
+          "txt_row": 164,
+          "report": "Findings: consolidation cardiac edema contours normal lobe spine lungs catheter. Impression: focal be nodule ..",
+          "labels": {
+           "Enlarged Cardiomediastinum": 0,
+           "Cardiomegaly": 0,
+           "Lung Opacity": 0,
+           "Lung Lesion": 0,
+           "Edema": 0,
+           "Consolidation": 1,
+           "Pneumonia": 0,
+           "Atelectasis": 0,
+           "Pneumothorax": 0,
+           "Pleural Effusion": 0,
+           "Pleural Other": 0,
+           "Fracture": 1,
+           "Support Devices": 0,
+           "No Finding": 0
+          }
+         }
+        ],
+        "gallery": {
+         "build_id": "tiny",
+         "images": 200,
+         "report_rows": 240,
+         "report_groups": 78,
+         "towers_identical": true
+        }
+       },
+       "seq": 7
+      }
+     },
+     {
+      "seq": 8,
+      "ts": null,
+      "event": "stage_start",
+      "data": {
+       "stage": "generate",
+       "index": 3,
+       "seq": 8
+      }
+     },
+     {
+      "seq": 9,
+      "ts": null,
+      "event": "content_block_start",
+      "data": {
+       "index": 0,
+       "content_block": {
+        "type": "report",
+        "text": ""
+       },
+       "seq": 9
+      }
+     },
+     {
+      "seq": 10,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 0,
+        "text": "and"
+       },
+       "seq": 10
+      }
+     },
+     {
+      "seq": 11,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 1,
+        "text": "and heart"
+       },
+       "seq": 11
+      }
+     },
+     {
+      "seq": 12,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 2,
+        "text": "and heart lungs"
+       },
+       "seq": 12
+      }
+     },
+     {
+      "seq": 13,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 3,
+        "text": "and heart lungs of"
+       },
+       "seq": 13
+      }
+     },
+     {
+      "seq": 14,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 4,
+        "text": "and heart without. catheter"
+       },
+       "seq": 14
+      }
+     },
+     {
+      "seq": 15,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 5,
+        "text": "and heart without. catheter acute"
+       },
+       "seq": 15
+      }
+     },
+     {
+      "seq": 16,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 6,
+        "text": "and heart without. catheter acute right"
+       },
+       "seq": 16
+      }
+     },
+     {
+      "seq": 17,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 7,
+        "text": "and heart and heart without. catheter acute"
+       },
+       "seq": 17
+      }
+     },
+     {
+      "seq": 18,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 8,
+        "text": "and heart and heart without. catheter acute right"
+       },
+       "seq": 18
+      }
+     },
+     {
+      "seq": 19,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 9,
+        "text": "and heart and heart without. catheter acute stable is"
+       },
+       "seq": 19
+      }
+     },
+     {
+      "seq": 20,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 10,
+        "text": "and heart and heart without. catheter acute right large heart"
+       },
+       "seq": 20
+      }
+     },
+     {
+      "seq": 21,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 11,
+        "text": "and heart and heart without. catheter acute right large and heart"
+       },
+       "seq": 21
+      }
+     },
+     {
+      "seq": 22,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 12,
+        "text": "and heart and heart without. catheter acute right large heart lungs of"
+       },
+       "seq": 22
+      }
+     },
+     {
+      "seq": 23,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 13,
+        "text": "and heart and heart without. catheter acute right large heart without. catheter"
+       },
+       "seq": 23
+      }
+     },
+     {
+      "seq": 24,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 14,
+        "text": "and heart and heart without. catheter acute right large heart without. catheter acute"
+       },
+       "seq": 24
+      }
+     },
+     {
+      "seq": 25,
+      "ts": null,
+      "event": "content_block_delta",
+      "data": {
+       "index": 0,
+       "delta": {
+        "type": "beam_snapshot",
+        "step": 15,
+        "text": "and heart and heart without. catheter acute right large heart without. catheter acute right"
+       },
+       "seq": 25
+      }
+     },
+     {
+      "seq": 26,
+      "ts": null,
+      "event": "content_block_stop",
+      "data": {
+       "index": 0,
+       "seq": 26
+      }
+     },
+     {
+      "seq": 27,
+      "ts": null,
+      "event": "stage_end",
+      "data": {
+       "stage": "generate",
+       "ms": null,
+       "detail": {
+        "decode": "beam",
+        "beam_size": 3,
+        "tokens": 16,
+        "stopped": "budget",
+        "cached_decode": true,
+        "compiled": false,
+        "prefill_ms": null,
+        "per_token_ms": null,
+        "device": "cpu",
+        "threads": null,
+        "drift_note": "tiny random-init model"
+       },
+       "seq": 27
+      }
+     },
+     {
+      "seq": 28,
+      "ts": null,
+      "event": "stage_start",
+      "data": {
+       "stage": "label",
+       "index": 4,
+       "seq": 28
+      }
+     },
+     {
+      "seq": 29,
+      "ts": null,
+      "event": "stage_end",
+      "data": {
+       "stage": "label",
+       "ms": null,
+       "detail": {
+        "chexbert_14": {
+         "Enlarged Cardiomediastinum": 0,
+         "Cardiomegaly": 0,
+         "Lung Opacity": 0,
+         "Lung Lesion": 0,
+         "Edema": 0,
+         "Consolidation": 0,
+         "Pneumonia": 0,
+         "Atelectasis": 0,
+         "Pneumothorax": 0,
+         "Pleural Effusion": 0,
+         "Pleural Other": 0,
+         "Fracture": 0,
+         "Support Devices": 1,
+         "No Finding": 0
+        },
+        "positives": [
+         "Support Devices"
+        ],
+        "neighbor_agreement": [
+         {
+          "rank": 1,
+          "agree": 11,
+          "of": 14,
+          "both_positive": [
+           "Support Devices"
+          ],
+          "neighbor_only": [
+           "Cardiomegaly",
+           "Atelectasis",
+           "Fracture"
+          ],
+          "generated_only": []
+         },
+         {
+          "rank": 2,
+          "agree": 11,
+          "of": 14,
+          "both_positive": [
+           "Support Devices"
+          ],
+          "neighbor_only": [
+           "Lung Lesion",
+           "Consolidation",
+           "Pneumonia"
+          ],
+          "generated_only": []
+         },
+         {
+          "rank": 3,
+          "agree": 8,
+          "of": 14,
+          "both_positive": [],
+          "neighbor_only": [
+           "Enlarged Cardiomediastinum",
+           "Edema",
+           "Consolidation",
+           "Atelectasis",
+           "Pneumothorax"
+          ],
+          "generated_only": [
+           "Support Devices"
+          ]
+         },
+         {
+          "rank": 4,
+          "agree": 9,
+          "of": 14,
+          "both_positive": [],
+          "neighbor_only": [
+           "Pleural Effusion",
+           "Pleural Other",
+           "Fracture",
+           "No Finding"
+          ],
+          "generated_only": [
+           "Support Devices"
+          ]
+         }
+        ]
+       },
+       "seq": 29
+      }
+     },
+     {
+      "seq": 30,
+      "ts": null,
+      "event": "stage_start",
+      "data": {
+       "stage": "score",
+       "index": 5,
+       "seq": 30
+      }
+     },
+     {
+      "seq": 31,
+      "ts": null,
+      "event": "stage_end",
+      "data": {
+       "stage": "score",
+       "ms": null,
+       "detail": {
+        "rouge_l": 0.08176943699731902,
+        "bleu_1": 0.07142857142857141,
+        "bleu_4": 0.0,
+        "chexbert_14_micro_f1": 0.0,
+        "exact_match_14": false,
+        "reference_source": "user",
+        "reference_chexbert_14": {
+         "Enlarged Cardiomediastinum": 0,
+         "Cardiomegaly": 1,
+         "Lung Opacity": 0,
+         "Lung Lesion": 0,
+         "Edema": 0,
+         "Consolidation": 0,
+         "Pneumonia": 0,
+         "Atelectasis": 0,
+         "Pneumothorax": 0,
+         "Pleural Effusion": 1,
+         "Pleural Other": 0,
+         "Fracture": 0,
+         "Support Devices": 0,
+         "No Finding": 0
+        }
+       },
+       "seq": 31
+      }
+     },
+     {
+      "seq": 32,
+      "ts": null,
+      "event": "message_stop",
+      "data": {
+       "message_id": "<m1>",
+       "status": "done",
+       "total_ms": null,
+       "report": "and heart and heart without. catheter acute right large heart without. catheter acute right",
+       "display_report": "and heart and heart without. catheter acute right large heart without. catheter acute right",
+       "truncated_mid_sentence": true,
+       "disclaimer": "Research prototype; not for clinical use.",
+       "seq": 32
+      }
+     }
+    ]
+   }
+  ]
+ },
+ "export_md": "# Session <s1>\n\n_Research prototype; not for clinical use._\n\nMode: private · Created: <time> · Title: chest.png\n\n## Turn 1 — <time>\n\nImage: `chest.png`\n\nReport:\n\n> and heart and heart without. catheter acute right large heart without. catheter acute right\n\nCheXbert-14 labels of the generated report (1 = positive):\n\n| Finding | Label |\n| --- | --- |\n| Enlarged Cardiomediastinum | 0 |\n| Cardiomegaly | 0 |\n| Lung Opacity | 0 |\n| Lung Lesion | 0 |\n| Edema | 0 |\n| Consolidation | 0 |\n| Pneumonia | 0 |\n| Atelectasis | 0 |\n| Pneumothorax | 0 |\n| Pleural Effusion | 0 |\n| Pleural Other | 0 |\n| Fracture | 0 |\n| Support Devices | 1 |\n| No Finding | 0 |\n\nNearest images:\n\n- #1 · similarity 0.681 · study 50000010\n- #2 · similarity 0.579 · study 50000074\n- #3 · similarity 0.533 · study 50000158\n- #4 · similarity 0.513 · study 50000063\n\nNearest reports:\n\n- #1 · similarity 0.567\n  > Findings: middle calcified basilar pneumothorax limits bilateral lower. Impression: low lungs or.\n- #2 · similarity 0.551\n  > Findings: spine no limits atelectasis limits sternotomy or. Impression: limits calcified heart.\n- #3 · similarity 0.478\n  > Findings: consolidation cardiac edema contours normal lobe spine lungs catheter. Impression: focal be nodule ..\n\nProvenance: name=tiny · prefix_k=4 · scan_impl=legacy · tfla_impl=exact · mamba3_chunk_size=8 · layer_pattern=[\"mamba3\",\"mlstm\"] · cached_decode_available=True · eos_trained=False · torch=2.11.0 · device=cpu · threads=<n> · cpu=arm · drift_note=tiny random-init model · total_ms=<n>\n",
+ "models": {
+  "default_model": "tiny",
+  "mode": "private",
+  "allow_compile": false,
+  "features": {
+   "retrieval": true,
+   "labels": true
+  },
+  "models": [
+   {
+    "name": "tiny",
+    "checkpoint": null,
+    "checkpoint_sha256": null,
+    "prefix_k": 4,
+    "scan_impl": "legacy",
+    "tfla_impl": "exact",
+    "mamba3_chunk_size": 8,
+    "layer_pattern": [
+     "mamba3",
+     "mlstm"
+    ],
+    "cached_decode_available": true,
+    "train_experiment": null,
+    "eos_trained": false,
+    "torch": "2.11.0",
+    "device": "cpu",
+    "threads": null,
+    "cpu": "arm",
+    "drift_note": "tiny random-init model",
+    "git_sha": null,
+    "git_dirty": null,
+    "git_source": null,
+    "features": {
+     "retrieval": true,
+     "labels": true
+    }
+   }
+  ]
+ }
+}

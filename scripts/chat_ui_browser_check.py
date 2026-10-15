@@ -1,0 +1,1822 @@
+"""CHAT_UI_PLAN.md P4-E: the browser checklist for the chat page, scripted. A local development tool; validate.sh does not
+run it.
+
+It starts the app (tiny engine: random weights, a toy vocabulary, 20 ms between decoding steps; a temporary home; a free
+loopback port), or takes --url, and drives headless Chrome over the DevTools protocol (scripts/chat_ui_cdp.py) with real
+mouse and key events. The image is a synthetic PNG (tests/app_helpers.png_bytes): nothing here is MIMIC-derived. Ten checks,
+one `CHECK <name> PASS|FAIL <detail>` line each:
+
+  stream    a turn streams: all six stages settle, the report grows over many snapshots, then the card says done
+  reload    Page.reload shows the identical card (its markup, text and stage states; a picture's object URL names the document that
+            made it, so the server path in its data-src is what is compared, P6-B); a reload in the middle of a turn finds it running
+            and follows it to its end (the app of the check holds the turn while the page reloads, App.hold: it is not a race)
+  sessions  a second chat switches cleanly with the first, also when a turn is left running: no leaked stream, no stale image (every
+            picture on the page names a message of the chat it shows)
+  exports   the JSON and Markdown exports download and open
+  stop      Stop aborts a 150-token turn within a step: aborted, fewer than 150 snapshots, the card says stopped
+  keyboard  Tab visits the controls in DOM order; Enter sends; Enter on Settings opens the drawer and Esc closes it, to Settings
+  narrow    375 x 812: a full turn, its details open, the sidebar and the drawer, with no horizontal overflow
+  a11y      the accessibility tree: stage buttons (counted on the page, and read against what the server runs: three on the app of
+            the check, five on a server with a gallery) named from their text with their expanded state, label chips that say
+            positive or negative (and whether each agrees with the reference), a status region that says "Report ready"
+  error     a server 422 shows the dismissible notice and keeps the composer as it was; a clicked Dismiss leaves the focus where the
+            click put it (a tap must not open a phone's keyboard), and one pressed from the keyboard hands it to the note field (P6-A)
+  settings  (P4-F, P4-G) the drawer is a form that ends in Save, and says what it took. A click into a field that holds a value selects
+            all of it (the first click after a Tab places the caret), and a budget typed with real keys replaces it (it is not appended)
+            and shows in the composer chips before any blur; Enter saves, closes the drawer to Settings and says "Settings saved." for
+            about 4 seconds; "300" and "8" are refused with the line "Enter a whole number from 16 to 200." under the field (never
+            snapped to 200 or 16; the valid 30 on the way to 300 applies, and the setting goes back to the value it had before the
+            typing), the drawer stays open, Enter changes nothing and leaves the bad text selected; the Save button saves. A default turn (the stop switch on) ends by itself with stopped "repeat",
+            fewer tokens than its budget and no budget note; a Send with no new image re-runs the last X-ray under a hint that says so
+            and uses the budget typed since; with the switch off, at 200 tokens with the page's default (Display repair on) no
+            sentence repeats on the settled card or in any frame of the stream, and Show raw still has the decoder's whole text
+
+The tiny model never writes an end-of-report token and loops after about 20 tokens, so with the page's default (stop when the report
+starts repeating, on) a tiny turn ends by itself near 21 tokens. The checks that need a long turn (stream, reload, sessions, stop) turn
+that switch off first, by storing the setting before the page loads; every check starts from the page's defaults.
+
+No check passes while the page logged a console error or threw. Chips: the tiny app the checks run skips retrieval, labelling
+and scoring (it has no gallery and no labeller), so the a11y check reads its chips from a live turn on a second tiny app started
+with tiny_gallery (P5-E: the synthetic gallery and the keyword labeller), its note a reference command, so the turn is labelled
+and scored and every chip says whether it agrees. Screenshots go to docs/chat_ui/evidence/p4e/ with checklist.json (the result
+and each check's measurements); --no-evidence runs without writing anything.
+
+    venv/bin/python scripts/chat_ui_browser_check.py [--url http://127.0.0.1:PORT/ --no-evidence] [--out DIR] [--no-evidence] [--only CHECK[,CHECK...]]
+
+Prints `RESULT {"checks": N, "failures": [...]}` last. Exits 1 on any failed check and 2 when Chrome or the app cannot be
+started, when --url is refused (or the run overruns --timeout seconds). With --url the app should pace its decoding (create_app's
+tiny_step_delay_s), or the stop check has no time to press Stop, and the reload step cannot hold its turn (the app is not the
+check's), so that step is as sensitive to the load of the machine as it was. --only runs the named checks, and only without evidence.
+A --url is an app that someone else started, so it is taken only with --no-evidence, and only when it is a tiny app on this machine's
+loopback (scripts/chat_ui_cdp.py url_problem and tiny_only_problem: the dev server's port and the tunnel's, any other host, and any app whose
+/v1/models is not the tiny engine's are refused, before Chrome starts and before the warm-up turn is sent). Every process it starts is
+killed on exit.
+"""
+import argparse
+import datetime
+import io
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import sys
+import tempfile
+import time
+import urllib.request
+import uuid
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from scripts.chat_ui_cdp import (App, Browser, exit_on_sigterm, find_chrome, tiny_only_problem, url_needs_no_evidence,  # noqa: E402
+                                 url_problem)
+from scripts.repair_generations import split_sentences  # noqa: E402
+from tests.app_helpers import png_bytes  # noqa: E402
+
+EVIDENCE_DIR = os.path.join(REPO_ROOT, "docs", "chat_ui", "evidence", "p4e")
+STEP_DELAY_S = 0.02            # between two decoding steps of the tiny engine: a 100-token turn takes about 2.6 s
+STREAM_TOKENS = 40             # the stream check's budget: a report that, settled, fits the 1280 x 900 page whole
+DESKTOP = (1280, 900)
+PHONE = (375, 812)
+EVIDENCE_FILES = ["streaming_1280x900_light.png", "settled_1280x900_light.png", "settled_1280x900_dark.png", "drawer_1280x900_light.png",
+                  "settled_375x812_light.png", "stopped_1280x900_light.png", "error_notice_1280x900_light.png",
+                  "labelled_chips_1280x900_light.png", "settings_1280x900_light.png", "drawer_error_1280x900_light.png",
+                  "checklist.json"]   # what a full run writes, and the only files it replaces
+STAGES = ["preprocess", "encode", "retrieve", "generate", "label", "score"]
+SETTLED = ("done", "skipped")  # what a stage of a finished turn can be
+
+
+def detailed_stages(features: Dict[str, bool], reference: bool = False) -> List[str]:
+    """The stages of a turn that have a detail table, so a disclosure button the page opens it with (render.js renderTimeline), on a server
+    with these features (/v1/models): preprocess, encode and generate always; retrieve when the server has its gallery; label when it has a
+    labeller; score only for a turn that was given a reference (it is skipped, no_reference, without one). In stage order. The others are
+    skipped, and have no button: the app of the checks (no gallery, no labeller) has three buttons, a tiny_gallery server five."""
+    runs = {"preprocess": True, "encode": True, "retrieve": bool(features.get("retrieval")), "generate": True,
+            "label": bool(features.get("labels")), "score": bool(reference)}
+    return [stage for stage in STAGES if runs[stage]]
+# The a11y check's labelled turn sends this as its note: a reference command, so its report is scored against it. Synthetic text,
+# with words the keyword labeller marks (enlarged, effusion, tube), so the reference has positives to agree or differ with.
+LIVE_REFERENCE = "Findings: The heart is enlarged. Small left pleural effusion. Nasogastric tube in place. Impression: Cardiomegaly."
+
+# ---- the page, as scripts: each is a function that the browser calls with one JSON argument ---------------------------------------
+
+# The card's markup is compared across a reload: its pictures (P6-B) are object URLs, which name the document that made them, so each
+# src="blob:..." is read as src="blob:" (the server path a picture shows is in its data-src, and that is compared). `pending` counts the
+# pictures still on their way: no source yet, or a source that has not loaded.
+CARD_JS = """() => {
+  const cards = [...document.querySelectorAll('#conversation article.card')];
+  const c = cards[cards.length - 1];
+  if (!c) return null;
+  const body = c.querySelector('.report-body');
+  const stopped = c.querySelector('.note.stopped');
+  const pending = [...c.querySelectorAll('img')].filter((i) => i.hasAttribute('src') ? !i.complete : !i.hasAttribute('data-failed')).length;
+  return {
+    id: c.getAttribute('data-message-id'), status: c.getAttribute('data-status'), cards: cards.length,
+    stages: Object.fromEntries([...c.querySelectorAll('.timeline > li')].map((l) => [l.getAttribute('data-stage'), l.getAttribute('data-state')])),
+    report: body ? body.textContent : '', stopped: stopped ? stopped.textContent : null,
+    html: c.outerHTML.replace(/ src="blob:[^"]*"/g, ' src="blob:"'), text: c.textContent, pending,
+  };
+}"""
+
+# The report as the card says it, a function of the card: each section's header and body joined back into the text the server sent. A body is
+# a paragraph while the report streams, and a list of its sentences (a line each) once the block has closed (P6-H); what is only drawn on a
+# sentence, the number of a term and the ⚠ of a sentence about an earlier study, is not part of the text and is left out.
+SAID_JS = """(c) => [...c.querySelectorAll('.report-body .report-section')].map((s) => {
+  const h = s.querySelector('h3'), p = s.querySelector('p');
+  const line = (li) => { const x = li.cloneNode(true); x.querySelectorAll('sup, .flag').forEach((n) => n.remove()); return x.textContent; };
+  return (h ? h.textContent + ': ' : '') + (p ? p.textContent : [...s.querySelectorAll('li')].map(line).join(' '));
+}).join(' ')"""
+
+# Watches the page's own DOM, so that no render between two polls is missed: every distinct state of the newest card, and every
+# thing the status region says. The recorder lives in the page and goes with it. `texts` are the snapshots: the report's text in a frame whose
+# `.report` is still `.provisional`, the card's word for a report that is being written. When the block closes the card draws the report as a
+# list of sentences (P6-H), another string for the same report, which is no snapshot and would count as one more, and as the last (P6-H fix 1).
+# `shown` (the said text, one string for either drawing) needs no such filter.
+RECORD_JS = """() => {
+  const rec = { t0: performance.now(), frames: [], said: [], texts: new Set(), shown: new Set(), busy: [] };
+  window.__rec = rec;
+  const last = () => { const all = document.querySelectorAll('#conversation article.card'); return all[all.length - 1] || null; };
+  const said = __SAID__;
+  let key = null;
+  new MutationObserver(() => {
+    const c = last();
+    if (!c) return;
+    const body = c.querySelector('.report-body');
+    const frame = { t: Math.round(performance.now() - rec.t0), status: c.getAttribute('data-status'),
+                    stages: [...c.querySelectorAll('.timeline > li')].map((l) => l.getAttribute('data-state')),
+                    report: body ? body.textContent : '', shown: said(c) };
+    const k = frame.status + '|' + frame.stages.join(',') + '|' + frame.report + '|' + frame.shown;
+    if (k === key) return;
+    key = k;
+    rec.frames.push(frame);
+    if (frame.status === 'running' && frame.report && c.querySelector('.report.provisional')) rec.texts.add(frame.report);
+    if (frame.status === 'running' && frame.shown) rec.shown.add(frame.shown);
+  }).observe(document.querySelector('#conversation'), { subtree: true, childList: true, attributes: true, characterData: true });
+  new MutationObserver(() => rec.busy.push({ t: Math.round(performance.now() - rec.t0),
+                                              on: document.querySelector('#conversation').hasAttribute('aria-busy') }))
+    .observe(document.querySelector('#conversation'), { attributes: true, attributeFilter: ['aria-busy'] });
+  new MutationObserver(() => rec.said.push({ t: Math.round(performance.now() - rec.t0), text: document.querySelector('#status').textContent }))
+    .observe(document.querySelector('#status'), { subtree: true, childList: true, characterData: true });
+  return true;
+}""".replace("__SAID__", SAID_JS)
+
+PROGRESS_JS = """() => {
+  const r = window.__rec, f = r.frames[r.frames.length - 1];
+  return f ? { status: f.status, snapshots: r.texts.size } : null;
+}"""
+
+RECORDED_JS = """() => {
+  const r = window.__rec;
+  return { frames: r.frames, said: r.said, texts: [...r.texts], shown: [...r.shown], busy: r.busy };
+}"""
+
+# The tab stops of the page in the order the DOM has them, and the one that has focus, in the same words.
+FOCUSABLE_JS = """() => {
+  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && !el.closest('[hidden]')
+    && getComputedStyle(el).visibility !== 'hidden' && !el.disabled && el.tabIndex >= 0; };
+  const name = (el) => el.id ? '#' + el.id : el.getAttribute('data-stage') ? 'stage:' + el.getAttribute('data-stage')
+    : el.closest('li[data-session]') && el.localName === 'a' ? 'chat: ' + el.querySelector('.session-title').textContent
+    : el.getAttribute('aria-label') || el.textContent.trim().slice(0, 30) || el.localName;
+  window.__stop = () => { const a = document.activeElement; return !a || a === document.body ? 'body' : name(a); };
+  window.__ring = () => {   // does the control that has focus show it? an outline of 2 px or more (the page's :focus-visible rule), or a shadow
+    const a = document.activeElement;
+    if (!a || a === document.body) return null;
+    const cs = getComputedStyle(a);
+    const outlined = cs.outlineStyle !== 'none' && parseFloat(cs.outlineWidth) >= 2;
+    return { shown: outlined || cs.boxShadow !== 'none', outline: cs.outlineStyle + ' ' + cs.outlineWidth };
+  };
+  return [...document.querySelectorAll('a[href], button, input, select, textarea, [tabindex]')].filter(visible).map(name);
+}"""
+
+OVERFLOW_JS = """(args) => {
+  const doc = document.documentElement, q = (s) => document.querySelector(s);
+  const out = { doc: [doc.scrollWidth, doc.clientWidth], conversation: [q('#conversation').scrollWidth, q('#conversation').clientWidth],
+                composer: [q('#composer').scrollWidth, q('#composer').clientWidth], inner: window.innerWidth, wide: [] };
+  for (const el of document.querySelectorAll('body *')) {
+    const r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden' && !el.closest('[hidden], .visually-hidden')
+        && (r.right > args.width + 0.5 || r.left < -0.5)) {   // the visually hidden status region is a clipped 1 px box
+      const cls = el.className && el.className.baseVal === undefined ? '.' + String(el.className).split(' ')[0] : '';
+      out.wide.push((el.id ? '#' + el.id : el.localName + cls) + ' [' + Math.round(r.left) + ', ' + Math.round(r.right) + ']');
+    }
+  }
+  out.wide = out.wide.slice(0, 8);
+  return out;
+}"""
+
+MESSAGE_JS = """async (id) => {
+  const res = await fetch('/v1/messages/' + id + '?after=0');
+  const body = await res.json();
+  return { status: body.status, events: body.events.map((e) => [e.event, e.data.status || null]) };
+}"""
+
+HEALTH_JS = """async () => (await (await fetch('/healthz')).json())"""
+
+MODELS_JS = """async () => (await (await fetch('/v1/models')).json())"""
+
+# The settings drawer as it reads at the moment, and the composer's chips beside it (P4-F, P4-G).
+DRAWER_JS = """() => {
+  const q = (s) => document.querySelector(s);
+  const note = (id) => { const n = q('#' + id); return n ? { hidden: n.hidden, text: n.textContent } : null; };
+  const field = (setting) => { const f = q('#drawer [data-setting="' + setting + '"]');
+    return f ? { disabled: f.disabled, checked: f.checked, value: f.value, describedby: f.getAttribute('aria-describedby'),
+                 min: f.getAttribute('min'), max: f.getAttribute('max') } : null; };
+  const save = q('#drawer-save'), form = q('#settings-form');
+  return { open: !q('#drawer').hidden, second: q('#drawer').children[1] ? q('#drawer').children[1].id : null,
+           apply: note('apply-note'), running: note('running-note'), retrieval: note('retrieval-note'), labels: note('labels-note'),
+           rerun: note('rerun-hint'), k_images: field('k_images'), k_reports: field('k_reports'), label: field('label'),
+           repair: field('display_repair'), stop: field('stop_on_repeat'), stop_hint: note('stop-hint'),
+           ranges: [...document.querySelectorAll('#drawer label')].map((l) => l.firstChild.textContent).filter((t) => t.indexOf('(') >= 0 && t.indexOf('–') >= 0),
+           form: !!form && form.localName === 'form' && form.hasAttribute('novalidate'),
+           save: save ? { text: save.textContent, type: save.getAttribute('type'), last: !!form && form.lastElementChild.contains(save),
+                          closeFirst: q('#drawer button') === q('#drawer-close') } : null,
+           saved: q('#saved').textContent, chips: [...document.querySelectorAll('#chips span')].map((s) => s.textContent) };
+}"""
+
+# One number field of the drawer while it is typed in: its text, whether it has focus, what is selected in it, the chips, the setting that
+# is stored, and the line under it (shown or not, with aria-invalid) that says what it takes.
+FIELD_JS = """(selector) => {
+  const f = document.querySelector(selector);
+  const e = document.getElementById(f.getAttribute('data-setting') + '-error');
+  let stored = null;
+  try {
+    stored = (JSON.parse(localStorage.getItem('cxrchat.settings') || 'null') || {})[f.getAttribute('data-setting')];
+  } catch (x) { stored = 'unreadable'; }
+  return { value: f.value, focused: document.activeElement === f, selected: String(window.getSelection()),
+           stored: stored === undefined ? null : stored, chips: [...document.querySelectorAll('#chips span')].map((s) => s.textContent),
+           error: e ? { hidden: e.hidden, text: e.textContent } : null, invalid: f.getAttribute('aria-invalid'),
+           describedby: f.getAttribute('aria-describedby'), drawerOpen: !document.querySelector('#drawer').hidden,
+           saved: document.querySelector('#saved').textContent,
+           active: document.activeElement.id || document.activeElement.getAttribute('data-setting') || document.activeElement.localName };
+}"""
+
+# The newest user turn and card: what the turn says it used (chips, provenance) and whether it carried an image of its own.
+TURN_JS = """() => {
+  const users = [...document.querySelectorAll('#conversation .turn.user')];
+  const cards = [...document.querySelectorAll('#conversation article.card')];
+  const u = users[users.length - 1], c = cards[cards.length - 1];
+  const prov = c ? c.querySelector('.provenance') : null;
+  return { users: users.length, cards: cards.length, id: c ? c.getAttribute('data-message-id') : null,
+           chips: u ? [...u.querySelectorAll('.options .chip')].map((x) => x.textContent) : null,
+           image: !!(u && u.querySelector('img')), provenance: prov ? prov.textContent : '' };
+}"""
+
+# The newest card's report as the page shows it (sections joined back into text), and the raw text when Show raw is on.
+SHOWN_JS = """() => {
+  const cards = [...document.querySelectorAll('#conversation article.card')];
+  const c = cards[cards.length - 1];
+  if (!c) return null;
+  const shown = (__SAID__)(c);
+  const raw = c.querySelector('.report-raw');
+  const toggle = c.querySelector('[data-action="raw"]');
+  const prov = c.querySelector('.provenance');
+  return { shown, raw: raw ? raw.textContent : null, pressed: toggle ? toggle.getAttribute('aria-pressed') : null,
+           truncated: !!c.querySelector('.note.truncated'), notes: [...c.querySelectorAll('.report .note')].map((n) => n.textContent),
+           repeatNote: !!c.querySelector('.report .note[data-stopped="repeat"]'), footer: prov ? prov.textContent : '' };
+}""".replace("__SAID__", SAID_JS)
+
+# A message as the server stored it: what it was asked, the image it used, every snapshot streamed, and the two reports.
+LOG_JS = """async (id) => {
+  const body = await (await fetch('/v1/messages/' + id + '?after=0')).json();
+  const first = (name) => body.events.find((e) => e.event === name);
+  const start = first('message_start'), stop = first('message_stop');
+  const generate = body.events.find((e) => e.event === 'stage_end' && e.data.stage === 'generate');
+  return { status: body.status, options: start ? start.data.options : null, image: start ? start.data.image : null,
+           generate: generate ? generate.data.detail : null,
+           snapshots: body.events.filter((e) => e.event === 'content_block_delta').map((e) => e.data.delta.text),
+           skipped: Object.fromEntries(body.events.filter((e) => e.event === 'stage_end' && e.data.skipped).map((e) => [e.data.stage, e.data.skipped])),
+           report: stop ? stop.data.report : null, display: stop ? stop.data.display_report : null,
+           truncated: stop ? stop.data.truncated_mid_sentence : null };
+}"""
+
+# Run by Chrome before the page's own scripts on every load (Context.stop_off): the stored settings, with the stop switch off.
+STOP_OFF_JS = """try { var s = JSON.parse(localStorage.getItem('cxrchat.settings') || 'null') || {}; s.stop_on_repeat = false;
+  localStorage.setItem('cxrchat.settings', JSON.stringify(s)); } catch (e) { /* storage blocked: the page runs with its defaults */ }"""
+
+# A text that is too faint on purpose: Chrome's contrast audit reports it, so that its silence about everything else is a result and
+# not an audit that did not run. It is put on the page for the audit and taken off again.
+CANARY_JS = """() => {
+  const s = document.createElement('span');
+  s.id = 'contrast-canary';
+  s.textContent = 'canary';
+  s.style.cssText = 'position: fixed; left: 0; bottom: 0; z-index: 1; color: #e6e6e6; background: #ffffff';
+  document.body.append(s);
+  return true;
+}"""
+
+# What each screenshot must show when it is taken, asked of the page itself: a file named "stopped" is not a picture of a
+# running turn. Each predicate is the body of a function of no arguments that returns true or false.
+SHOT_RULES = {
+    "streaming": "const c = document.querySelector('#conversation article.card'); return !!c && c.getAttribute('data-status') === 'running' "
+                 "&& !!c.querySelector('.report-body') && !document.querySelector('#stop').hidden",
+    "settled": "const c = document.querySelector('#conversation article.card'); return !!c && c.getAttribute('data-status') === 'done' "
+               "&& !!c.querySelector('.report-body') && document.querySelector('#stop').hidden "
+               "&& !!c.querySelector('.report .note[data-stopped=\"repeat\"]') "
+               "&& ![...document.querySelectorAll('#chips span, #conversation .turn.user .options .chip')].some((x) => x.textContent === 'full budget')",
+    "drawer": "return !document.querySelector('#drawer').hidden && document.querySelector('#settings').getAttribute('aria-expanded') === 'true'",
+    "stopped": "const c = document.querySelector('#conversation article.card'); return !!c && c.getAttribute('data-status') === 'aborted' "
+               "&& !!c.querySelector('.note.stopped')",
+    "error_notice": "const n = document.querySelector('#notice'); return !n.hidden && n.getAttribute('role') === 'alert' && n.textContent.length > 4 "
+                    "&& !document.querySelector('#preview').hidden",
+    "labelled_chips": "return document.querySelectorAll('#conversation li.chip.label').length === 14 "
+                      "&& document.querySelectorAll('#conversation li.chip.label.positive').length > 0",
+    "settings": "const d = document.querySelector('#drawer'), r = document.querySelector('#rerun-hint'); "
+                "return !d.hidden && !document.querySelector('#apply-note').hidden && !r.hidden && r.textContent.indexOf('No new image') === 0 "
+                "&& [...document.querySelectorAll('#chips span')].some((c) => c.textContent === '200 tok') "
+                "&& document.querySelector('#drawer-save').getBoundingClientRect().bottom <= innerHeight",
+    "drawer_error": "const e = document.querySelector('#max_new_tokens-error'), f = document.querySelector('#drawer input[data-setting=\"max_new_tokens\"]'); "
+                    "return !document.querySelector('#drawer').hidden && !e.hidden && e.textContent.indexOf('Enter a whole number') === 0 "
+                    "&& f.getAttribute('aria-invalid') === 'true' && document.activeElement === f "
+                    "&& [...document.querySelectorAll('#chips span')].some((c) => c.textContent === '120 tok') "
+                    "&& ![...document.querySelectorAll('#chips span')].some((c) => c.textContent === '30 tok') "
+                    "&& document.querySelector('#drawer-save').getBoundingClientRect().bottom <= innerHeight",
+}
+
+
+class Failure(Exception):
+    """A check's expectation was not met."""
+
+
+class Overrun(BaseException):
+    """The whole run ran out of time. Not an Exception, so that no check swallows it."""
+
+
+# ---- the run -------------------------------------------------------------------------------------------------------------------
+
+class Context:
+    """What the checks share: the browser, the app, the images and the screenshots. A check makes the chats it needs itself, so that
+    one that fails does not take the next with it."""
+
+    def __init__(self, browser: Browser, app: Optional[App], base: str, work: str, out_dir: Optional[str]) -> None:
+        self.browser, self.app, self.base, self.work, self.out_dir = browser, app, base, work, out_dir
+        self.serial = 0
+        self.shots = []  # type: List[Dict[str, Any]]
+        self.stop_script = None  # type: Optional[str]   # the id of the script that stores "stop_on_repeat: false" before each page loads
+        self.console = []  # type: List[str]
+        self.images = {}  # type: Dict[str, str]
+        self.downloads = os.path.join(work, "downloads")
+        os.makedirs(self.downloads)
+        for name, (w, h) in {"a": (320, 320), "b": (288, 256), "c": (256, 224)}.items():
+            self.images[name] = os.path.join(work, "xray_{}.png".format(name))
+            with open(self.images[name], "wb") as handle:
+                handle.write(png_bytes(w, h))
+
+    # -- the stop switch: on in the page's defaults, off for a check that needs a turn that runs to its budget
+    def stop_off(self) -> None:
+        """From the next page load on, the stored settings say stop_on_repeat false. The tiny model loops after about 20 tokens, and with the
+        page's default (the switch on) a turn ends there; a check that needs a long turn (a Stop to press, a stream to watch, a reload in
+        the middle) asks for this first, and so does not depend on how long the model happens to write."""
+        if self.stop_script is None:
+            self.stop_script = self.browser.call("Page.addScriptToEvaluateOnNewDocument", source=STOP_OFF_JS)["identifier"]
+
+    def stop_default(self) -> None:
+        """Back to the page's defaults: the script is removed and whatever it stored is forgotten. run_all has run_check do this before every check."""
+        if self.stop_script is not None:
+            self.browser.call("Page.removeScriptToEvaluateOnNewDocument", identifier=self.stop_script)
+            self.stop_script = None
+        forget_settings(self.browser)
+
+    # -- the page
+    def open(self, hash_: str = "", viewport: Tuple[int, int] = DESKTOP, scheme: str = "light", base: Optional[str] = None) -> None:
+        """A fresh load of the app, at this viewport and colour scheme. The query is unique, so that a stale page cannot pass."""
+        b = self.browser
+        self.serial += 1
+        b.set_viewport(viewport[0], viewport[1], scheme)
+        b.call("Page.navigate", url="{}?run={}{}".format(base or self.base, self.serial, hash_))
+        b.wait_for("location.search === '?run=%d' && document.readyState === 'complete' && !!document.querySelector('#exports')"
+                   % self.serial, what="the page to load")
+        b.wait_for("document.querySelector('#mode-badge').textContent !== '' && location.hash !== ''", what="the app to start")
+
+    def card(self) -> Optional[Dict[str, Any]]:
+        return self.browser.evaluate("(%s)()" % CARD_JS)
+
+    def wait_card(self, status: Optional[str] = None, timeout: float = 20.0, message: Optional[str] = None) -> Dict[str, Any]:
+        """The newest card, once it has this status and its pictures have loaded (P6-B: they arrive after the card)."""
+        cond = "(() => { const c = (%s)(); return c && c.pending === 0 && %s ? c : null; })()" % (
+            CARD_JS, "c.status === %s" % json.dumps(status) if status else "true")
+        return self.browser.wait_for(cond, timeout, message or "a card" + (" that is " + status if status else ""))
+
+    def attach(self, name: str) -> None:
+        """Choose the image as the file dialog would, and wait for the composer to show it."""
+        self.browser.set_files("#file", [self.images[name]])
+        self.browser.wait_for("!document.querySelector('#preview').hidden && document.querySelector('#preview').textContent.indexOf('xray_%s') >= 0" % name,
+                              what="the attached image in the composer")
+
+    def send(self, note: Optional[str] = None) -> None:
+        if note:
+            self.browser.click("#prompt")
+            self.browser.insert_text(note)
+        self.browser.click("#send")
+
+    def session_id(self) -> str:
+        return self.browser.evaluate("location.hash.replace('#/s/', '')")
+
+    def run_turn(self, name: str, note: Optional[str] = None, timeout: float = 30.0) -> Dict[str, Any]:
+        """Attach, send and wait until that turn is over; -> its settled card (the newest: a turn before it does not count)."""
+        before = self.browser.evaluate("document.querySelectorAll('#conversation article.card').length")
+        self.attach(name)
+        self.send(note)
+        return self.browser.wait_for("(() => { const c = (%s)(); return c && c.cards > %d && c.status !== 'running' && c.pending === 0 ? c : null; })()"
+                                     % (CARD_JS, before), timeout, "the turn to end")
+
+    def shot(self, key: str, name: str, what: str, viewport: Tuple[int, int], scheme: str = "light") -> None:
+        """A screenshot, once the page itself says that it shows what `key` claims (SHOT_RULES)."""
+        rule = SHOT_RULES[key]
+        if not self.browser.evaluate("(() => { %s })()" % rule):
+            raise Failure("screenshot {}: the page does not show {}".format(name, what))
+        if self.out_dir is None:
+            return
+        os.makedirs(self.out_dir, exist_ok=True)
+        file_name = "{}_{}x{}_{}.png".format(name, viewport[0], viewport[1], scheme)
+        path = os.path.join(self.out_dir, file_name)
+        size = self.browser.screenshot(path)
+        if not self.browser.evaluate("(() => { %s })()" % rule):   # still so after the capture: the picture cannot be of another state
+            os.remove(path)
+            raise Failure("screenshot {}: the page stopped showing {} while it was being taken".format(name, what))
+        self.shots.append({"file": file_name, "shows": what, "viewport": list(viewport), "scheme": scheme, "bytes": size,
+                           "page_confirmed": True})
+
+
+def drain_console(browser: Browser, console: List[str]) -> None:
+    """Pull what the page logged since the last call, appended to `console`: errors and uncaught exceptions only. The features check reads its
+    console with this too (P6-F fix 1)."""
+    browser.evaluate("0")   # an answer from the page: the events that came before it are in the record
+    for params in browser.events("Runtime.consoleAPICalled"):
+        if params.get("type") == "error":
+            console.append("console.error: " + " ".join(str(a.get("value", a.get("description", ""))) for a in params.get("args", []))[:200])
+    for params in browser.events("Runtime.exceptionThrown"):
+        details = params.get("exceptionDetails", {})
+        console.append("uncaught: " + str((details.get("exception") or {}).get("description") or details.get("text"))[:200])
+
+
+def screen_reader_only(selector: str) -> bool:
+    """Whether Chrome's name for a node (its tag and classes: "span.visually-hidden") is the page's text for a screen reader, which is drawn as
+    one clipped pixel. It has no pixels of its own to be too faint, and the audit reads it against the page's ground and not against what it
+    sits in (the ": positive" of a label chip came out at 1.00:1 in light and 1.16:1 in dark, beside a chip whose seen text was fine)."""
+    return re.search(r"\.visually-hidden(?![\w-])", selector) is not None
+
+
+def faint_texts(found: List[Dict[str, Any]]) -> List[str]:
+    """One line per text of the audit's findings that a user can see and is too faint: not the audit's own canary, not text for a screen reader."""
+    return ["{} {:.2f}:1 (needs {})".format(i["selector"], i["contrastRatio"], i["thresholdAA"]) for i in found
+            if "contrast-canary" not in i["selector"] and not screen_reader_only(i["selector"])]
+
+
+def contrast_issues(b: Browser) -> List[str]:
+    """Chrome's own contrast audit (WCAG AA) of what the page shows now: one line per text that is too faint, the canary left out."""
+    b.call("Audits.enable")
+    b.evaluate("(%s)()" % CANARY_JS)
+    b.events("Audits.issueAdded")
+    b.call("Audits.checkContrast", reportAAA=False)
+    found = []  # type: List[Dict[str, Any]]
+    deadline = time.time() + 8
+    while time.time() < deadline and not any("contrast-canary" in i["selector"] for i in found):   # the canary says the audit is done
+        time.sleep(0.1)
+        b.evaluate("0")
+        for event in b.events("Audits.issueAdded"):
+            if event["issue"]["code"] == "LowTextContrastIssue":
+                detail = event["issue"]["details"]["lowTextContrastIssueDetails"]
+                found.append(dict(detail, selector=detail["violatingNodeSelector"]))
+    b.evaluate("document.querySelector('#contrast-canary').remove()")
+    if not any("contrast-canary" in i["selector"] for i in found):
+        raise Failure("Chrome's contrast audit did not report its canary: the audit did not run")
+    return faint_texts(found)
+
+
+def one_line(text: Any, limit: int = 220) -> str:
+    out = " ".join(str(text).split())
+    return out if len(out) <= limit else out[:limit - 1] + "…"
+
+
+def expect(condition: Any, message: str) -> None:
+    if not condition:
+        raise Failure(message)
+
+
+# ---- the AX tree ------------------------------------------------------------------------------------------------------------------
+
+class Ax:
+    """Accessibility.getFullAXTree, indexed by node id and by the DOM node a node stands for."""
+
+    def __init__(self, browser: Browser) -> None:
+        nodes = browser.call("Accessibility.getFullAXTree")["nodes"]
+        self.by_id = {n["nodeId"]: n for n in nodes}
+        self.by_backend = {n["backendDOMNodeId"]: n for n in nodes if n.get("backendDOMNodeId") is not None}
+
+    @staticmethod
+    def role(node: Dict[str, Any]) -> str:
+        return (node.get("role") or {}).get("value", "")
+
+    @staticmethod
+    def name(node: Dict[str, Any]) -> str:
+        return (node.get("name") or {}).get("value", "")
+
+    @staticmethod
+    def prop(node: Dict[str, Any], key: str) -> Any:
+        for p in node.get("properties", []):
+            if p["name"] == key:
+                return p["value"].get("value")
+        return None
+
+    def text(self, node: Dict[str, Any]) -> str:
+        """What a screen reader reads of the node's contents: the text of its descendants that are exposed (aria-hidden and
+        display: none are not), in order."""
+        parts = []  # type: List[str]
+
+        def walk(n: Dict[str, Any]) -> None:
+            if self.role(n) == "StaticText" and not n.get("ignored"):
+                parts.append(self.name(n))
+            for child in n.get("childIds", []):
+                if child in self.by_id:
+                    walk(self.by_id[child])
+
+        walk(node)
+        return "".join(parts)
+
+
+# The roles of the accessibility tree that are no control: text and structure. The list is closed on purpose: a role that is not on it (a control,
+# or one nobody has said is not) is reported when it has no name, so that nothing a user can operate is let through by its tabindex.
+NON_CONTROL_ROLES = ("paragraph", "generic", "heading", "group", "region", "main", "article", "list", "listitem", "figure", "StaticText")
+
+
+def focus_target_only(attributes: List[str], role: str) -> bool:
+    """Whether an element, given as the flat attribute list DOM.describeNode returns (name, value, name, value, ...) and the role the tree gives it,
+    can be focused and is no control and no stop of Tab: its role is one of NON_CONTROL_ROLES and its tabindex is a whole number below zero ('-1',
+    '-2'; not '-0', which is zero, nor anything that is not a whole number). The page uses such an element to hold the focus where a control that
+    has gone was (a matching report's text after Show less), and the tree calls it focusable all the same. An unnamed <button tabindex="-1">
+    is not one: it is a control, and a key reaches it by an arrow."""
+    value = dict(zip(attributes[0::2], attributes[1::2])).get("tabindex", "").strip()
+    return role in NON_CONTROL_ROLES and re.fullmatch(r"-0*[1-9]\d*", value) is not None
+
+
+def unnamed_controls(b: Any, exposed: List[Dict[str, Any]]) -> Tuple[List[Tuple[str, Any]], List[Tuple[str, Any]]]:
+    """Of the exposed nodes a user can focus, the ones with no accessible name, as (role, backend DOM node id): -> (those that are controls, those
+    that are focus targets no key reaches and are left out, focus_target_only)."""
+    unnamed, left_out = [], []  # type: List[Tuple[str, Any]], List[Tuple[str, Any]]
+    for node in exposed:
+        if Ax.name(node).strip():
+            continue
+        attributes = b.call("DOM.describeNode", backendNodeId=node["backendDOMNodeId"]).get("node", {}).get("attributes", []) \
+            if node.get("backendDOMNodeId") is not None else []
+        (left_out if focus_target_only(attributes, Ax.role(node)) else unnamed).append((Ax.role(node), node.get("backendDOMNodeId")))
+    return unnamed, left_out
+
+
+# ---- the checks --------------------------------------------------------------------------------------------------------------------
+
+def check_stream(ctx: Context) -> Tuple[str, Dict[str, Any]]:
+    b = ctx.browser
+    ctx.stop_off()   # the report is watched growing over many snapshots: the turn runs to its 40 tokens
+    ctx.open("#/new")
+    ctx.attach("a")
+    b.run(RECORD_JS, None)
+    started = time.time()
+    ctx.send("tokens %d" % STREAM_TOKENS)
+    shot_taken = False
+    deadline = time.time() + 40
+    while True:
+        progress = b.evaluate("(%s)()" % PROGRESS_JS)
+        if progress is not None and progress["status"] == "running" and progress["snapshots"] >= 10 and not shot_taken:
+            ctx.shot("streaming", "streaming", "a turn that is running, its report part-written, and Stop shown", DESKTOP)
+            shot_taken = True
+        if progress is not None and progress["status"] != "running":
+            break
+        if time.time() > deadline:
+            raise Failure("the card was still running after 40 s")
+        time.sleep(0.04)
+    elapsed = time.time() - started
+    expect(shot_taken, "the turn ended before 10 snapshots were seen running; no mid-turn picture could be taken")
+    b.wait_for("!document.querySelector('#conversation').hasAttribute('aria-busy')", 3, "aria-busy to come off #conversation")   # a frame after the card
+    rec = b.evaluate("(%s)()" % RECORDED_JS)
+    final = ctx.card()
+    texts = rec["texts"]
+    frames = rec["frames"]
+    expect(final["status"] == "done", "the card ended {}, not done".format(final["status"]))
+    expect(sorted(final["stages"]) == sorted(STAGES), "the timeline shows {}".format(sorted(final["stages"])))
+    unsettled = {k: v for k, v in final["stages"].items() if v not in SETTLED}
+    expect(not unsettled, "stages not settled: {}".format(unsettled))
+    seen_running = sorted({STAGES[i] for f in frames for i, s in enumerate(f["stages"]) if s == "running" and i < len(STAGES)})
+    expect("generate" in seen_running, "the generate stage was never seen running")
+    expect(len(texts) >= 3, "the report changed over {} snapshots, not 3 or more".format(len(texts)))
+    busy = rec["busy"]
+    expect([x["on"] for x in busy[-2:]] == [True, False], "aria-busy on #conversation went {}, not on and then off".format([x["on"] for x in busy]))
+    done_at = next(f["t"] for f in frames if f["status"] == "done")
+    expect(busy[-1]["t"] >= done_at, "aria-busy came off at {} ms, before the card was done at {} ms".format(busy[-1]["t"], done_at))
+    expect(len(texts[-1]) > len(texts[0]), "the report did not grow: {} then {} characters".format(len(texts[0]), len(texts[-1])))
+    expect(final["report"].strip() != "", "the settled card has no report")
+    said = [s["text"] for s in rec["said"]]
+    expect(said and said[-1] == "Report ready", "the status region ended on {!r}, not 'Report ready'".format(said[-1] if said else None))
+    expect("generate running" in said, "the status region never said 'generate running': {}".format(said))
+    controls = b.evaluate("({ send: !document.querySelector('#send').disabled, stop: document.querySelector('#stop').hidden })")
+    expect(controls == {"send": True, "stop": True}, "after the turn Send/Stop are {}".format(controls))
+    # The settled pair is shot from a turn run with the page's own settings (the stop switch on), not from the long turn above: it ends by
+    # itself, and its card says why, with no chip that says the switch is off.
+    ctx.stop_default()
+    ctx.open("#/new")
+    own = ctx.run_turn("a")
+    expect(own["status"] == "done", "the turn run with the page's own settings ended {}".format(own["status"]))
+    own_page, own_turn = b.evaluate("(%s)()" % SHOWN_JS), b.evaluate("(%s)()" % TURN_JS)
+    expect(own_page["notes"] == [REPEAT_NOTE] and "full budget" not in own_turn["chips"] and "full budget" not in b.evaluate("(%s)()" % DRAWER_JS)["chips"],
+           "the page's own turn says {} with chips {}: it should say {!r} and no full budget".format(own_page["notes"], own_turn["chips"], REPEAT_NOTE))
+    ctx.shot("settled", "settled", "a finished turn run with the page's own settings: stages, the report, the note that says why it stopped, provenance", DESKTOP)
+    b.set_viewport(DESKTOP[0], DESKTOP[1], "dark")
+    ctx.shot("settled", "settled", "the same finished turn in the dark colour scheme", DESKTOP, "dark")
+    b.set_viewport(DESKTOP[0], DESKTOP[1], "light")
+    states = {s: final["stages"][s] for s in STAGES}
+    data = {"stages": states, "stages_seen_running": seen_running, "snapshots": len(texts), "report_chars": [len(texts[0]), len(texts[-1])],
+            "frames_recorded": len(frames), "status_region": said, "aria_busy": [[x["on"], x["t"]] for x in busy[-2:]], "card_done_ms": done_at,
+            "token_budget": STREAM_TOKENS, "seconds": round(elapsed, 2),
+            "settled_pair_from_a_default_turn": {"notes": own_page["notes"], "chips": own_turn["chips"], "footer": own_page["footer"]}}
+    done = sum(1 for v in states.values() if v == "done")
+    return ("{} stages settled ({} done, {} skipped); {} snapshots, report {} -> {} chars; status ended on 'Report ready'; done in {:.1f} s".format(
+        len(states), done, len(states) - done, len(texts), len(texts[0]), len(texts[-1]), elapsed), data)
+
+
+def first_difference(a: str, b: str) -> str:
+    n = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+    return "first difference at {}: {!r} against {!r}".format(n, a[max(0, n - 40):n + 60], b[max(0, n - 40):n + 60])
+
+
+def check_reload(ctx: Context) -> Tuple[str, Dict[str, Any]]:
+    b = ctx.browser
+    ctx.stop_off()   # a reload in the middle of a 150-token turn needs a turn that is still running
+    ctx.open("#/new")
+    before = ctx.run_turn("a", "tokens 24")
+    session = ctx.session_id()
+    expect(before["status"] == "done", "the turn ended {}".format(before["status"]))
+    b.call("Page.reload")
+    b.wait_for("document.readyState === 'complete' && !!document.querySelector('#exports')", what="the page to reload")
+    after = ctx.wait_card("done", message="the replayed card")
+    expect(b.evaluate("location.hash") == "#/s/" + session, "the address is no longer this chat")
+    expect(after["id"] == before["id"], "another message is shown: {}".format(after["id"]))
+    expect(after["stages"] == before["stages"], "stage states differ: {} against {}".format(before["stages"], after["stages"]))
+    expect(after["text"] == before["text"], "text differs: " + first_difference(before["text"], after["text"]))
+    expect(after["html"] == before["html"], "markup differs: " + first_difference(before["html"], after["html"]))
+    # A reload in the middle of a turn: the page finds the turn running, follows it to its end, and the card it ends with is the one
+    # that another reload shows. The turn is held (App.hold) after its first snapshot while the page is reloaded and has found it: the tiny
+    # engine runs on its own clock, and a 150-token turn of 20 ms steps is over in 3 s, so a reload that took longer than that (a loaded
+    # machine; it did about one run in four) found the turn done, and the step failed. It is released in a finally, so that a step that fails
+    # while it holds a turn does not leave the checks after it waiting on it. With --url the app is someone else's and cannot be held: the
+    # step then runs as it did, and is as sensitive to the load as it was.
+    held = ctx.app is not None
+    if held:
+        ctx.app.hold()
+    try:
+        ctx.attach("b")
+        ctx.send("tokens 150")
+        b.wait_for("(() => { const c = (%s)(); return c && c.cards === 2 && c.status === 'running' && c.report.length > 0 ? c : null; })()" % CARD_JS,
+                   20, "the second turn to start writing")
+        message = ctx.card()["id"]
+        b.call("Page.reload")
+        b.wait_for("document.readyState === 'complete' && !!document.querySelector('#exports')", what="the page to reload")
+        b.wait_for("(() => { const c = (%s)(); return c && c.cards === 2 && c.status === 'running' ? c : null; })()" % CARD_JS,
+                   10, "the turn found running after the reload")
+        found = b.evaluate("({ send: !document.querySelector('#send').disabled, stop: !document.querySelector('#stop').hidden,"
+                           " busy: document.querySelector('#conversation').hasAttribute('aria-busy') })")
+        expect(found == {"send": False, "stop": True, "busy": True}, "the page that found a running turn has Send/Stop/aria-busy {}".format(found))
+        if held:   # the hold is in force, which a launcher that did not install it would not say: the server's own count of snapshots stands still
+            count_then, status_then = snapshot_count(b, message)
+            time.sleep(0.3)   # 15 steps of the 20 ms engine, had the turn gone on
+            count_now, status_now = snapshot_count(b, message)
+            expect(status_then == status_now == "running" and count_then == count_now,
+                   "the held turn did not hold: {} snapshots, then {} after 0.3 s (status {}, then {})".format(count_then, count_now, status_then, status_now))
+    finally:
+        if held:
+            ctx.app.release()
+    followed = ctx.wait_card("done", timeout=30, message="the turn the reloaded page was following")
+    ended = b.evaluate("({ send: !document.querySelector('#send').disabled, stop: document.querySelector('#stop').hidden })")
+    expect(ended == {"send": True, "stop": True}, "when the followed turn ended Send/Stop were {}".format(ended))
+    b.call("Page.reload")
+    b.wait_for("document.readyState === 'complete' && !!document.querySelector('#exports')", what="the page to reload again")
+    replayed = ctx.wait_card("done", message="the replayed second card")
+    expect(replayed["id"] == followed["id"] and replayed["cards"] == 2, "another turn is shown after the second reload: {}".format(replayed["id"]))
+    expect(replayed["html"] == followed["html"], "the followed card is not the replayed one: " + first_difference(followed["html"], replayed["html"]))
+    return ("the card after Page.reload equals the live one ({} characters of markup, the same six stage states); a reload mid-turn ({}) followed "
+            "the running turn to the card another reload shows".format(len(after["html"]), "the turn held while the page reloaded" if held
+                                                                         else "no hold: the app is not this check's"),
+            {"markup_chars": len(after["html"]), "text_chars": len(after["text"]), "stages": after["stages"],
+             "mid_turn_reload": {"turn_held": held, "snapshots_while_held": [count_then, count_now] if held else None, "found_running": found,
+                                 "ended": ended, "followed_equals_replayed": True, "markup_chars": len(replayed["html"])}})
+
+
+def server_status(base: str, message: str) -> str:
+    """A message's status as the server has it, asked from here: the page is under watch and must not be the one that asks."""
+    with urllib.request.urlopen("{}v1/messages/{}?after=0".format(base, message), timeout=10) as response:
+        return json.load(response)["status"]
+
+
+def strays(shown: List[str], message_ids: Sequence[str], gallery_rows: Iterable[int]) -> List[str]:
+    """Of the pictures shown (each its data-src, or "src <src>" for one with none), those that are not the chat's own: a picture of the chat
+    names one of its messages (/v1/messages/<id>/image?...) or a gallery row one of its retrieve stages named (/v1/gallery/images/<row>,
+    P6 fix 1). One with no data-src is a preview the page made of a file, a stale one once the chat is replayed."""
+    own = tuple("/v1/messages/{}/image?".format(i) for i in message_ids)
+    rows = {"/v1/gallery/images/{}".format(row) for row in gallery_rows}
+    return [s for s in shown if not ((own and s.startswith(own)) or s in rows)]
+
+
+def retrieved_rows(messages: Iterable[Any]) -> Set[int]:
+    """The gallery rows the retrieve stages of these stored messages named (private mode: a neighbour's gallery_row). Public mode names none."""
+    rows = set()  # type: Set[int]
+    for message in messages:
+        for row in (message.get("events") if isinstance(message, dict) else None) or []:
+            data = row.get("data") if isinstance(row, dict) else None
+            if not (isinstance(data, dict) and row.get("event") == "stage_end" and data.get("stage") == "retrieve"):
+                continue
+            detail = data.get("detail") if isinstance(data.get("detail"), dict) else {}
+            for neighbour in detail.get("image_neighbors") or []:
+                if isinstance(neighbour, dict) and type(neighbour.get("gallery_row")) is int:
+                    rows.add(neighbour["gallery_row"])
+    return rows
+
+
+def stray_images(b: Browser, base: str, session: str) -> List[str]:
+    """The pictures in the conversation that are not this chat's own (P6-B, strays): its messages, and the gallery rows its turns retrieved,
+    are asked of the server from here, so that the page under watch is not the one that asks."""
+    def get(path: str) -> Any:
+        with urllib.request.urlopen("{}v1/{}".format(base, path), timeout=10) as response:
+            return json.load(response)
+
+    messages = get("sessions/{}".format(session))["messages"]
+    rows = retrieved_rows(get("messages/{}?after=0".format(m["id"])) for m in messages if m["role"] == "assistant")
+    shown = b.evaluate("[...document.querySelectorAll('#conversation img')].map((i) => i.getAttribute('data-src') || ('src ' + (i.getAttribute('src') || '')))")
+    return strays(shown, [m["id"] for m in messages], rows)
+
+
+def check_sessions(ctx: Context) -> Tuple[str, Dict[str, Any]]:
+    b = ctx.browser
+    b.call("Network.enable")
+    ctx.stop_off()   # a chat is left while its 150-token turn runs, and the turn must still be running to be left
+    ctx.open("#/new")
+    card_a = ctx.run_turn("a", "tokens 24")
+    id_a, msg_a = ctx.session_id(), card_a["id"]
+    b.click("#new-session")
+    b.wait_for("location.hash === '#/new' && document.querySelectorAll('#conversation > *').length === 0", what="an empty new chat")
+    card_b = ctx.run_turn("b", "tokens 24")
+    id_b, msg_b = ctx.session_id(), card_b["id"]
+    expect(id_b != id_a and msg_b != msg_a, "the second turn did not make a chat of its own")
+    rows = b.evaluate("[...document.querySelectorAll('#session-list li')].map((li) => li.getAttribute('data-session'))")
+    expect(rows[:2] == [id_b, id_a], "the sidebar lists {} instead of [new, first]".format(rows))
+
+    def show(session: str, message: str, filename: str) -> Dict[str, Any]:
+        b.click('#session-list li[data-session="%s"] a' % session)
+        card = b.wait_for("(() => { const c = (%s)(); return c && c.id === %s && c.status === 'done' && c.pending === 0 ? c : null; })()"
+                          % (CARD_JS, json.dumps(message)), 20, "the card of {}".format(session))
+        # a user turn as it reads: its text, and its picture's alt text (P6-B: a replayed upload shows its thumbnail, named by its file)
+        facts = b.evaluate("({ cards: document.querySelectorAll('#conversation article.card').length,"
+                           " users: [...document.querySelectorAll('#conversation .turn.user')].map((u) => u.textContent"
+                           " + [...u.querySelectorAll('img')].map((i) => ' ' + (i.getAttribute('alt') || '')).join('')),"
+                           " current: [...document.querySelectorAll('#session-list [aria-current]')].map((a) => a.parentNode.getAttribute('data-session')),"
+                           " hash: location.hash, preview: document.querySelector('#preview').hidden,"
+                           " send: !document.querySelector('#send').disabled, stop: document.querySelector('#stop').hidden })")
+        expect(card["cards"] == 1 and facts["cards"] == 1, "{} shows {} cards".format(session, facts["cards"]))
+        expect(facts["hash"] == "#/s/" + session, "the address is {}".format(facts["hash"]))
+        expect(facts["current"] == [session], "the sidebar marks {} as the current chat".format(facts["current"]))
+        expect(len(facts["users"]) == 1 and filename in facts["users"][0], "the user turn is {!r}, not the one for {}".format(facts["users"], filename))
+        stray = stray_images(b, ctx.base, session)
+        expect(not stray, "a stale preview image, or another chat's, is still on the page: {}".format(stray))
+        expect(facts["send"] and facts["stop"], "the composer is locked in {}".format(session))
+        expect(facts["preview"], "an image is attached in the composer of {}".format(session))
+        return card
+
+    to_a = show(id_a, msg_a, "xray_a.png")
+    expect(to_a["html"] == card_a["html"], "the first chat's card differs from the one it had: " + first_difference(card_a["html"], to_a["html"]))
+    to_b = show(id_b, msg_b, "xray_b.png")
+    expect(to_b["html"] == card_b["html"], "the second chat's card differs from the one it had: " + first_difference(card_b["html"], to_b["html"]))
+    # Leave a chat with a turn running in it: its stream must go with the view, nothing may ask for the turn while the chat is away,
+    # and the turn must still be there, whole, when the chat is opened again.
+    ctx.attach("c")
+    b.events("Network.requestWillBeSent")
+    b.events("Network.loadingFailed")
+    ctx.send("tokens 150")
+    b.wait_for("(() => { const c = (%s)(); return c && c.cards === 2 && c.status === 'running' && c.report.length > 0 ? c : null; })()" % CARD_JS,
+               20, "the second turn of the second chat to start writing")
+    msg_b2 = ctx.card()["id"]
+    b.evaluate("0")
+    streams = [p["requestId"] for p in b.events("Network.requestWillBeSent", clear=False)
+               if p["request"]["method"] == "POST" and p["request"]["url"].endswith("/messages")]
+    expect(len(streams) == 1, "{} turn requests were sent for one turn".format(len(streams)))
+    b.click('#session-list li[data-session="%s"] a' % id_a)
+    b.wait_for("(() => { const c = (%s)(); return c && c.id === %s && c.pending === 0 ? c : null; })()" % (CARD_JS, json.dumps(msg_a)), 20,
+               "the first chat's card")
+    pictures_a = b.evaluate("document.querySelectorAll('#conversation img').length")   # its own (P6-B): the thumbnail and the card's two
+    samples = 0
+    deadline = time.time() + 20
+    while server_status(ctx.base, msg_b2) == "running":
+        if time.time() > deadline:
+            raise Failure("the turn left running in the second chat never ended")
+        seen = b.evaluate("({ ids: [...document.querySelectorAll('#conversation article.card')].map((c) => c.getAttribute('data-message-id')),"
+                          " send: !document.querySelector('#send').disabled, stop: document.querySelector('#stop').hidden })")
+        samples += 1
+        expect(seen["ids"] == [msg_a], "the first chat shows {} while the second one's turn runs".format(seen["ids"]))
+        expect(seen["send"] and seen["stop"], "the first chat's composer was locked by the other chat's turn")
+        time.sleep(0.08)
+    expect(samples >= 1, "the turn ended before the other chat could be watched: nothing was sampled")   # else every assertion above is vacuous
+    time.sleep(0.4)   # and a little longer: nothing may still arrive
+    after = b.evaluate("({ ids: [...document.querySelectorAll('#conversation article.card')].map((c) => c.getAttribute('data-message-id')),"
+                       " img: [...document.querySelectorAll('#conversation img')].length })")
+    after["stray"] = stray_images(b, ctx.base, id_a)
+    expect(after["ids"] == [msg_a] and after["img"] == pictures_a and not after["stray"],
+           "the first chat changed after the other turn ended: {} (it had {} pictures)".format(after, pictures_a))
+    b.evaluate("0")
+    dropped = [p for p in b.events("Network.loadingFailed", clear=False) if p["requestId"] == streams[0]]
+    expect(dropped and dropped[0].get("canceled") is True, "the stream of the turn was not dropped when its chat was left: {}".format(dropped))
+    asked = [p["request"]["url"] for p in b.events("Network.requestWillBeSent") if p["request"]["method"] == "GET" and msg_b2 in p["request"]["url"]]
+    expect(not asked, "the page asked for the turn of the chat it had left: {}".format(asked))
+    b.click('#session-list li[data-session="%s"] a' % id_b)
+    cards = b.wait_for("(() => { const all = [...document.querySelectorAll('#conversation article.card')];"
+                       " const done = all.every((c) => c.getAttribute('data-status') === 'done');"
+                       " return all.length === 2 && done ? all.map((c) => c.getAttribute('data-message-id')) : null; })()",
+                       20, "both turns of the second chat, done")
+    expect(cards == [msg_b, msg_b2], "the second chat shows {} instead of [{}, {}]".format(cards, msg_b, msg_b2))
+    report2 = b.evaluate("document.querySelectorAll('#conversation article.card')[1].querySelector('.report-body').textContent")
+    expect(len(report2) > 100, "the turn that finished while the chat was left has a {}-character report".format(len(report2)))
+    stray = stray_images(b, ctx.base, id_b)
+    expect(not stray, "a stale preview image, or another chat's, is on the second chat: {}".format(stray))
+    return ("2 chats switched 4 times, each with its own card and user turn; leaving a running turn cancelled its stream (request aborted), "
+            "nothing asked for it ({} samples), and it replays done".format(samples),
+            {"sessions": [id_a, id_b], "messages": {"a": msg_a, "b": msg_b, "b2": msg_b2}, "samples_while_away": samples,
+             "stream_request_cancelled": True, "report_chars_of_turn_finished_while_away": len(report2)})
+
+
+def wait_download(directory: str, name: str, timeout: float = 15.0) -> str:
+    path = os.path.join(directory, name)
+    deadline = time.time() + timeout
+    last = -1
+    while time.time() < deadline:
+        if os.path.exists(path):
+            size = os.path.getsize(path)
+            if size > 0 and size == last:
+                return path
+            last = size
+        time.sleep(0.15)
+    raise Failure("{} was not downloaded within {:g} s (the folder has {})".format(name, timeout, sorted(os.listdir(directory))))
+
+
+def check_exports(ctx: Context) -> Tuple[str, Dict[str, Any]]:
+    b = ctx.browser
+    b.call("Browser.setDownloadBehavior", behavior="allow", downloadPath=ctx.downloads, eventsEnabled=True)
+    ctx.open("#/new")
+    ctx.run_turn("a", "tokens 24")
+    session = ctx.session_id()
+    ctx.run_turn("b", "tokens 24")   # a second turn in the same chat
+    ctx.open("#/s/" + session)       # exported from a page that replays it
+    ctx.wait_card("done", message="the chat to export")
+    expect(b.evaluate("!document.querySelector('#exports').hidden"), "the export buttons are not shown for an open chat")
+    b.click('#exports button[data-format="json"]')
+    path = wait_download(ctx.downloads, "session-{}.json".format(session))
+    with open(path, encoding="utf-8") as handle:
+        doc = json.load(handle)
+    expect(doc["session"]["id"] == session, "the JSON is for session {}".format(doc["session"]["id"]))
+    roles = [m["role"] for m in doc["messages"]]
+    expect(roles == ["user", "assistant", "user", "assistant"], "the JSON has messages {}".format(roles))
+    last_events = [m["events"][-1] for m in doc["messages"] if m["role"] == "assistant"]
+    expect(all(e["event"] == "message_stop" and e["data"]["status"] == "done" for e in last_events), "an exported log does not end in message_stop done")
+    b.click('#exports button[data-format="md"]')
+    md_path = wait_download(ctx.downloads, "session-{}.md".format(session))
+    with open(md_path, encoding="utf-8") as handle:
+        md = handle.read()
+    expect("## Turn 1" in md and "## Turn 2" in md, "the Markdown has no '## Turn 1' and '## Turn 2'")
+    expect("Research prototype; not for clinical use." in md, "the Markdown carries no disclaimer")
+    expect(b.evaluate("document.querySelector('#notice').hidden"), "the page showed a notice during the exports")
+    return ("JSON parses ({} bytes, {} messages, logs end in message_stop done); Markdown ({} bytes) has '## Turn 1' and '## Turn 2'".format(
+        os.path.getsize(path), len(doc["messages"]), os.path.getsize(md_path)),
+            {"json": {"file": os.path.basename(path), "bytes": os.path.getsize(path), "messages": len(doc["messages"]),
+                      "events_per_turn": [len(m["events"]) for m in doc["messages"] if m["role"] == "assistant"]},
+             "markdown": {"file": os.path.basename(md_path), "bytes": os.path.getsize(md_path),
+                          "headings": [line for line in md.splitlines() if line.startswith("## ")]}})
+
+
+def snapshot_count(b: Browser, message: str) -> Tuple[int, str]:
+    log = b.evaluate("(%s)(%s)" % (MESSAGE_JS, json.dumps(message)))
+    return sum(1 for e in log["events"] if e[0] == "content_block_delta"), log["status"]
+
+
+def check_stop(ctx: Context) -> Tuple[str, Dict[str, Any]]:
+    b = ctx.browser
+    ctx.stop_off()   # Stop is pressed in a turn that is writing: with the switch on the tiny turn ends by itself in about 30 tokens and the check flakes
+    ctx.open("#/new")
+    ctx.attach("a")
+    ctx.send("tokens 150")
+    card = b.wait_for("(() => { const c = (%s)(); return c && c.status === 'running' && c.report.length > 0 ? c : null; })()" % CARD_JS, 20,
+                      "the first snapshot of a 150-token turn")
+    message = card["id"]
+    b.wait_for("!document.querySelector('#stop').hidden && !document.querySelector('#stop').disabled", 5, "Stop to be usable")
+    at_press, _ = snapshot_count(b, message)
+    pressed = time.time()
+    b.click("#stop")
+    settled = b.wait_for("(() => { const c = (%s)(); return c && c.status !== 'running' ? c : null; })()" % CARD_JS, 10, "the stopped card")
+    seconds = time.time() - pressed
+    expect(settled["status"] == "aborted", "the card ended {}, not aborted".format(settled["status"]))
+    expect(settled["stopped"] and "stopped" in settled["stopped"].lower(), "the card's note is {!r}, not 'stopped'".format(settled["stopped"]))
+    total, status = snapshot_count(b, message)
+    expect(status == "aborted", "the server stored the turn as {}".format(status))
+    expect(total < 150, "all {} snapshots were produced".format(total))
+    expect(seconds < 2.0, "the card took {:.1f} s to say aborted after Stop was pressed".format(seconds))
+    expect(total - at_press <= 20, "{} more snapshots (steps of 20 ms) were produced after Stop was pressed".format(total - at_press))
+    time.sleep(0.5)
+    later_total, _ = snapshot_count(b, message)
+    expect(later_total == total, "the turn kept producing after it was stopped: {} then {}".format(total, later_total))
+    health = b.evaluate("(%s)()" % HEALTH_JS)
+    expect(health["turns_in_flight"] == 0, "the server still counts {} turns in flight".format(health["turns_in_flight"]))
+    controls = b.evaluate("({ send: !document.querySelector('#send').disabled, stop: document.querySelector('#stop').hidden,"
+                          " label: document.querySelector('#stop').textContent, said: document.querySelector('#status').textContent })")
+    expect(controls["send"] and controls["stop"] and controls["label"] == "Stop", "after the stop the controls are {}".format(controls))
+    expect(controls["said"] == "Turn stopped", "the status region says {!r}".format(controls["said"]))
+    skipped = sorted(k for k, v in settled["stages"].items() if v == "skipped")
+    ctx.shot("stopped", "stopped", "a turn that was stopped part-way: 'Turn stopped', the report so far", DESKTOP)
+    return ("stopped after {} of 150 snapshots ({} more by the time the card said aborted, {:.2f} s after the press); no more afterwards; note {!r}".format(
+        total, total - at_press, seconds, settled["stopped"]),
+            {"budget": 150, "snapshots_when_pressed": at_press, "snapshots_total": total, "seconds_to_aborted": round(seconds, 2),
+             "note": settled["stopped"], "server_status": status, "stages": settled["stages"], "skipped": skipped})
+
+
+def check_keyboard(ctx: Context) -> Tuple[str, Dict[str, Any]]:
+    b = ctx.browser
+    ctx.open("#/new")
+    # Tab leaves the page for the browser's own controls after the last control only when the browser's window is the active one; when it is not,
+    # which depends on the machine and not on the page, Tab wraps to the first control. The walk below asserts the first.
+    b.call("Page.bringToFront")
+    b.set_files("#file", [ctx.images["a"]])   # the file dialog is the one thing a script cannot press a key in
+    b.wait_for("!document.querySelector('#preview').hidden", what="the attached image")
+    stops = []  # type: List[str]
+    on_page = b.evaluate("(%s)()" % FOCUSABLE_JS)   # the tab stops of this page, in DOM order: the walk to the note field cannot need more
+    for _ in range(len(on_page) + 1):   # from the top of the page, Tab until the note field has focus
+        b.key("Tab", "Tab", 9)
+        stops.append(b.evaluate("window.__stop()"))
+        if stops[-1] == "#prompt":
+            break
+    expect(stops and stops[-1] == "#prompt", "Tab never reached the note field: {}".format(stops))
+    expect("#image-well" in stops and stops.index("#image-well") < stops.index("#prompt"), "Tab skipped the image well: {}".format(stops))
+    b.type_text("tokens 20")
+    expect(b.evaluate("document.querySelector('#prompt').value") == "tokens 20", "typing did not reach the note field")
+    b.key("Enter", "Enter", 13, text="\r")
+    card = b.wait_for("(() => { const c = (%s)(); return c && c.status !== 'running' ? c : null; })()" % CARD_JS, 30, "the turn that Enter sent")
+    expect(card["status"] == "done", "Enter sent a turn that ended {}".format(card["status"]))
+    expect(b.evaluate("document.activeElement.id") == "prompt", "focus is on {}, not back in the note field".format(b.evaluate("document.activeElement.id")))
+    # A page with a card on it: the whole tab order, from the top, against the DOM order.
+    b.call("Page.reload")
+    b.wait_for("document.readyState === 'complete' && !!document.querySelector('#exports')", what="the page to reload")
+    ctx.wait_card("done", message="the replayed card")
+    expected = b.evaluate("(%s)()" % FOCUSABLE_JS)
+    walked = []  # type: List[str]
+    rings = []  # type: List[Any]
+    for _ in range(len(expected) + 2):
+        b.key("Tab", "Tab", 9)
+        walked.append(b.evaluate("window.__stop()"))
+        rings.append(b.evaluate("window.__ring()"))
+    bare = [w for w, r in zip(walked, rings) if r is not None and not r["shown"]]
+    expect(not bare, "these tab stops show no focus ring: {}".format(bare))
+    expect(walked[:len(expected)] == expected, "Tab order differs from DOM order: {} against {}".format(walked[:len(expected)], expected))
+    expect(walked[len(expected)] == "body", "after the last control Tab stays in the page: {}".format(walked[len(expected)]))
+    def at(name: str) -> int:
+        expect(name in expected, "{} is not a tab stop (stops: {})".format(name, expected))
+        return expected.index(name)
+    chats = [i for i, name in enumerate(expected) if name.startswith("chat: ")]
+    expect(chats, "no chat link is a tab stop: {}".format(expected))
+    sidebar = [at("#new-session"), at("Export JSON"), at("Export Markdown")] + chats
+    stages = [at("stage:preprocess"), at("stage:encode"), at("stage:generate")]
+    composer = [at("#image-well"), at("#prompt"), at("#settings"), at("#send")]
+    expect(sidebar == sorted(sidebar) and max(sidebar) < min(stages) and max(stages) < min(composer) and composer == sorted(composer),
+           "the order is not sidebar (with its chats), then the card's stage buttons, then the composer: {}".format(expected))
+    expect(any(s.startswith("Delete chat") for s in expected) and any(s.startswith("Copy report") for s in expected),
+           "the chat's Delete or the card's Copy is not a tab stop: {}".format(expected))
+    # A stage's details open and close from the keyboard, with the focus staying on the button.
+    for _ in range(len(expected) + 1):
+        if b.evaluate("window.__stop()") == "stage:encode":
+            break
+        b.key("Tab", "Tab", 9)
+    expect(b.evaluate("window.__stop()") == "stage:encode", "Tab never came round to the encode button")
+    toggled = []
+    for label, press in (("Enter", lambda: b.key("Enter", "Enter", 13, text="\r")), ("Space", lambda: b.key(" ", "Space", 32, text=" "))):
+        press()
+        toggled.append(b.evaluate("({ expanded: document.activeElement.getAttribute('aria-expanded'),"
+                                  " open: document.activeElement.closest('li').classList.contains('open'), focus: window.__stop() })"))
+    expect(toggled == [{"expanded": "true", "open": True, "focus": "stage:encode"}, {"expanded": "false", "open": False, "focus": "stage:encode"}],
+           "Enter then Space on the encode button gave {}".format(toggled))
+    # Settings by keyboard: Enter opens the drawer and moves focus into it; Esc closes it and gives focus back to Settings.
+    for _ in range(len(expected) + 1):
+        if b.evaluate("window.__stop()") == "#settings":
+            break
+        b.key("Tab", "Tab", 9)
+    expect(b.evaluate("window.__stop()") == "#settings", "Tab never came back round to Settings")
+    b.key("Enter", "Enter", 13, text="\r")
+    opened = b.evaluate("({ hidden: document.querySelector('#drawer').hidden, expanded: document.querySelector('#settings').getAttribute('aria-expanded'),"
+                        " focus: window.__stop() })")
+    expect(opened["hidden"] is False and opened["expanded"] == "true", "Enter on Settings left the drawer {}".format(opened))
+    expect(b.evaluate("document.querySelector('#drawer').contains(document.activeElement)"), "focus did not move into the drawer: {}".format(opened["focus"]))
+    ctx.shot("drawer", "drawer", "the settings drawer open, focus inside it", DESKTOP)
+    b.key("Escape", "Escape", 27)
+    closed = b.evaluate("({ hidden: document.querySelector('#drawer').hidden, expanded: document.querySelector('#settings').getAttribute('aria-expanded'),"
+                        " focus: window.__stop() })")
+    expect(closed == {"hidden": True, "expanded": "false", "focus": "#settings"}, "Esc left {}".format(closed))
+    return ("Tab visits {} controls in DOM order, each with a focus ring; Enter sends; Enter and Space toggle a stage; "
+            "Enter opens the drawer and Esc closes it to Settings".format(len(expected)),
+            {"tab_stops": expected, "chat_links_among_them": len(chats), "every_stop_shows_a_focus_ring": True, "stops_to_note_field": stops,
+             "after_enter": {"status": card["status"], "focus": "prompt"}, "stage_toggle": {"Enter": toggled[0], "Space": toggled[1]},
+             "drawer": {"opened": opened, "closed": closed}})
+
+
+def check_narrow(ctx: Context) -> Tuple[str, Dict[str, Any]]:
+    b = ctx.browser
+    width = PHONE[0]
+    ctx.open("#/new", PHONE)
+    measured = {}  # type: Dict[str, Any]
+
+    def measure(state: str) -> None:
+        m = b.run(OVERFLOW_JS, {"width": width})
+        measured[state] = m
+        expect(m["inner"] == width, "the viewport is {} px wide, not {}".format(m["inner"], width))
+        for name, (sw, cw) in (("document", m["doc"]), ("#conversation", m["conversation"]), ("#composer", m["composer"])):
+            expect(sw <= cw, "{} overflows horizontally in the {} state: scrollWidth {} > clientWidth {}".format(name, state, sw, cw))
+        expect(not m["wide"], "in the {} state these reach past the {} px: {}".format(state, width, m["wide"]))
+
+    measure("empty chat")
+    card = ctx.run_turn("a", "tokens 24")
+    expect(card["status"] == "done", "the turn ended {}".format(card["status"]))
+    measure("settled card")
+    b.evaluate("document.querySelector('#conversation').scrollTop = 0")   # the page follows a turn to its end: from the top, the stage pills show
+    ctx.shot("settled", "settled", "a finished turn on a phone-width page, from its top: the image, the stage pills, the report", PHONE)
+    for stage in ("preprocess", "encode", "generate"):
+        b.click('#conversation li[data-stage="%s"] > button' % stage)
+    expect(b.evaluate("document.querySelectorAll('#conversation li.open').length") == 3, "the three stage details did not open")
+    measure("stage details open")
+    b.click("#sidebar-toggle")
+    expect(b.evaluate("document.body.classList.contains('sidebar-open')"), "the sidebar toggle did not open the sidebar")
+    measure("sidebar open")
+    b.key("Escape", "Escape", 27)
+    expect(not b.evaluate("document.body.classList.contains('sidebar-open')"), "Esc did not close the sidebar")
+    b.click("#settings")
+    expect(b.evaluate("!document.querySelector('#drawer').hidden"), "Settings did not open the drawer")
+    measure("drawer open")
+    reach = b.evaluate("(() => { const r = document.querySelector('#send').getBoundingClientRect();"
+                       " return r.bottom <= innerHeight && r.right <= innerWidth && r.left >= 0; })()")
+    expect(reach, "Send is outside the viewport")
+    return ("no horizontal overflow at {} px in 5 states (empty chat, settled card, stage details open, sidebar open, drawer open)".format(width),
+            {"viewport": list(PHONE), "overflow": {state: {"document": m["doc"], "conversation": m["conversation"], "composer": m["composer"]}
+                                                  for state, m in measured.items()}})
+
+
+def check_a11y(ctx: Context) -> Tuple[str, Dict[str, Any]]:
+    b = ctx.browser
+    b.call("Accessibility.enable")
+    # -- a live turn: the stage buttons and the status region
+    ctx.open("#/new")
+    b.run(RECORD_JS, None)
+    ctx.run_turn("a", "tokens 24")
+    said = [s["text"] for s in b.evaluate("(%s)()" % RECORDED_JS)["said"]]
+    expect(said and said[-1] == "Report ready", "the status region ended on {!r}".format(said[-1] if said else None))
+    ax = Ax(b)
+    exposed = [n for n in ax.by_id.values() if not n.get("ignored") and Ax.prop(n, "focusable") is True and Ax.role(n) != "RootWebArea"]
+    unnamed, focus_targets = unnamed_controls(b, exposed)   # the clamped texts of matching reports (a server with a gallery) are focus targets, no controls
+    expect(not unnamed, "controls a user can focus have no accessible name: {}".format(unnamed))
+    buttons = []
+    # The stage buttons are counted on the page, and read against what the server runs (/v1/models): the app of the checks has no gallery and no
+    # labeller, so three stages have a detail and a button; a tiny_gallery server runs retrieve and label too, and has five.
+    features = b.evaluate("(%s)()" % MODELS_JS)["features"]
+    expected = detailed_stages(features)
+    on_page = b.evaluate("[...document.querySelectorAll('#conversation li[data-stage] > button')].map((x) => x.closest('li').getAttribute('data-stage'))")
+    expect(on_page == expected, "the page has stage buttons for {}, where a server with the features {} has them for {}".format(on_page, features, expected))
+    ids = b.backend_ids('#conversation li[data-stage] > button')
+    expect(len(ids) == len(on_page), "{} stage buttons in the document, {} read off the page".format(len(ids), len(on_page)))   # zip would stop at the shorter
+    for stage, backend in zip(on_page, ids):
+        node = ax.by_backend.get(backend)
+        expect(node is not None, "the {} button is not in the accessibility tree".format(stage))
+        visible = b.evaluate("document.querySelector('#conversation li[data-stage=\"%s\"] > button').textContent" % stage)
+        expect(visible.strip(), "the {} button has no visible text".format(stage))   # an empty text is the start of every name
+        name = Ax.name(node)
+        expect(Ax.role(node) == "button", "the {} control is a {}, not a button".format(stage, Ax.role(node)))
+        expect(name.startswith(visible) and len(name) > len(visible),
+               "the {} button is named {!r}, which does not start with its text {!r} and add to it".format(stage, name, visible))
+        expect(name[:1].isalpha(), "the {} button is named {!r}: a glyph comes before its label".format(stage, name))
+        expect(Ax.prop(node, "expanded") is False, "the {} button's expanded state is {!r}, not false".format(stage, Ax.prop(node, "expanded")))
+        buttons.append({"stage": stage, "visible": visible, "name": name, "expanded": False})
+    expect(len(buttons) == len(on_page), "{} stage buttons were checked, not {}".format(len(buttons), len(on_page)))
+    b.click('#conversation li[data-stage="encode"] > button')
+    ax2 = Ax(b)
+    opened = ax2.by_backend[b.backend_ids('#conversation li[data-stage="encode"] > button')[0]]
+    expect(Ax.prop(opened, "expanded") is True, "after a click the encode button's expanded state is {!r}".format(Ax.prop(opened, "expanded")))
+    next(x for x in buttons if x["stage"] == "encode")["expanded_after_click"] = True
+    items = {}  # type: Dict[str, str]
+    for stage in STAGES:
+        li = ax2.by_backend[b.backend_ids('#conversation li[data-stage="%s"]' % stage)[0]]
+        items[stage] = ax2.text(li)
+    glyphed = {stage: spoken[:12] for stage, spoken in items.items() if not spoken[:1].isalpha()}
+    expect(not glyphed, "stage items read a glyph before their label (the ::before shape is part of what a screen reader hears): {}".format(glyphed))
+    plain = []
+    for stage in (s for s in STAGES if s not in on_page):   # the stages with no button are the skipped ones (no gallery, no labeller, no reference)
+        expect(stage in items[stage] and "skipped" in items[stage], "the skipped {} stage reads as {!r}".format(stage, items[stage]))
+        plain.append(items[stage])
+    status = [n for n in ax2.by_id.values() if Ax.role(n) == "status"]
+    expect(len(status) >= 1, "no status region in the accessibility tree")
+    region = next((n for n in status if ax2.text(n) == "Report ready"), None)
+    expect(region is not None, "no status region reads 'Report ready' (they read {})".format([ax2.text(n) for n in status]))
+    expect(Ax.prop(region, "live") == "polite", "the status region is live={!r}, not polite".format(Ax.prop(region, "live")))
+    faint = {}  # type: Dict[str, List[str]]
+    faint["settled card, light"] = contrast_issues(b)
+    b.click("#settings")
+    faint["drawer open, light"] = contrast_issues(b)
+    b.set_viewport(DESKTOP[0], DESKTOP[1], "dark")
+    faint["drawer open, dark"] = contrast_issues(b)
+    b.key("Escape", "Escape", 27)
+    faint["settled card, dark"] = contrast_issues(b)
+    b.set_viewport(DESKTOP[0], DESKTOP[1], "light")
+    expect(not any(faint.values()), "text below WCAG AA contrast: {}".format({k: v[:3] for k, v in faint.items() if v}))
+    # -- a labelled turn, live, on a second app with the tiny gallery: the chips
+    labelled = None
+    try:
+        labelled = App(static_dir=ctx.app.static_dir if ctx.app is not None else None, tiny_gallery=True)   # the page under test
+        ctx.open("", DESKTOP, "light", base=labelled.url)
+        settled = ctx.run_turn("a", "reference: " + LIVE_REFERENCE)
+        expect(settled["status"] == "done", "the labelled turn ended {}".format(settled["status"]))
+        expect(settled["stages"] == dict.fromkeys(STAGES, "done"), "the labelled turn's stages are {}".format(settled["stages"]))
+        with urllib.request.urlopen(labelled.url + "v1/messages/" + settled["id"], timeout=10) as response:
+            events = json.load(response)["events"]
+        found = {row["data"]["stage"]: row["data"].get("detail") or {} for row in events if row["event"] == "stage_end"}
+        positives = [n for n, v in found["label"].get("chexbert_14", {}).items() if v]
+        expect(len(found["label"].get("chexbert_14", {})) == 14, "the label stage stored {} labels".format(len(found["label"].get("chexbert_14", {}))))
+        expect(found["score"].get("reference_chexbert_14"), "the score stage stored no labels of the reference")
+        notes = b.evaluate("[...[...document.querySelectorAll('#conversation article.card')].pop().querySelectorAll('.labels .note')].map((n) => n.textContent)")
+        expect(notes == [], "the settled card still says {} where its chips are".format(notes))   # never "labelling…" once labelled
+        ax3 = Ax(b)
+        chips = []
+        for backend, label, value, agree in zip(
+                b.backend_ids("#conversation li.chip.label"),
+                *[b.evaluate("[...document.querySelectorAll('#conversation li.chip.label')].map((c) => c.getAttribute(%s))" % json.dumps(a))
+                  for a in ("data-label", "data-value", "data-agree")]):
+            node = ax3.by_backend.get(backend)
+            expect(node is not None, "the {} chip is not in the accessibility tree".format(label))
+            spoken = ax3.text(node)
+            state = "positive" if value == "1" else "negative"
+            expect(spoken.startswith(label) and (": " + state) in spoken, "the {} chip reads {!r}, not '{}: {}'".format(label, spoken, label, state))
+            expect(agree in ("true", "false"), "the {} chip has no agreement with the reference ({!r})".format(label, agree))
+            if agree == "true":
+                expect("matches reference" in spoken, "the {} chip reads {!r}, without 'matches reference'".format(label, spoken))
+            else:
+                expect("differs from reference" in spoken, "the {} chip reads {!r}, without 'differs from reference'".format(label, spoken))
+            expect("✓" not in spoken and "✗" not in spoken, "the {} chip reads its mark glyph aloud: {!r}".format(label, spoken))
+            chips.append(spoken)
+        expect(len(chips) == 14, "{} chips, not 14".format(len(chips)))
+        expect(sum(": positive" in c for c in chips) == len(positives) and sum(": negative" in c for c in chips) == 14 - len(positives),
+               "the chips say {} positive and {} negative, the label stage {} positive".format(
+                   sum(": positive" in c for c in chips), sum(": negative" in c for c in chips), len(positives)))
+        lists = [n for n in ax3.by_id.values() if Ax.role(n) == "list" and Ax.name(n).startswith("CheXbert-14")]
+        expect(len(lists) == 1, "the chip list has no accessible name that starts with 'CheXbert-14'")
+        b.evaluate("document.querySelector('#conversation .labels').scrollIntoView({ block: 'center' })")
+        ctx.shot("labelled_chips", "labelled_chips", "the 14 label chips of a live labelled turn, with agreement marks", DESKTOP)
+    finally:
+        if labelled is not None:
+            labelled.stop()
+    return ("stage buttons: their text, then state, with expanded, no glyph first; status region live=polite reads 'Report ready'; 14 chips of "
+            "a live labelled turn read '<name>: positive|negative' and whether each agrees with the reference; every control named; no text "
+            "under AA contrast in 4 states",
+            {"contrast_issues_under_aa": faint, "focusable_controls_named": len(exposed) - len(focus_targets),
+             "focus_targets_left_out": [role for role, _ in focus_targets], "server_features": features,
+             "stage_buttons_on_page": on_page, "stage_buttons": buttons, "skipped_stages": plain,
+             "stage_items_as_read": items,
+             "status_region": {"live": "polite", "text": "Report ready", "history": said}, "chips_on_live_labelled_turn": chips})
+
+
+def check_error(ctx: Context) -> Tuple[str, Dict[str, Any]]:
+    b = ctx.browser
+    b.call("Network.enable")
+    ctx.open("#/new")
+    ctx.attach("a")
+    b.click("#prompt")
+    b.insert_text("tokens 500")   # the drawer refuses a budget over 200 (with a line under the field), so the server's bounds are reached through the note's command
+    b.events("Network.responseReceived")
+    b.click("#send")
+    b.wait_for("!document.querySelector('#notice').hidden", 15, "the notice")
+    b.evaluate("0")
+    statuses = [(p["response"]["url"].split("?")[0].rsplit("/", 3)[-3:], p["response"]["status"]) for p in b.events("Network.responseReceived")
+                if p["response"]["url"].endswith("/messages")]
+    expect(statuses and statuses[-1][1] == 422, "the turn request was answered {}, not 422".format(statuses))
+    notice = b.evaluate("({ text: document.querySelector('#notice p').textContent, role: document.querySelector('#notice').getAttribute('role'),"
+                        " retry: !document.querySelector('#notice button:not([aria-label])').hidden, prompt: document.querySelector('#prompt').value,"
+                        " preview: !document.querySelector('#preview').hidden, file: document.querySelector('#preview span').textContent,"
+                        " turns: document.querySelectorAll('#conversation > *').length, send: !document.querySelector('#send').disabled,"
+                        " stop: document.querySelector('#stop').hidden, busy: document.querySelector('#conversation').hasAttribute('aria-busy') })")
+    expect("max_new_tokens" in notice["text"], "the notice says {!r}, not the server's reason".format(notice["text"]))
+    expect(notice["role"] == "alert", "the notice has role {!r}".format(notice["role"]))
+    expect(notice["prompt"] == "tokens 500" and notice["preview"] and "xray_a.png" in notice["file"], "the composer was not kept: {}".format(notice))
+    expect(notice["turns"] == 0, "the refused turn is still on the page ({} nodes)".format(notice["turns"]))
+    expect(notice["send"] and notice["stop"], "the composer is locked after the refusal")
+    ctx.shot("error_notice", "error_notice", "the dismissible notice above the composer, with the refused note and the image still in it", DESKTOP)
+    b.click('#notice button[aria-label="Dismiss"]')   # a click, as a tap on a phone: the focus is left to the browser (P6-A e)
+    dismissed = b.evaluate("({ hidden: document.querySelector('#notice').hidden, prompt: document.querySelector('#prompt').value,"
+                           " preview: !document.querySelector('#preview').hidden, focus: document.activeElement.id })")
+    expect(dismissed["hidden"] and dismissed["prompt"] == "tokens 500" and dismissed["preview"], "Dismiss changed the composer: {}".format(dismissed))
+    expect(dismissed["focus"] != "prompt", "a clicked Dismiss put the focus in the note field, which opens a phone's keyboard")
+    # The keyboard's Dismiss hands the focus to the note field, where the next note is typed: the same refusal again, dismissed with Enter.
+    b.click("#send")
+    b.wait_for("!document.querySelector('#notice').hidden", 15, "the notice again")
+    b.key("Shift", "ShiftLeft", 16)   # the keyboard's modality: a focus() now shows its ring, as a Tab to the button would
+    b.evaluate("document.querySelector('#notice button[aria-label=\"Dismiss\"]').focus()")
+    b.key("Enter", "Enter", 13, text="\r")
+    keyed = b.evaluate("({ hidden: document.querySelector('#notice').hidden, focus: document.activeElement.id })")
+    expect(keyed == {"hidden": True, "focus": "prompt"}, "a Dismiss pressed from the keyboard left {}".format(keyed))
+    dismissed["keyboard"] = keyed
+    # and the same composer sends once the note is fixed
+    b.evaluate("(() => { const p = document.querySelector('#prompt'); p.value = ''; p.dispatchEvent(new Event('input', { bubbles: true })); })()")
+    b.click("#send")
+    card = b.wait_for("(() => { const c = (%s)(); return c && c.status !== 'running' ? c : null; })()" % CARD_JS, 30, "the retried turn")
+    expect(card["status"] == "done", "the retried turn ended {}".format(card["status"]))
+    return ("a server {} showed the alert '{}', kept the note and the image; a clicked Dismiss left the focus alone and a keyed one handed it to "
+            "the note field; the same composer then sent".format(
+        statuses[-1][1], one_line(notice["text"], 60)),
+            {"http_status": statuses[-1][1], "notice": notice["text"], "composer_kept": True, "dismissed": dismissed})
+
+
+# ---- settings (P4-F, P4-G) ------------------------------------------------------------------------------------------------------
+
+BUDGET_FIELD = '#drawer input[data-setting="max_new_tokens"]'
+STOP_SWITCH = '#drawer input[data-setting="stop_on_repeat"]'
+SAVE_BUTTON = "#drawer-save"
+APPLY_NOTE = "Changes apply from your next Send."
+RUNNING_NOTE = "The running turn keeps the settings it started with."
+RETRIEVAL_NOTE = "This server has no retrieval gallery, so similar X-rays and matching reports are skipped."
+LABELS_NOTE = "This server has no CheXbert labeller, so labels are skipped."
+STORAGE_TEXT = "Browser storage is unavailable, so these settings last until the page closes."
+SAVED_TEXT = "Settings saved. They apply from your next Send."
+BUDGET_ERROR = "Enter a whole number from 16 to 200."
+REPEAT_NOTE = "Stopped when the model began repeating itself."
+STOP_LABEL = "Stop when the report starts repeating"
+STOP_HINT = "Off: the published protocol, which always decodes the whole token budget."
+FIELD_LABELS = ["Beam size (1–8)", "Token budget (16–200)", "Similar images (0–12)", "Matching reports (0–10)"]
+# What is typed, with real keys: the first Send's budget is reached by 120 and Enter, then a refused 300 and 8, then 150 and the Save button.
+# 200 is the longest budget the server allows, and the re-run's.
+ENTER_BUDGET, FIRST_BUDGET, SECOND_BUDGET = 120, 150, 200
+SAVED_SECONDS = (3.0, 6.5)   # "Settings saved." stays for about 4 s, by the clock of the page
+RERUN_HINT = "No new image: Send re-runs xray_a.png with these settings."
+
+
+def budget_note(tokens: int) -> str:
+    """The card's note for a turn that ran to its token budget with the display repair on and a sentence cut off."""
+    return "Reached the {}-token budget; the unfinished last sentence is hidden (Show raw shows it).".format(tokens)
+
+
+def repeated(text: str) -> int:
+    """How many sentences of the text repeat an earlier one (the repair's key: lower case, whitespace normalised)."""
+    keys = [s.lower() for s in split_sentences(text)]
+    return len(keys) - len(set(keys))
+
+
+def budget_chip(chips: List[str]) -> Optional[str]:
+    return next((c for c in chips if c.endswith(" tok")), None)
+
+
+def settled_where_it_began(states: List[Dict[str, Any]], before: int) -> bool:
+    """After a text that is not a whole number inside the bounds, the chips and the stored setting are the value the field had before the
+    typing began (the valid prefix of a too-big number, 30 of 300, applies on the way and goes back)."""
+    return bool(states) and budget_chip(states[-1]["chips"]) == "{} tok".format(before) and states[-1]["stored"] == before
+
+
+def errors_shown(states: List[Dict[str, Any]]) -> List[bool]:
+    """Whether the line under the field was showing after each key."""
+    return [not (state["error"] or {}).get("hidden", True) for state in states]
+
+
+def click_and_type(b: Browser, selector: str, digits: str, click: bool = True) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """What a user does: a real click into a number field of the drawer, then the digits one key at a time over whatever it holds. The
+    field is given up first (a click on the drawer's title), as it is when a user comes back to it: a click in a field that has focus puts
+    the caret where it lands, like any other, and only the focus a click gives selects the whole value. click False: no click at all, the
+    keys go to the field that already has focus (what a refused Enter leaves).
+    -> the field as the click left it (its text, whether it has focus, what is selected), and the field after each digit: its text,
+    focus, the composer chips, the stored setting, and whether the line under it is showing."""
+    if click:
+        b.click("#drawer h2")
+        b.click(selector)
+    clicked = b.run(FIELD_JS, selector)
+    states = []  # type: List[Dict[str, Any]]
+    for ch in digits:
+        b.type_text(ch)
+        states.append(b.run(FIELD_JS, selector))
+    return clicked, states
+
+
+def type_budget(b: Browser, digits: str, replaces: str, chips: List[str], stored: List[Optional[int]], errors: List[bool], click: bool = True) -> Dict[str, Any]:
+    """Click into the budget field, which holds `replaces`, and type the digits. The click selects the whole value, so the field reads the
+    digits and not the digits after the old value (100 and 150 typed as one text is 100150, which is out of range); and after every key
+    the field says what was typed and keeps focus, the chips and the stored setting move only for a whole number inside the bounds, and
+    the line under the field shows while the text is not one. Nothing is clamped: a text that is not right changes nothing."""
+    clicked, states = click_and_type(b, BUDGET_FIELD, digits, click)
+    expect(clicked["focused"] and clicked["value"] == replaces and clicked["selected"] == replaces,
+           "{} left the field {} (it held {!r}): its whole value should be selected, so that typing replaces it".format(
+               "the click" if click else "the refused Enter", clicked, replaces))
+    typed = [digits[:i + 1] for i in range(len(digits))]
+    expect([t["value"] for t in states] == typed,
+           "the field read {} while {} was typed over {!r}: a value that is appended reads {!r}".format([t["value"] for t in states], digits, replaces, replaces + digits))
+    expect(all(t["focused"] for t in states), "the field lost focus while it was typed in: {}".format([t["focused"] for t in states]))
+    expect([budget_chip(t["chips"]) for t in states] == chips,
+           "the chips read {}, not {}, as {} was typed".format([budget_chip(t["chips"]) for t in states], chips, typed))
+    expect([t["stored"] for t in states] == stored,
+           "the stored setting went {}, not {}, as {} was typed".format([t["stored"] for t in states], stored, typed))
+    expect(errors_shown(states) == errors, "the line under the field showed {}, not {}, as {} was typed".format(errors_shown(states), errors, typed))
+    expect(all((t["invalid"] == "true") == e and (t["describedby"] == "max_new_tokens-error") == e for t, e in zip(states, errors)),
+           "aria-invalid / aria-describedby do not follow the line: {}".format([(t["invalid"], t["describedby"]) for t in states]))
+    return {"replaces": replaces, "selected_by_the_click": clicked["selected"], "states": states}
+
+
+def press_enter(b: Browser) -> None:
+    b.key("Enter", "Enter", 13, text="\r")
+
+
+def finished_card(b: Browser, cards: int, timeout: float = 60.0) -> Dict[str, Any]:
+    """The newest card once it is the `cards`-th and its turn is over."""
+    return b.wait_for("(() => { const c = (%s)(); return c && c.cards === %d && c.status !== 'running' ? c : null; })()" % (CARD_JS, cards),
+                      timeout, "turn {} to end".format(cards))
+
+
+def forget_settings(b: Browser) -> None:
+    try:
+        b.evaluate("localStorage.removeItem('cxrchat.settings')")
+    except RuntimeError:   # no page of the app is open (yet): nothing of it is stored
+        pass
+
+
+def check_drawer_before_anything_changes(drawer: Dict[str, Any], features: Dict[str, bool]) -> None:
+    """The drawer as a fresh page shows it: when changes apply, the page's defaults, the range in every number field's label, the stop switch
+    on with its hint, a form that ends in Save, and a stage the server does not run switched off with its reason (one it does run is left
+    alone), as /v1/models says."""
+    retrieval, labelling = features["retrieval"], features["labels"]
+    expect(drawer["second"] == "apply-note" and drawer["apply"] == {"hidden": False, "text": APPLY_NOTE},
+           "the first line under the drawer's title is {} / {}, not {!r}".format(drawer["second"], drawer["apply"], APPLY_NOTE))
+    expect(drawer["running"] == {"hidden": True, "text": RUNNING_NOTE}, "the running-turn line is {} before any turn".format(drawer["running"]))
+    expect(drawer["repair"]["checked"] and not drawer["repair"]["disabled"], "Display repair is not on by default: {}".format(drawer["repair"]))
+    expect(not {"raw text", "repair on", "full budget"} & set(drawer["chips"]),
+           "the chips say something about Display repair or the stop switch while they are on: {}".format(drawer["chips"]))
+    expect(drawer["ranges"] == FIELD_LABELS, "the number fields are labelled {}, not {}".format(drawer["ranges"], FIELD_LABELS))
+    for name, bounds in (("k_images", (0, 12)), ("k_reports", (0, 10))):
+        expect((drawer[name]["min"], drawer[name]["max"]) == tuple(str(b) for b in bounds), "{} takes {}".format(name, (drawer[name]["min"], drawer[name]["max"])))
+    stop = drawer["stop"]
+    expect(stop is not None and stop["checked"] and not stop["disabled"] and stop["describedby"] == "stop-hint",
+           "the stop switch is not on, enabled and described by its hint: {}".format(stop))
+    expect(drawer["stop_hint"] == {"hidden": False, "text": STOP_HINT}, "the stop switch's hint is {}".format(drawer["stop_hint"]))
+    expect(drawer["form"], "the drawer's controls are not in a form with novalidate")
+    expect(drawer["save"] == {"text": "Save", "type": "submit", "last": True, "closeFirst": True},
+           "the drawer's Save button is {}: it should be a submit button that ends the form, with the close button first".format(drawer["save"]))
+    expect(drawer["saved"] == "", "the page says {!r} before anything was saved".format(drawer["saved"]))
+    for name in ("k_images", "k_reports"):
+        expect(drawer[name]["disabled"] == (not retrieval) and drawer[name]["describedby"] == (None if retrieval else "retrieval-note"),
+               "{} is {} on a server whose retrieval is {}".format(name, drawer[name], retrieval))
+    expect(drawer["retrieval"] == {"hidden": retrieval, "text": RETRIEVAL_NOTE},
+           "the retrieval note is {} on a server whose retrieval is {}".format(drawer["retrieval"], retrieval))
+    label = drawer["label"]
+    expect(label["disabled"] == (not labelling) and label["describedby"] == (None if labelling else "labels-note") and (labelling or not label["checked"]),
+           "CheXbert labels is {} on a server whose labelling is {}".format(label, labelling))
+    expect(drawer["labels"] == {"hidden": labelling, "text": LABELS_NOTE},
+           "the labels note is {} on a server whose labelling is {}".format(drawer["labels"], labelling))
+    expect(bool([c for c in drawer["chips"] if c.startswith("k ")]) == retrieval,
+           "the composer chips {} on a server whose retrieval is {}: k belongs to them only when the stage runs".format(drawer["chips"], retrieval))
+    expect(drawer["rerun"]["hidden"], "the re-run hint is shown in an empty chat: {}".format(drawer["rerun"]))
+
+
+def check_tab_then_click(b: Browser) -> Dict[str, Any]:
+    """Tab into the budget field (it is selected whole), then click it: that click places the caret, like any click in a field that has
+    focus. The guard that keeps the mouseup of a click from undoing the selection is for the click that gave the field its focus, and
+    does not swallow the first click after a Tab (which would leave the whole value selected, as if nothing had been clicked)."""
+    b.click("#drawer h2")
+    b.click('#drawer input[data-setting="beam_size"]')   # the field before it in the form
+    b.key("Tab", "Tab", 9)
+    tabbed = b.run(FIELD_JS, BUDGET_FIELD)
+    expect(tabbed["focused"] and tabbed["selected"] == "100", "Tab left the budget field as {}: it should have focus, with its whole value selected".format(tabbed))
+    b.click(BUDGET_FIELD)
+    clicked = b.run(FIELD_JS, BUDGET_FIELD)
+    expect(clicked["focused"] and clicked["selected"] == "" and clicked["value"] == "100",
+           "the first click after a Tab left the field as {}: it should place the caret (nothing selected), not keep the selection".format(clicked))
+    return {"selected_by_tab": tabbed["selected"], "selected_after_the_click": clicked["selected"], "value": clicked["value"]}
+
+
+def check_the_enter_that_saves(b: Browser) -> Dict[str, Any]:
+    """Enter has just been pressed in the budget field, holding a whole number inside the bounds: the form submitted, which is Save. The
+    drawer is closed and focus is back on Settings, the setting is stored, and "Settings saved." is on the page for about 4 seconds."""
+    appeared = b.wait_for("document.querySelector('#saved').textContent !== '' ? 1 : 0", 5, "the confirmation after Enter") and time.time()
+    after = b.run(FIELD_JS, BUDGET_FIELD)
+    expect(not after["drawerOpen"] and after["active"] == "settings", "after Enter the drawer is {} and focus is on {!r}".format(
+        "open" if after["drawerOpen"] else "closed", after["active"]))
+    expect(after["saved"] == SAVED_TEXT, "the page says {!r}, not {!r}".format(after["saved"], SAVED_TEXT))
+    expect(after["stored"] == ENTER_BUDGET and budget_chip(after["chips"]) == "{} tok".format(ENTER_BUDGET),
+           "after Enter the stored budget is {} and the chips {}".format(after["stored"], after["chips"]))
+    region = b.evaluate("(() => { const r = document.querySelector('#saved'), cs = getComputedStyle(r), box = r.getBoundingClientRect();"
+                        " return { role: r.getAttribute('role'), live: r.getAttribute('aria-live'), visible: box.width > 1 && box.height > 1 && cs.visibility !== 'hidden',"
+                        " near: !!r.previousElementSibling && r.previousElementSibling.id === 'chips' }; })()")
+    expect(region == {"role": "status", "live": "polite", "visible": True, "near": True},
+           "the confirmation is {}: it should be a polite status region, in sight, right after the chips".format(region))
+    b.wait_for("document.querySelector('#saved').textContent === ''", 8, "the confirmation to go")
+    lasted = time.time() - appeared
+    expect(SAVED_SECONDS[0] <= lasted <= SAVED_SECONDS[1], "the confirmation stayed {:.1f} s, not about 4".format(lasted))
+    return {"drawer_open": False, "focus": after["active"], "message": after["saved"], "stored": after["stored"], "chips": after["chips"],
+            "region": region, "seconds_on_page": round(lasted, 1)}
+
+
+def check_a_refused_enter(b: Browser, before: Dict[str, Any], typed: str, began_at: int) -> Dict[str, Any]:
+    """Enter pressed in the budget field holding a text that is not a whole number inside the bounds: the drawer stays open on that field,
+    the line under it says what it takes, the text is as typed and is selected whole (so that the next key replaces it), and nothing changed
+    (not the chips, not the stored setting, no confirmation): Enter did not snap it to 200 or to 16. The setting is the value the field
+    had before the typing began, `began_at`, however many whole numbers the typing passed through."""
+    after = b.run(FIELD_JS, BUDGET_FIELD)
+    expect(after["drawerOpen"] and after["focused"], "after Enter on {!r} the drawer is {} and focus is on {!r}".format(
+        typed, "open" if after["drawerOpen"] else "closed", after["active"]))
+    expect(after["value"] == typed, "Enter changed the field from {!r} to {!r}".format(typed, after["value"]))
+    expect(after["error"] == {"hidden": False, "text": BUDGET_ERROR} and after["invalid"] == "true",
+           "the line under the field is {} (aria-invalid {!r}), not {!r}".format(after["error"], after["invalid"], BUDGET_ERROR))
+    expect(after["chips"] == before["chips"] and after["stored"] == before["stored"],
+           "Enter changed the chips {} -> {} or the stored setting {} -> {}".format(before["chips"], after["chips"], before["stored"], after["stored"]))
+    expect(budget_chip(after["chips"]) == "{} tok".format(began_at) and after["stored"] == began_at,
+           "after Enter on {!r} the chips say {} and {} is stored, not the {} that the field had before the typing".format(
+               typed, budget_chip(after["chips"]), after["stored"], began_at))
+    expect(after["selected"] == typed, "the refused Enter left {!r} selected in the field, not the whole text {!r}".format(after["selected"], typed))
+    expect(after["saved"] == "", "the page says {!r} although the form was refused".format(after["saved"]))
+    return {"typed": typed, "drawer_open": True, "field_kept_as_typed": True, "text_selected": True, "error": after["error"]["text"],
+            "chips": after["chips"], "stored": after["stored"], "began_at": began_at, "saved_message": after["saved"]}
+
+
+def check_repeat_stop(log: Dict[str, Any], page: Dict[str, Any], budget: int) -> Dict[str, Any]:
+    """A turn that ran with the page's default (the stop switch on): it ended by itself, on a repeat, before its token budget; the server
+    stored a snapshot for every step it took; the card has the quiet note and no budget note, and its footer says the tokens decoded."""
+    options, generate = log["options"], log["generate"]
+    expect(options["stop_on_repeat"] is True and options["max_new_tokens"] == budget, "the server ran with {}".format(options))
+    expect(generate["stopped"] == "repeat" and 0 < generate["tokens"] < budget,
+           "the turn stopped {!r} after {} tokens of {}: it should have stopped on a repeat before its budget".format(generate["stopped"], generate["tokens"], budget))
+    expect(len(log["snapshots"]) == generate["tokens"], "{} snapshots for {} tokens".format(len(log["snapshots"]), generate["tokens"]))
+    expect(log["truncated"] is False and not page["truncated"], "the turn that stopped on a repeat is flagged as cut off by the budget")
+    expect(page["notes"] == [REPEAT_NOTE] and page["repeatNote"], "the card's notes are {}, not [{!r}]".format(page["notes"], REPEAT_NOTE))
+    expect("{} tok".format(generate["tokens"]) in page["footer"].split(" · "),
+           "the card's footer is {!r}, without {} tok (what was decoded, which is fewer than the budget {})".format(page["footer"], generate["tokens"], budget))
+    expect(repeated(page["shown"]) == 0 and repeated(log["report"]) >= 1,
+           "the card repeats {} sentence(s) and the decoder's text {}".format(repeated(page["shown"]), repeated(log["report"])))
+    expect(log["status"] == "done", "the stopped turn is stored as {}".format(log["status"]))
+    return {"budget": budget, "tokens": generate["tokens"], "stopped": generate["stopped"], "snapshots": len(log["snapshots"]),
+            "card_notes": page["notes"], "footer": page["footer"], "truncated_mid_sentence": log["truncated"],
+            "raw_report_repeats": repeated(log["report"]), "card_repeats": repeated(page["shown"])}
+
+
+def check_clean_display(b: Browser, log: Dict[str, Any], rec: Dict[str, Any]) -> Dict[str, Any]:
+    """The 200-token re-run, run with the page's default for the display (Display repair on) and the stop switch off: it ran to its budget
+    (stopped "budget", all 200 tokens), and no sentence repeats on the card, in any snapshot the server stored or in any frame of the card
+    that was seen while it streamed; the card says what its budget hid, and Show raw is the decoder's whole text. -> what was measured."""
+    page = b.evaluate("(%s)()" % SHOWN_JS)
+    shown, report = page["shown"], log["report"]
+    expect(log["generate"]["stopped"] == "budget" and log["generate"]["tokens"] == SECOND_BUDGET,
+           "with the switch off the turn stopped {!r} after {} tokens, not at its budget of {}".format(log["generate"]["stopped"], log["generate"]["tokens"], SECOND_BUDGET))
+    expect(page["notes"] == ([budget_note(SECOND_BUDGET)] if log["truncated"] else []) and not page["repeatNote"],
+           "the card's notes are {} for a turn that reached its budget with truncated_mid_sentence {}".format(page["notes"], log["truncated"]))
+    expect("{} tok".format(SECOND_BUDGET) in page["footer"].split(" · "), "the card's footer is {!r}, without {} tok".format(page["footer"], SECOND_BUDGET))
+    expect(page["pressed"] == "false" and page["raw"] is None, "the card starts on the raw text: {}".format(page["pressed"]))
+    expect(" ".join(shown.split()) == " ".join(log["display"].split()), "the card shows {!r}, not the display report {!r}".format(shown, log["display"]))
+    expect(repeated(shown) == 0, "the settled card repeats {} sentence(s): {!r}".format(repeated(shown), one_line(shown, 300)))
+    expect(repeated(report) >= 5, "the decoder's own report repeats only {} sentence(s): the case is not the user's".format(repeated(report)))
+    stored_bad = [t for t in log["snapshots"] if repeated(t)]
+    expect(len(log["snapshots"]) == SECOND_BUDGET and not stored_bad,
+           "{} stored snapshots, {} of them repeat a sentence".format(len(log["snapshots"]), len(stored_bad)))
+    frames_bad = [t for t in rec["shown"] if repeated(t)]
+    expect(len(rec["shown"]) >= 10 and not frames_bad, "{} frames of the stream were seen; {} repeat a sentence".format(len(rec["shown"]), len(frames_bad)))
+    expect(len(shown.split()) * 2 < len(report.split()),
+           "the clean report ({} words) is not much shorter than the raw one ({})".format(len(shown.split()), len(report.split())))
+    b.click('#conversation > article.card:last-child [data-action="raw"]')
+    raw = b.wait_for("(() => { const r = (%s)(); return r && r.raw !== null ? r : null; })()" % SHOWN_JS, 5, "Show raw to show the raw text")
+    expect(raw["pressed"] == "true" and raw["raw"] == report, "Show raw shows {!r}, not the decoder's report".format(one_line(raw["raw"], 200)))
+    expect(repeated(raw["raw"]) >= 5, "Show raw has only {} repeated sentence(s)".format(repeated(raw["raw"])))
+    return {"words": {"card": len(shown.split()), "raw_report": len(report.split())},
+            "sentences": {"card": len(split_sentences(shown)), "raw_report": len(split_sentences(report))},
+            "repeated_sentences": {"card": repeated(shown), "raw_report": repeated(report), "worst_stream_frame": max(repeated(t) for t in rec["shown"]),
+                                   "worst_stored_snapshot": max(repeated(t) for t in log["snapshots"])},
+            "stream_frames_seen": len(rec["shown"]), "stored_snapshots": len(log["snapshots"]), "stopped": log["generate"]["stopped"],
+            "tokens": log["generate"]["tokens"], "card_notes": page["notes"],
+            "truncated_mid_sentence": log["truncated"], "show_raw_equals_decoder_report": True}
+
+
+def check_settings(ctx: Context) -> Tuple[str, Dict[str, Any]]:
+    b = ctx.browser
+    ctx.open("#/new")
+    forget_settings(b)   # the page's defaults, whatever an earlier check left in this browser
+    try:
+        return settings_walk(ctx)
+    finally:
+        forget_settings(b)
+
+
+def settings_walk(ctx: Context) -> Tuple[str, Dict[str, Any]]:
+    b = ctx.browser
+    ctx.open("#/new")   # a fresh load, which reads the defaults
+    b.click("#settings")
+    b.wait_for("!document.querySelector('#drawer').hidden", what="the drawer")
+    features = b.evaluate("(%s)()" % MODELS_JS)["features"]
+    expect(set(features) == {"retrieval", "labels"} and all(isinstance(v, bool) for v in features.values()), "/v1/models says features {}".format(features))
+    drawer = b.evaluate("(%s)()" % DRAWER_JS)
+    check_drawer_before_anything_changes(drawer, features)
+    ctx.attach("a")
+    # -- a Tab into the budget selects it whole; the first click after the Tab places the caret
+    tab_click = check_tab_then_click(b)
+    # -- the user's own flow, with real keys. A click into the budget selects "100", so 1, 2, 0 typed over it read 120 (the old page left the
+    # caret after the 100, and 150 typed there was 100150, which Enter silently made 200). 1 and 12 are below the bound of 16: not applied,
+    # and the line under the field says so. Enter in the field is Save.
+    entered = type_budget(b, str(ENTER_BUDGET), "100", ["100 tok", "100 tok", "{} tok".format(ENTER_BUDGET)], [None, None, ENTER_BUDGET], [True, True, False])
+    press_enter(b)
+    saved_by_enter = check_the_enter_that_saves(b)
+    # -- a number that is too big, typed key by key over the 120 that the field holds. The 30 on the way is a whole number inside the bounds
+    # and applies like any other (the chips follow the keys); 300 is not, and the setting goes back to the 120 it was before the typing
+    # began. Enter then saves nothing, says why, and leaves the bad text selected.
+    b.click("#settings")
+    b.wait_for("!document.querySelector('#drawer').hidden", what="the drawer, opened again")
+    refused_300 = type_budget(b, "300", str(ENTER_BUDGET), ["{} tok".format(ENTER_BUDGET), "30 tok", "{} tok".format(ENTER_BUDGET)],
+                              [ENTER_BUDGET, 30, ENTER_BUDGET], [True, False, True])
+    expect(settled_where_it_began(refused_300["states"], ENTER_BUDGET),
+           "after 300 the chips say {} and {} is stored, not the {} that the field had before the typing".format(
+               budget_chip(refused_300["states"][-1]["chips"]), refused_300["states"][-1]["stored"], ENTER_BUDGET))
+    before = b.run(FIELD_JS, BUDGET_FIELD)
+    press_enter(b)
+    enter_on_300 = check_a_refused_enter(b, before, "300", ENTER_BUDGET)
+    ctx.shot("drawer_error", "drawer_error", "the drawer with 300 typed in the token budget: the line under the field, the red border, the chips at the 120 it had before", DESKTOP)
+    # -- 8 has no whole number on the way to it: the setting stays where it was. No click first: the refused Enter selected the text, so the
+    # key replaces it
+    refused_8 = type_budget(b, "8", "300", ["{} tok".format(ENTER_BUDGET)], [ENTER_BUDGET], [True], click=False)
+    expect(settled_where_it_began(refused_8["states"], ENTER_BUDGET), "after 8 the chips and the stored setting are not the {} the field had".format(ENTER_BUDGET))
+    before = b.run(FIELD_JS, BUDGET_FIELD)
+    press_enter(b)
+    enter_on_8 = check_a_refused_enter(b, before, "8", ENTER_BUDGET)
+    # -- put right (a click into the field that holds the bad 8 selects it), and saved with the Save button this time
+    fixed = type_budget(b, str(FIRST_BUDGET), "8", ["{} tok".format(ENTER_BUDGET), "{} tok".format(ENTER_BUDGET), "{} tok".format(FIRST_BUDGET)],
+                        [ENTER_BUDGET, ENTER_BUDGET, FIRST_BUDGET], [True, True, False])
+    b.click(SAVE_BUTTON)
+    b.wait_for("document.querySelector('#drawer').hidden", 5, "the drawer to close on Save")
+    by_button = b.run(FIELD_JS, BUDGET_FIELD)
+    expect(by_button["saved"] == SAVED_TEXT and by_button["active"] == "settings" and by_button["stored"] == FIRST_BUDGET and not by_button["drawerOpen"],
+           "after the Save button: {}".format({k: by_button[k] for k in ("saved", "active", "stored", "drawerOpen")}))
+    # -- Send: the page's default, the stop switch on. The drawer says that the running turn keeps its settings; the turn used the typed
+    # budget (the chips say what was asked) and ended by itself, on a repeat, before it (the footer says what was decoded)
+    ctx.send()
+    b.wait_for("!document.querySelector('#running-note').hidden", 10, "the drawer to say that a turn is running")
+    first = finished_card(b, 1)
+    expect(first["status"] == "done", "the first turn ended {}".format(first["status"]))
+    one = b.evaluate("(%s)()" % TURN_JS)
+    expect("{} tok".format(FIRST_BUDGET) in one["chips"] and "full budget" not in one["chips"],
+           "the new turn's chips are {}: they should say {} tok, and not full budget".format(one["chips"], FIRST_BUDGET))
+    stopped = check_repeat_stop(b.evaluate("(%s)(%s)" % (LOG_JS, json.dumps(one["id"]))), b.evaluate("(%s)()" % SHOWN_JS), FIRST_BUDGET)
+    after = b.evaluate("(%s)()" % DRAWER_JS)
+    expect(after["running"]["hidden"], "the drawer still says a turn is running after it ended")
+    expect(after["rerun"] == {"hidden": False, "text": RERUN_HINT}, "after the turn the re-run hint is {}, not {!r}".format(after["rerun"], RERUN_HINT))
+    # -- the hint belongs to Send with no image: an attached one hides it, removing that image brings it back
+    ctx.attach("b")
+    expect(b.evaluate("(%s)()" % DRAWER_JS)["rerun"]["hidden"], "the re-run hint stays while an image is attached")
+    b.click("#preview button")
+    b.wait_for("document.querySelector('#preview').hidden", what="the attached image to go")
+    expect(b.evaluate("(%s)()" % DRAWER_JS)["rerun"] == {"hidden": False, "text": RERUN_HINT},
+           "the re-run hint did not come back with the image removed")
+    # -- no new image, the longest budget, and the stop switch off (a click on the switch): in force at once, and used by the re-run
+    b.click("#settings")
+    b.wait_for("!document.querySelector('#drawer').hidden", what="the drawer, opened for the second budget")
+    retyped = type_budget(b, str(SECOND_BUDGET), str(FIRST_BUDGET), ["{} tok".format(FIRST_BUDGET), "20 tok", "{} tok".format(SECOND_BUDGET)],
+                          [FIRST_BUDGET, 20, SECOND_BUDGET], [True, False, False])
+    b.click(STOP_SWITCH)
+    b.wait_for("[...document.querySelectorAll('#chips span')].some((c) => c.textContent === 'full budget')", 5, "the chips to say full budget")
+    switched = b.evaluate("(%s)()" % DRAWER_JS)
+    expect(not switched["stop"]["checked"] and "full budget" in switched["chips"], "after the click the stop switch is {} and the chips {}".format(switched["stop"], switched["chips"]))
+    ctx.shot("settings", "settings", "the drawer with its ranges, notes and Save, the re-run hint under the image well, and the chips at the typed budget", DESKTOP)
+    b.click(SAVE_BUTTON)
+    b.wait_for("document.querySelector('#drawer').hidden", 5, "the drawer to close on Save")
+    b.run(RECORD_JS, None)
+    ctx.send()
+    b.wait_for("!document.querySelector('#running-note').hidden", 10, "the drawer to say that the second turn is running")
+    second = finished_card(b, 2)
+    expect(second["status"] == "done", "the re-run ended {}".format(second["status"]))
+    two = b.evaluate("(%s)()" % TURN_JS)
+    expect(two["users"] == 2 and two["cards"] == 2 and not two["image"], "the re-run is not a turn without an image of its own: {}".format(two))
+    expect("{} tok".format(SECOND_BUDGET) in two["chips"] and "full budget" in two["chips"],
+           "the re-run's chips {} do not say {} tok and full budget".format(two["chips"], SECOND_BUDGET))
+    log = b.evaluate("(%s)(%s)" % (LOG_JS, json.dumps(two["id"])))
+    expect(log["image"]["source"] == "previous" and log["image"]["filename"] == "xray_a.png", "the re-run used {}, not the last X-ray".format(log["image"]))
+    expect(log["options"]["max_new_tokens"] == SECOND_BUDGET and log["options"]["display_repair"] is True and log["options"]["stop_on_repeat"] is False,
+           "the server ran with {}".format(log["options"]))
+    skips = {"score": "no_reference"}
+    skips.update({} if features["retrieval"] else {"retrieve": "gallery_unavailable"})
+    skips.update({} if features["labels"] else {"label": "labeler_unavailable"})
+    expect(log["skipped"] == skips, "the stages the server skipped are {}, not {}: the drawer and the pipeline disagree".format(log["skipped"], skips))
+    clean = check_clean_display(b, log, b.evaluate("(%s)()" % RECORDED_JS))
+    return ("a click into the budget selected it and 1-2-0 typed over it read 120 (not 100120); Enter saved it, closed the drawer to Settings and the page said "
+            "'Settings saved.' for {:.1f} s; 300 and 8 were refused with the line under the field (300 passed through the valid 30 and went back to the "
+            "120 it started from, 8 changed nothing, Enter changed nothing and left the text selected); a Tab then a click placed the caret; the Save "
+            "button saved 150; a default turn stopped on a repeat after {} of its {} tokens with the quiet note and no budget "
+            "note; with the switch off, at 200 tokens the card has {} words and {} repeated sentences (raw: {} words, {} repeated), none in {} frames of "
+            "the stream; Show raw is the decoder's text".format(
+                saved_by_enter["seconds_on_page"], stopped["tokens"], FIRST_BUDGET, clean["words"]["card"], clean["repeated_sentences"]["card"],
+                clean["words"]["raw_report"], clean["repeated_sentences"]["raw_report"], clean["stream_frames_seen"]),
+            {"drawer_before": {"server_features": features, "apply_note": drawer["apply"]["text"], "retrieval_note": drawer["retrieval"],
+                               "labels_note": drawer["labels"], "k_fields_disabled": drawer["k_images"]["disabled"] and drawer["k_reports"]["disabled"],
+                               "labels_disabled": drawer["label"]["disabled"], "chips": drawer["chips"],
+                               "display_repair_checked": drawer["repair"]["checked"], "number_field_labels": drawer["ranges"],
+                               "stop_switch": {"checked": drawer["stop"]["checked"], "hint": drawer["stop_hint"]["text"]}, "save_button": drawer["save"]},
+             "tab_then_click": tab_click,
+             "enter_saves": {"typed": entered, "after_enter": saved_by_enter},
+             "refused_300": {"typed": refused_300, "after_enter": enter_on_300},
+             "refused_8": {"typed": refused_8, "after_enter": enter_on_8},
+             "save_button": {"typed": fixed, "after_click": {k: by_button[k] for k in ("saved", "active", "stored", "drawerOpen")}},
+             "first_send_stop_switch_on": {"chips_of_turn": one["chips"], "rerun_hint": after["rerun"]["text"], "repeat_stop": stopped},
+             "rerun_stop_switch_off": {"typed": retyped, "chips_of_turn": two["chips"], "footer": two["provenance"], "image": log["image"],
+                                       "options": log["options"], "skipped_stages": log["skipped"]},
+             "clean_display_at_200_tokens": clean})
+
+
+CHECKS = [("stream", check_stream), ("reload", check_reload), ("sessions", check_sessions), ("exports", check_exports),
+          ("stop", check_stop), ("keyboard", check_keyboard), ("narrow", check_narrow), ("a11y", check_a11y), ("error", check_error),
+          ("settings", check_settings)]
+
+
+def select_checks(only: Optional[str]) -> List[Tuple[str, Callable[["Context"], Tuple[str, Dict[str, Any]]]]]:
+    """The checks to run: all of them, or the ones `only` names (comma-separated), in the order of CHECKS. A name that is no check's, or no name
+    at all, is a ValueError."""
+    if only is None:
+        return list(CHECKS)
+    known = [name for name, _ in CHECKS]
+    names = [name.strip() for name in only.split(",") if name.strip()]
+    for name in names:
+        if name not in known:
+            raise ValueError("no check named {} (the checks are {})".format(name, ", ".join(known)))
+    if not names:
+        raise ValueError("no check named: --only takes one or more of {}".format(", ".join(known)))
+    return [(name, fn) for name, fn in CHECKS if name in names]
+
+
+def run_check(ctx: Any, name: str, fn: Callable[[Any], Tuple[str, Dict[str, Any]]], claim: Optional[str] = None,
+              before: Optional[Callable[[Any], None]] = None, keep: int = 400, failure_chars: int = 220) -> Dict[str, Any]:
+    """Run one check against a context (anything with .browser and .console: this file's, the features check's) and make its entry of the
+    checklist, `{name, [claim,] status, detail, seconds, data, console_errors}`, printing `CHECK <name> <status> <detail>`. A failed expectation
+    or any other exception is a failed check and not a crashed run, and so is an error the page logged while the check ran. This is the one
+    implementation of both checks (P6-F fix 1); what they say differently is a parameter: `claim` is kept in the entry when given, `before(ctx)`
+    runs first inside the same guard (this check resets the page's defaults), `keep` is how much of the detail the entry holds, and
+    `failure_chars` how much of a failure is printed (a pass prints 220)."""
+    mark = len(ctx.console)
+    started = time.time()
+    status, detail, data = "PASS", "", {}  # type: str, str, Dict[str, Any]
+    try:
+        if before is not None:
+            before(ctx)
+        detail, data = fn(ctx)
+    except Failure as exc:
+        status, detail = "FAIL", str(exc)
+    except Exception as exc:   # a CDP error, a timeout waiting for the page: a failed check, not a crashed run
+        status, detail = "FAIL", "{}: {}".format(type(exc).__name__, exc)
+    try:
+        drain_console(ctx.browser, ctx.console)
+    except Exception as exc:
+        ctx.console.append("could not read the console: {}".format(exc))
+    logged = ctx.console[mark:]
+    if status == "PASS" and logged:
+        status, detail = "FAIL", "the page logged {} error(s): {}".format(len(logged), logged[0])
+    print("CHECK {} {} {}".format(name, status, one_line(detail, 220 if status == "PASS" else failure_chars)), flush=True)
+    entry = {"name": name}  # type: Dict[str, Any]
+    if claim is not None:
+        entry["claim"] = claim
+    entry.update(status=status, detail=one_line(detail, keep), seconds=round(time.time() - started, 1), data=data, console_errors=logged)
+    return entry
+
+
+def warm_up(base: str) -> float:
+    """One throwaway turn over HTTP, so that the first turn in the browser does not wait for the engine's first-use imports (which
+    would look like 3 s of silence to the page). Its chat is deleted. -> seconds."""
+    started = time.time()
+    boundary = uuid.uuid4().hex
+
+    def part(name: str, value: str) -> bytes:
+        return ("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" % (boundary, name, value)).encode()
+
+    session = json.load(urllib.request.urlopen(urllib.request.Request(
+        base + "v1/sessions", data=b"{}", headers={"Content-Type": "application/json"}, method="POST"), timeout=30))["id"]
+    body = io.BytesIO()
+    body.write(part("text", "") + part("options", json.dumps({"max_new_tokens": 16})))
+    body.write(("--%s\r\nContent-Disposition: form-data; name=\"image\"; filename=\"warm.png\"\r\nContent-Type: image/png\r\n\r\n" % boundary).encode())
+    body.write(png_bytes(128, 128) + b"\r\n--%s--\r\n" % boundary.encode())
+    request = urllib.request.Request(base + "v1/sessions/%s/messages" % session, data=body.getvalue(), method="POST",
+                                     headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        response.read()
+    urllib.request.urlopen(urllib.request.Request(base + "v1/sessions/" + session, method="DELETE"), timeout=30).read()
+    return time.time() - started
+
+
+def run_all(browser: Browser, app: Optional[App], base: str, work: str, out_dir: Optional[str],
+            checks: Optional[List[Tuple[str, Callable[[Context], Tuple[str, Dict[str, Any]]]]]] = None) -> Tuple[List[Dict[str, Any]], Context]:
+    """Every check in order (or the `checks` given), on this browser and this app; -> (one result per check, the context with the screenshots)."""
+    browser.call("Runtime.enable")
+    browser.call("Emulation.setFocusEmulationEnabled", enabled=True)   # the page behaves as the focused one, so key events move focus
+    ctx = Context(browser, app, base, work, out_dir)
+    if out_dir is not None:   # a picture of an earlier run must not pass for this run's
+        for name in EVIDENCE_FILES:
+            if os.path.exists(os.path.join(out_dir, name)):
+                os.remove(os.path.join(out_dir, name))
+    return [run_check(ctx, name, fn, before=Context.stop_default)   # each check starts from the page's defaults; one that needs a long turn asks for the switch off itself
+            for name, fn in (CHECKS if checks is None else checks)], ctx
+
+
+def environment(browser: Browser, app: Optional[App], warm: Optional[float]) -> Dict[str, Any]:
+    version = browser.call("Browser.getVersion")["product"]
+    return {"date": datetime.date.today().isoformat(), "engine": "tiny (random weights, toy vocabulary; no checkpoint, no data)",
+            "tiny_step_delay_s": STEP_DELAY_S if app is not None else None, "image": "synthetic PNG (tests/app_helpers.png_bytes)",
+            "browser": version + " (headless)", "python": platform.python_version(), "os": platform.system(),
+            "warm_up_turn_s": None if warm is None else round(warm, 2), "viewports": {"desktop": list(DESKTOP), "phone": list(PHONE)},
+            "notes": ["The tiny app of the checks has no gallery and no labeller, so it skips retrieve, label and score; the a11y check reads its label "
+                      "chips from a live turn on a second tiny app started with tiny_gallery (the synthetic gallery and the keyword labeller), its note "
+                      "a reference command, so that turn is labelled and scored (labelled_chips_*.png).",
+                      "The settings drawer refuses a token budget outside the server's 16-200 with a line under the field, so the 422 of the error check "
+                      "is reached through the note's command ('tokens 500'), which the server applies on top of the drawer's options.",
+                      "Display repair and Stop when the report starts repeating are on by default in the page (the server's own defaults stay off). "
+                      "The tiny model never writes an end-of-report token and loops after about 20 tokens, so a default turn ends by itself near 21 tokens "
+                      "(the settings check measures it); the checks that need a long turn (stream, reload, sessions, stop) store the switch off before the "
+                      "page loads, and every check starts from the page's defaults.",
+                      "The settled pictures (light and dark) are shot from a turn run with the page's own settings, so they show the note that says why "
+                      "it stopped and no 'full budget' chip. Display repair on means the reports in every picture are the repaired display copy; the settings check runs 200 tokens, with the stop "
+                      "switch off, to show that none of its sentences repeats on the card or in any frame of the stream, while Show raw keeps the decoder's "
+                      "whole text (the tiny model repeats one sentence about a dozen times).",
+                      "The tiny server runs no retrieval gallery and no labeller, so its /v1/models says features retrieval and labels are false: the "
+                      "drawer disables k_images, k_reports and CheXbert labels with a note, and the composer chips leave out k (settings_*.png).",
+                      "Every screenshot was confirmed by the page itself (a DOM rule per picture, true before and after the capture)."]}
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="The browser checklist for the chat page, in headless Chrome.")
+    parser.add_argument("--url", help="check this running tiny app instead of starting one (its page URL, e.g. http://127.0.0.1:PORT/); needs --no-evidence")
+    parser.add_argument("--out", default=EVIDENCE_DIR, help="where screenshots and checklist.json go (default: docs/chat_ui/evidence/p4e)")
+    parser.add_argument("--no-evidence", action="store_true", help="run the checks and write no screenshots and no checklist.json")
+    parser.add_argument("--only", metavar="CHECK[,CHECK...]",
+                        help="run only these checks (names as printed, in the order of the checklist); needs --no-evidence")
+    parser.add_argument("--timeout", type=int, default=420, help="seconds the whole run may take (default 420)")
+    args = parser.parse_args(argv)
+    url_needs_no_evidence(parser, args)   # an app that someone else started is not what the evidence is of
+    if args.only is not None:
+        if not args.no_evidence:   # a part of the checklist would replace the pictures and checklist.json of the whole of it
+            parser.error("--only needs --no-evidence: the evidence of a partial run would replace that of the full one")
+        try:
+            select_checks(args.only)
+        except ValueError as exc:
+            parser.error(str(exc))
+    return args
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    if args.url:   # before anything is started or sent (the warm-up turn is a POST): the address, then the app's own answer about itself
+        problem = url_problem(args.url) or tiny_only_problem(args.url)
+        if problem:
+            print("ERROR --url refused: " + problem)
+            return 2
+    exit_on_sigterm()   # a SIGTERM runs the finally below, which stops Chrome and the app
+    chrome = find_chrome()
+    if chrome is None:
+        print("ERROR no Chrome found: set $CHROME to its executable")
+        return 2
+
+    def overrun(signum: int, frame: Any) -> None:
+        raise Overrun("the browser check ran past its {} s limit".format(args.timeout))
+
+    signal.signal(signal.SIGALRM, overrun)
+    signal.alarm(args.timeout)
+    out_dir = None if args.no_evidence else os.path.abspath(args.out)
+    work = tempfile.mkdtemp(prefix="chat_ui_browser_check_")
+    app = None  # type: Optional[App]
+    browser = None  # type: Optional[Browser]
+    results = []  # type: List[Dict[str, Any]]
+    ctx = None  # type: Optional[Context]
+    warm = None  # type: Optional[float]
+    try:
+        if args.url:
+            base = args.url if args.url.endswith("/") else args.url + "/"
+        else:
+            app = App(step_delay_s=STEP_DELAY_S)
+            base = app.url
+        warm = warm_up(base)
+        browser = Browser(chrome, label="chat_ui_browser_chrome")
+        results, ctx = run_all(browser, app, base, work, out_dir, select_checks(args.only))
+        env = environment(browser, app, warm)
+    except Overrun as exc:
+        print("ERROR {}".format(exc))
+        return 2
+    except Exception as exc:   # the app or Chrome would not start, a request failed: not a failed check, a run that could not be made
+        print("ERROR {}: {}".format(type(exc).__name__, exc))
+        return 2
+    finally:
+        signal.alarm(0)
+        try:   # each step in the finally of the one before it: an interrupt in one (Ctrl-C, a SIGTERM's SystemExit) must not leave the next running
+            if browser is not None:
+                browser.close()
+        finally:
+            try:
+                if app is not None:
+                    app.stop()
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+    failures = [r["name"] for r in results if r["status"] != "PASS"]
+    result = {"checks": len(results), "failures": failures}
+    if out_dir is not None and ctx is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "checklist.json"), "w", encoding="utf-8") as handle:
+            json.dump({"result": result, "environment": env, "checks": results, "screenshots": ctx.shots}, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+    print("RESULT " + json.dumps(result))
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

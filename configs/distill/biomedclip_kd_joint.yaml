@@ -1,0 +1,54 @@
+# BiomedCLIP-text-KD joint config (Plan-of-Record Phase 4).
+#
+# Loss = α·L_KD(BiomedCLIP-text, 512-d) + β·L_CLIP(BiomedCLIP-vit) + γ·L_SimCSE
+#
+# Pivot rationale (vs joint_mimic.yaml): the previous PubMedBERT teacher lives
+# in a 768-d space *related to but not coincident with* BiomedCLIP's 512-d
+# joint embedding. Phase 5/5b/7 plateaued at R@10 ≈ 9 % with paired cosine
+# 0.21–0.29 — the modality gap. Distilling from BiomedCLIP's own text tower
+# pulls the student into the SAME 512-d metric the image tower lives in by
+# construction, eliminating the bridging burden on img_proj.
+#
+# Loss weights: α reset to v1 baseline (0.3) — KD now PUSHES toward the CLIP
+# target space rather than competing for direction, so it should be safer than
+# v2's 0.1.
+#
+# No teacher_model / teacher_dtype / teacher_max_length keys — those are
+# PubMedBERT-specific. BiomedCLIP context is fixed at 256 tokens.
+
+teacher: "biomedclip_text"
+
+# Joint loss weights.
+#
+# Phase 10: α_kd schedule. CLIP is gated off during the freeze window
+# (Phase 9), so α_kd_warmup=1.0 cannot conflict with CLIP gradient — KD owns
+# the warmup entirely. After unfreeze, CLIP turns on and α_kd_post=0.3 is the
+# safe coexistence weight (1.0 caused the 6a/6b/6c divergence). `alpha_kd` is
+# kept as the legacy single-value fallback for non-scheduled call sites.
+alpha_kd: 0.3
+alpha_kd_warmup: 1.0
+alpha_kd_post: 0.3
+beta_clip: 1.0
+gamma_simcse: 0.1
+
+# Per-group learning rates
+backbone_lr: 1.0e-5
+head_lr: 3.0e-4
+
+# Backbone freeze during head warm-up.
+# Phase 10: 500→1000. The 500-step window of Phase 6c was insufficient for
+# z_text to fully migrate into BiomedCLIP-text space; CLIP turning on too
+# early polluted proj_head. 1000 steps + α_kd_warmup=1.0 should drive
+# cos(z_text, t_emb) ≥ 0.7 before CLIP engages.
+freeze_text_encoder_steps: 1000
+
+# Phase 6f: small MoCo queue K=256.
+# Phase 6e (no queue, K=0) showed: in-batch 32 negatives → MIMIC R@10=8.23%
+# (below Phase 5c's 9.99%), Indiana R@10=4.04% (+0.68pp vs 5c), paired
+# cos=0.258 (+0.032 vs 5c). Gap to 5c explained by negative-pool size:
+# 32 in-batch vs 5c's warm 16384-key queue.
+# K=256 warms in K/batch=256/32=8 steps after unfreeze → negligible cold-start
+# noise (8 random steps vs 512 in Phase 6d). Gives 8× harder negatives vs
+# Phase 6e while preserving the KD-warmup alignment benefit.
+moco_queue_size: 256
+moco_momentum: 0.999

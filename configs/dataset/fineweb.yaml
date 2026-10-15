@@ -1,0 +1,43 @@
+# FineWeb dataset configuration
+# High-quality web text dataset from HuggingFace
+# Using 1.5B tokens subset for efficient training
+
+dataset_name: "fineweb"
+dataset_version: "sample-10BT"  # 10B token sample (we'll limit to 1.5B)
+
+# Splits
+train_split: "train"
+validation_split: "train"  # FineWeb doesn't have separate val split, we'll use a slice
+
+# Tokenization
+tokenizer: "gpt2"
+max_length: 1024  # Reduced from 2048 for memory efficiency
+max_seq_length: 1024  # Override for shorter sequences if needed
+
+# Data loading (optimized for 20GB MIG GPU)
+batch_size: 4  # Reduced from 32 for MIG GPU
+eval_batch_size: 4
+num_workers: 4  # Reduced to avoid worker overhead
+pin_memory: true
+
+# Streaming and caching
+streaming: false  # Set to false to download and cache locally
+cache_dir: "./data/fineweb_cache"
+
+# Text packing (efficient training without padding waste)
+pack_sequences: true
+
+# Preprocessing (optimized for memory efficiency)
+preprocessing_num_workers: 8  # Reduced to avoid memory pressure
+
+# Token limit for 1.5B tokens
+# With batch_size=4, accumulate=8, seq_len=1024: 
+# effective_batch = 4 * 8 = 32
+# tokens_per_batch = 32 * 1024 = 32,768
+# For 1.5B tokens: 1,500,000,000 / 32,768 ≈ 45,776 batches per epoch
+max_train_samples: null  # We'll calculate this dynamically
+target_tokens: 1_500_000_000  # 1.5 billion tokens
+
+# Validation
+val_size: 0.01  # Use 1% of data for validation
+val_max_samples: 1000  # Limit validation to 1000 samples for speed

@@ -1,0 +1,134 @@
+#!/bin/bash
+# ============================================================================
+# H100 Stage-0 LM pre-train template (hybrid_70m_v2 + BioMedLM KD).
+# H100 port of train_stage0_arch_v2_ext.sh. Phase 5 clones this for 150M
+# (train_stage0_150m_h100.sh: model=hybrid_150m_v2, larger max_steps/batch).
+#
+# H100 changes vs the A100 script:
+#   - the batch partition (7-day cap) → the full run finishes in ONE block
+#     (no requeue juggling; A100 hit 16-36h walltime kills mid-run).
+#   - --gpus=1 (H100 node via --exclude=arm03,node17v1) ; larger --mem.
+#   - trainer=h100_single_gpu.
+#   - BATCH_SIZE/ACCUM/GRAD_CKPT are env-overridable. the cluster's H100 = 80GB (NOT the
+#     94/141GB the plan first assumed), so 150M needs GRAD_CKPT=true + accum to
+#     fit (see train_stage0_150m_h100.sh). 70M fits larger microbatch bare.
+#   - compile_model=false: Stage-0 uses the cu_seqlens doc-boundary segmented
+#     scan (data-dependent loop) which graph-breaks under torch.compile.
+#
+# Adjust the two ENV placeholders for the H100 cluster:
+#   SCRATCH_ROOT — fast scratch for HF/dataset/checkpoint cache.
+#   VENV_ACTIVATE — path to the py>=3.10 env activate script (venv or conda).
+#
+# PPL gate (informational per plan): PubMed val PPL — target <= 13.76.
+# ============================================================================
+#SBATCH --partition=@SLURM_PARTITION@
+#SBATCH --account=@SLURM_ACCOUNT@
+#SBATCH --gpus=1
+#SBATCH --exclude=@SLURM_EXCLUDE@   # node13v1: faulty GPU (cudaErrorContained, 2026-07-19)
+#SBATCH --mem=128G
+#SBATCH --cpus-per-task=8
+#SBATCH --time=2-00:00:00
+#SBATCH --job-name=h100_stage0_v2
+#SBATCH --output=logs/%x_%j.log
+#SBATCH --error=logs/%x_%j.log
+#SBATCH --open-mode=append   # the batch partition is preemptible: without this a requeue
+                             # TRUNCATES the log and the restart leaves no trace
+#SBATCH --requeue
+
+set -euo pipefail
+
+SCRATCH_ROOT="${SCRATCH_ROOT:-/sc/scratch/$USER/hybrid_xmamba_h100}"
+VENV_ACTIVATE="${VENV_ACTIVATE:-.venv/bin/activate}"
+MODEL_CONFIG="${MODEL_CONFIG:-hybrid_70m_v2}"
+# MAMBA3_PLAN_V2.md M7: the screen needs a seed override (the A0/A0-seed pair measures the noise
+# floor, and every arm must otherwise share a seed for a paired comparison) and a checkpoint
+# budget override -- save_top_k=3 at 2.4 GB per 150M checkpoint fills the quota fast when eight
+# arms run at once, and a screen only ever reads the final val loss.
+SEED="${SEED:-42}"
+SAVE_TOP_K="${SAVE_TOP_K:-3}"
+# Extra Hydra overrides, space separated. This is how the MAMBA3_PLAN_V2.md screen arms flip their
+# levers -- A3..A6 are hybrid_150m_m3.yaml plus `model.mamba3_*=...`, not five separate yamls.
+# Do not hand-write these: `eval "$(python scripts/mamba3_arms.py env A5)"` sets this variable
+# from the one definition of the ladder that the pre-flight also checks.
+EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-}"
+# Validation cadence. 2000 suits a 12,000-step screen (6 passes). At M8-A's 120,000 steps it
+# would mean SIXTY passes: A0 measured ~5.4 h for six, so validation alone would cost ~54 h
+# against ~13.5 h of actual training. Raising the interval changes only how often the metric is
+# computed, never the metric -- the val set stays the same 15,724 chunks, so the number remains
+# comparable to the 13.18 Phase-5 baseline. Do NOT shrink the val set for that reason.
+VAL_EVERY="${VAL_EVERY:-2000}"
+MAX_STEPS="${MAX_STEPS:-120000}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
+ACCUM="${ACCUM:-1}"                 # grad-accum: eff batch = BATCH_SIZE*ACCUM
+GRAD_CKPT="${GRAD_CKPT:-false}"     # gradient checkpointing (trades compute for VRAM)
+LR="${LR:-6.0e-4}"                  # 70M default; 150M wrapper overrides to 4.0e-4
+WARMUP="${WARMUP:-1000}"            # 70M default; 150M wrapper overrides to 2000
+GRAD_CLIP="${GRAD_CLIP:-1.0}"       # 70M default; 150M wrapper overrides to 0.5 (spike guard)
+EXPERIMENT="${EXPERIMENT:-h100_stage0_${MODEL_CONFIG}}"
+
+echo "=== H100 Stage-0 pre-train: ${MODEL_CONFIG} + BioMedLM KD (seed=${SEED}, save_top_k=${SAVE_TOP_K}) ==="
+echo "extra overrides: ${EXTRA_OVERRIDES:-<none>} | val every ${VAL_EVERY} steps"
+date; hostname
+mkdir -p logs
+
+cd "${SLURM_SUBMIT_DIR}/hybrid_model_mamba_xlstm" 2>/dev/null || cd "${SLURM_SUBMIT_DIR:-.}"
+
+export HF_HOME="${SCRATCH_ROOT}/.hf"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+export TORCHINDUCTOR_CACHE_DIR="${SCRATCH_ROOT}/.torchinductor"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export CUDA_LAUNCH_BLOCKING=0
+export PYTHONUNBUFFERED=1   # flush progress bar to the log live (else block-buffered → looks frozen)
+
+source "${VENV_ACTIVATE}"
+python -c "import torch; assert torch.cuda.is_available(), 'CUDA unavailable'; print('GPU:', torch.cuda.get_device_name(0), f'{torch.cuda.get_device_properties(0).total_memory/1024**3:.0f}GB')"
+nvidia-smi
+
+echo "Pre-caching BioMedLM (2.7B)..."
+python -c "
+from transformers import AutoModelForCausalLM
+import torch
+_ = AutoModelForCausalLM.from_pretrained('stanford-crfm/BioMedLM', torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+print('BioMedLM cached.')
+"
+
+echo "Starting Stage-0 distillation (${MAX_STEPS} steps, bs=${BATCH_SIZE}, accum=1)..."
+python scripts/train_stage0_distill.py \
+  model=${MODEL_CONFIG} \
+  seed=${SEED} \
+  dataset=pubmed \
+  trainer=h100_single_gpu \
+  distill=stage0_biomedlm \
+  trainer.accelerator=cuda \
+  trainer.max_epochs=-1 \
+  trainer.max_steps=${MAX_STEPS} \
+  trainer.accumulate_grad_batches=${ACCUM} \
+  trainer.val_check_interval=${VAL_EVERY} \
+  trainer.log_every_n_steps=25 \
+  trainer.compile_model=false \
+  dataset.batch_size=${BATCH_SIZE} \
+  dataset.eval_batch_size=${BATCH_SIZE} \
+  dataset.max_length=512 \
+  dataset.max_seq_length=512 \
+  dataset.num_workers=4 \
+  dataset.preprocessing_num_workers=8 \
+  dataset.pin_memory=true \
+  dataset.cache_dir="${SCRATCH_ROOT}/pubmed_cache" \
+  callbacks.checkpoint.every_n_train_steps=2000 \
+  callbacks.checkpoint.save_top_k=${SAVE_TOP_K} \
+  experiment_name=${EXPERIMENT} \
+  output_dir=./outputs/${EXPERIMENT} \
+  wandb.enabled=false \
+  model.learning_rate=${LR} \
+  model.warmup_steps=${WARMUP} \
+  model.gradient_clip_val=${GRAD_CLIP} \
+  model.use_gradient_checkpointing=${GRAD_CKPT} \
+  +model.scheduler_name=wsd \
+  +model.beta2_schedule=true \
+  +model.beta2_start=0.999 \
+  +model.beta2_end=0.974 \
+  ${EXTRA_OVERRIDES}
+  # ^ deliberately unquoted: the arm's overrides are separate Hydra arguments, not one string.
+
+echo "=== END: checkpoints in ./outputs/${EXPERIMENT}/checkpoints/ ==="
+date

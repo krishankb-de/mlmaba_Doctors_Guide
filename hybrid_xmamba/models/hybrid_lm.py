@@ -1,0 +1,962 @@
+"""Hybrid Language Model implementation.
+
+Main model class that assembles the hybrid architecture into a
+causal language modeling backbone.
+"""
+
+import dataclasses
+import logging
+
+import torch
+import torch.nn as nn
+import torch.utils.checkpoint
+from typing import Callable, List, Optional, Tuple, Union
+from dataclasses import dataclass
+
+from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+from hybrid_xmamba.layers.hybrid_block import create_hybrid_blocks
+from hybrid_xmamba.layers.normalization import RMSNorm
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CausalLMOutput:
+    """Output type for causal language models."""
+    loss: Optional[torch.Tensor] = None
+    logits: torch.Tensor = None
+    hidden_states: Optional[Tuple[torch.Tensor]] = None
+    attentions: Optional[Tuple[torch.Tensor]] = None
+
+
+class HybridEmbedding(nn.Module):
+    """Embedding layer with optional positional encoding.
+    
+    Args:
+        config: Model configuration
+    """
+    
+    def __init__(self, config: HybridConfig):
+        super().__init__()
+        self.config = config
+        
+        # Token embeddings
+        self.token_embedding = nn.Embedding(config.vocab_size, config.dim)
+        
+        # Optional learned positional embeddings
+        # Note: Some architectures (like Mamba) don't need explicit positional embeddings
+        self.use_pos_embedding = False
+        if self.use_pos_embedding:
+            self.position_embedding = nn.Embedding(
+                config.max_position_embeddings, 
+                config.dim
+            )
+        
+        self.dropout = nn.Dropout(config.dropout)
+    
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Forward pass for embeddings.
+        
+        Args:
+            input_ids: Token IDs (B, L)
+            
+        Returns:
+            Embedded representations (B, L, D)
+        """
+        batch_size, seq_len = input_ids.shape
+        
+        # Token embeddings
+        embeddings = self.token_embedding(input_ids)
+        
+        # Add positional embeddings if used
+        if self.use_pos_embedding:
+            position_ids = torch.arange(
+                seq_len, 
+                dtype=torch.long, 
+                device=input_ids.device
+            ).unsqueeze(0).expand(batch_size, -1)
+            position_embeddings = self.position_embedding(position_ids)
+            embeddings = embeddings + position_embeddings
+        
+        return self.dropout(embeddings)
+
+
+class StopDecoding(Exception):
+    """Raised by an `on_step` callback to end an EOS-stop beam search now (`HybridLanguageModel.beam_search_cached_eos`, and
+    `beam_search_decode_eos` in scripts/evaluate_report_generation.py, which imports this class). The search returns its best finished
+    hypothesis, with ended_by_eos True, if it has one; otherwise the exception propagates unchanged, so a subclass can carry what the
+    caller needs (the chat app's `_RepeatStop` carries the best beam's ids). The published decoders catch nothing: for them it is an
+    exception like any other, which leaves the search."""
+
+
+class HybridLanguageModel(nn.Module):
+    """Hybrid Mamba-xLSTM Language Model.
+    
+    This model combines Mamba and xLSTM layers in a flexible pattern
+    for causal language modeling.
+    
+    Args:
+        config: Model configuration
+    """
+    
+    def __init__(self, config: HybridConfig):
+        super().__init__()
+        self.config = config
+        
+        # Embedding layer
+        self.embeddings = HybridEmbedding(config)
+        
+        # Create hybrid blocks based on layer pattern.
+        #
+        # MAMBA3_PLAN_V2.md M2-F: this used to be ~20 hand-written `name=config.name` lines. Every
+        # new config field then had to be added here *and* to the per-type kwarg whitelist in
+        # `hybrid_block.py`, and forgetting either silently fell back to the default -- the exact
+        # failure that cost this project a run in Phase 9 (`norm_topology` was dropped when
+        # building HybridConfig, so HybridNorm weights loaded into a pre_rms model). Passing every
+        # dataclass field removes the class of bug rather than one instance of it: the whitelist
+        # downstream still decides what each mixer receives, but nothing can go missing on the way.
+        layer_kwargs = {f.name: getattr(config, f.name) for f in dataclasses.fields(config)}
+        layer_kwargs["hidden_dim"] = config.slstm_hidden_dim  # sLSTM's own name for it
+        for reserved in ("dim", "num_layers", "layer_pattern", "norm_type", "norm_topology",
+                         "use_mlp", "mlp_ratio"):
+            layer_kwargs.pop(reserved, None)
+        self.layers = create_hybrid_blocks(
+            dim=config.dim,
+            num_layers=config.num_layers,
+            layer_pattern=config.layer_pattern,
+            norm_type=config.norm_type,
+            norm_topology=config.norm_topology,
+            use_mlp=config.use_mlp,
+            mlp_ratio=config.mlp_ratio,
+            **layer_kwargs,
+        )
+        
+        # Final normalization
+        if config.norm_type.lower() == "rms":
+            self.final_norm = RMSNorm(config.dim)
+        else:
+            self.final_norm = nn.LayerNorm(config.dim)
+        
+        # Language modeling head
+        self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
+        
+        # Optionally tie weights with embedding
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.embeddings.token_embedding.weight
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+
+        # MAMBA3_PLAN_V2.md M1-F: `_init_weights` zeroes every nn.Linear bias, which erases any
+        # per-mixer init done in the block's own __init__ -- the Mamba dt bias is exactly that.
+        # Mixers needing to re-assert an init expose `post_model_init`; it is a no-op unless the
+        # corresponding strategy flag is on, so the default path is unchanged.
+        for layer in self.layers:
+            mixer = getattr(layer, "mixer", None)
+            if hasattr(mixer, "post_model_init"):
+                mixer.post_model_init()
+
+        logger.info(self.architecture_fingerprint())
+    
+    def architecture_fingerprint(self) -> str:
+        """One-line summary of what was actually built (MAMBA3_PLAN_V2.md M2-I).
+
+        The expensive failure mode in this project is not a crash, it is training the wrong thing
+        for three days: `hybrid_block` filters mixer kwargs against a per-type whitelist and drops
+        the rest silently, Hydra rejects overrides for keys a yaml never declared, and
+        `HybridConfig` is constructed by hand in a dozen entry points. Phase 9 lost a run to
+        exactly that (`norm_topology` silently dropped). This prints at step 0 of every job, so
+        "is this really Mamba-3?" is answerable by looking at the log rather than by inference.
+        """
+        types = self.get_layer_types()
+        counts = ", ".join(f"{k}x{types.count(k)}" for k in sorted(set(types)))
+        parts = [
+            f"layers=[{counts}]",
+            f"norm_topology={self.config.norm_topology}",
+            f"scan_impl={self.config.scan_impl}",
+            f"tfla_impl={self.config.tfla_impl}",
+            f"dt_init={self.config.dt_init_strategy}",
+        ]
+        if "mamba3" in types:
+            parts.append(
+                "mamba3(d_state={0}, head_dim={1}, ngroups={2}, conv={3}, trapezoid={4}, "
+                "rope={5}, bc_bias={6}, a_mode={7}, mimo_rank={8})".format(
+                    self.config.mamba3_d_state, self.config.mamba3_head_dim,
+                    self.config.mamba3_ngroups, self.config.mamba3_use_conv,
+                    self.config.mamba3_use_trapezoid, self.config.mamba3_use_rope,
+                    self.config.mamba3_bc_bias, self.config.mamba3_a_mode,
+                    self.config.mamba3_mimo_rank,
+                )
+            )
+        parts.append(f"params={sum(p.numel() for p in self.parameters()):,}")
+        return "ARCH " + " | ".join(parts)
+
+    def _init_weights(self, module):
+        """Initialize model weights."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+    
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        output_hidden_states: bool = False,
+        return_dict: bool = True,
+    ) -> Union[CausalLMOutput, Tuple[torch.Tensor, ...]]:
+        """Forward pass for language modeling.
+
+        Args:
+            input_ids: Token IDs (B, L). Mutually exclusive with inputs_embeds.
+            inputs_embeds: Pre-computed hidden states (B, L, D) to use instead
+                of embedding input_ids — e.g. an image prefix concatenated with
+                token embeddings for Phase 10 image-conditioned generation.
+                Mutually exclusive with input_ids; exactly one must be given.
+            labels: Target token IDs for loss computation (B, L)
+            attention_mask: (B, L) — 1 for real tokens, 0 for padding. When
+                provided, padded positions are zero-masked at the embedding
+                layer so SSM/mLSTM state does not absorb padding. Mamba and
+                mLSTM blocks are causal; zero-masking the input is sufficient
+                for right-padded sequences (the default).
+            output_hidden_states: Whether to return all hidden states
+            return_dict: Whether to return CausalLMOutput or tuple
+
+        Returns:
+            CausalLMOutput or tuple of (loss, logits, hidden_states)
+        """
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Exactly one of input_ids or inputs_embeds must be provided")
+
+        # Embedding
+        hidden_states = self.embeddings(input_ids) if inputs_embeds is None else inputs_embeds
+
+        # Zero out padded positions so recurrent state stays clean
+        if attention_mask is not None:
+            hidden_states = hidden_states * attention_mask.to(hidden_states.dtype).unsqueeze(-1)
+        
+        # Store all hidden states if requested
+        all_hidden_states = () if output_hidden_states else None
+        
+        # Pass through all layers
+        use_ckpt = self.config.use_gradient_checkpointing and self.training
+        for layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            if use_ckpt:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    layer, hidden_states, None, cu_seqlens, use_reentrant=False
+                )
+            else:
+                hidden_states = layer(hidden_states, cache=None, cu_seqlens=cu_seqlens)
+        
+        # Final normalization
+        hidden_states = self.final_norm(hidden_states)
+        
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+        
+        # Language modeling head
+        logits = self.lm_head(hidden_states)
+        
+        # Compute loss if labels provided
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            
+            # Flatten the tokens
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(
+                shift_logits.view(-1, self.config.vocab_size),
+                shift_labels.view(-1)
+            )
+        
+        if not return_dict:
+            output = (logits,)
+            if output_hidden_states:
+                output = output + (all_hidden_states,)
+            return ((loss,) + output) if loss is not None else output
+        
+        return CausalLMOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=all_hidden_states,
+        )
+    
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        prefix_embeds: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 100,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Generate text autoregressively.
+
+        Args:
+            input_ids: Starting token IDs (B, L)
+            prefix_embeds: Optional (B, k, D) prefix hidden states prepended
+                before the input_ids embeddings — e.g. an image prefix from
+                Phase 10's ImagePrefixMapper. When None, behavior is identical
+                to the original input_ids-only path.
+            max_new_tokens: Number of tokens to generate
+            temperature: Sampling temperature
+            top_k: Top-k sampling parameter
+            top_p: Nucleus sampling parameter
+
+        Returns:
+            Generated token IDs (B, L + max_new_tokens). The prefix (if given)
+            consumes context but contributes no ids of its own.
+        """
+        self.eval()
+
+        if prefix_embeds is None:
+            with torch.no_grad():
+                for _ in range(max_new_tokens):
+                    # Forward pass
+                    outputs = self.forward(input_ids, return_dict=True)
+                    logits = outputs.logits
+
+                    # Get logits for last token
+                    next_token_logits = logits[:, -1, :] / temperature
+
+                    # Apply top-k filtering
+                    if top_k is not None:
+                        indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                        next_token_logits[indices_to_remove] = float('-inf')
+
+                    # Apply nucleus (top-p) filtering
+                    if top_p is not None:
+                        sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+
+                        # Remove tokens with cumulative probability above threshold
+                        sorted_indices_to_remove = cumulative_probs > top_p
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+
+                        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                        next_token_logits[indices_to_remove] = float('-inf')
+
+                    # Sample from distribution
+                    probs = torch.softmax(next_token_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+
+                    # Append to sequence
+                    input_ids = torch.cat([input_ids, next_token], dim=1)
+
+            return input_ids
+
+        # Prefix-conditioned path (Phase 10): hidden_states carries the prefix
+        # + token embeddings; generated tokens are re-embedded and appended
+        # to hidden_states each step since there is no KV/state cache to grow.
+        generated_ids = input_ids
+        with torch.no_grad():
+            hidden_states = torch.cat([prefix_embeds, self.embeddings(input_ids)], dim=1)
+            for _ in range(max_new_tokens):
+                outputs = self.forward(inputs_embeds=hidden_states, return_dict=True)
+                logits = outputs.logits
+
+                next_token_logits = logits[:, -1, :] / temperature
+
+                if top_k is not None:
+                    indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                    next_token_logits[indices_to_remove] = float('-inf')
+
+                if top_p is not None:
+                    sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    next_token_logits[indices_to_remove] = float('-inf')
+
+                probs = torch.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+
+                generated_ids = torch.cat([generated_ids, next_token], dim=1)
+                hidden_states = torch.cat([hidden_states, self.embeddings(next_token)], dim=1)
+
+        return generated_ids
+    
+    # -- M6-C: model-level O(1) decode ------------------------------------------------------
+
+    def supports_cached_decode(self) -> bool:
+        """True when every mixer in the stack has an O(1) `step`.
+
+        A partially cacheable stack is worthless -- one recomputing layer keeps the whole model
+        O(L) per token -- so this is all-or-nothing by design. sLSTM has no step yet, so a
+        pattern containing it decodes the old way.
+        """
+        return all(getattr(layer.mixer, "supports_step", False) for layer in self.layers)
+
+    def allocate_inference_cache(self, batch_size, device=None, dtype=torch.float32):
+        """One cache per layer. ~7.1 MB fp32 for the 150M model at batch 1, independent of L."""
+        device = device or self.lm_head.weight.device
+        return [
+            layer.allocate_inference_cache(batch_size, device=device, dtype=dtype)
+            for layer in self.layers
+        ]
+
+    def step_logits(self, hidden_t: torch.Tensor, caches) -> torch.Tensor:
+        """One token of hidden state -> next-token logits, advancing every layer's cache."""
+        for layer, cache in zip(self.layers, caches):
+            hidden_t = layer.step(hidden_t, cache)
+        return self.lm_head(self.final_norm(hidden_t))
+
+    def prefill(self, hidden: torch.Tensor, caches) -> torch.Tensor:
+        """Consume a prompt, leaving the caches positioned after its last token.
+
+        Token by token. That is O(L) work for the prompt -- the same order the chunked forward
+        does -- but as L separate kernel launches rather than one batched pass, so time-to-first-
+        token is *worse* than the uncached path even though every token after it is far better.
+
+        The fix is known and deliberately not attempted here: `ssd_chunked_scan` already computes
+        the carried state in its inter-chunk loop but does not return it, and padding is masked
+        out of that state, so exposing it correctly is its own change. Recorded as M6 follow-up
+        rather than bolted on -- M6-E measures and reports the TTFT cost as it stands.
+
+        Returns:
+            Logits for the final prompt position, (batch, vocab).
+        """
+        logits = None
+        for t in range(hidden.shape[1]):
+            logits = self.step_logits(hidden[:, t], caches)
+        return logits
+
+    def _filter_logits(self, logits, temperature, top_k, top_p):
+        """Shared sampling filter, so the cached and uncached paths cannot diverge on it."""
+        logits = logits / temperature
+        if top_k is not None:
+            logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = float("-inf")
+        if top_p is not None:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            remove = cumulative > top_p
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = 0
+            logits[remove.scatter(1, sorted_indices, remove)] = float("-inf")
+        return logits
+
+    def generate_cached(
+        self,
+        input_ids: torch.Tensor,
+        prefix_embeds: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 100,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+    ) -> torch.Tensor:
+        """`generate` with an O(1)-per-token recurrent cache instead of full recomputation.
+
+        The uncached path re-runs the whole prefix for every new token: O(L) per token, O(L^2)
+        per sequence, paid `beam_size` times over under beam search. Here the prompt is consumed
+        once and each new token costs a fixed amount of work.
+
+        Same contract as `generate`, including the `prefix_embeds` branch: the prefix consumes
+        context and contributes no ids of its own.
+        """
+        if not self.supports_cached_decode():
+            raise NotImplementedError(
+                "cached decode needs every mixer to implement step(); layer types are "
+                "{}".format(self.get_layer_types())
+            )
+        self.eval()
+        batch = input_ids.shape[0]
+        param = self.lm_head.weight
+        caches = self.allocate_inference_cache(batch, device=param.device, dtype=param.dtype)
+
+        generated_ids = input_ids
+        with torch.no_grad():
+            hidden = self.embeddings(input_ids)
+            if prefix_embeds is not None:
+                hidden = torch.cat([prefix_embeds, hidden], dim=1)
+            logits = self.prefill(hidden, caches)
+
+            for _ in range(max_new_tokens):
+                filtered = self._filter_logits(logits.clone(), temperature, top_k, top_p)
+                next_token = torch.multinomial(torch.softmax(filtered, dim=-1), num_samples=1)
+                generated_ids = torch.cat([generated_ids, next_token], dim=1)
+                logits = self.step_logits(self.embeddings(next_token)[:, 0], caches)
+        return generated_ids
+
+    @staticmethod
+    def reorder_cache(caches, index: torch.Tensor):
+        """Reindex every cached tensor along the batch axis (M6-C, beam search).
+
+        Beam search reorders and duplicates hypotheses at each step, so their recurrent state has
+        to follow. Everything batch-major is gathered; scalars like `seen` are shared across
+        beams by construction (all beams have consumed the same number of tokens) and are copied
+        through unchanged.
+        """
+        out = []
+        for cache in caches:
+            if cache is None:
+                out.append(None)
+                continue
+            moved = {}
+            for key, value in cache.items():
+                if torch.is_tensor(value):
+                    moved[key] = value.index_select(0, index)
+                else:
+                    moved[key] = value
+            out.append(moved)
+        return out
+
+    def beam_search_cached(
+        self,
+        input_ids: torch.Tensor,
+        prefix_embeds: Optional[torch.Tensor] = None,
+        beam_size: int = 3,
+        max_new_tokens: int = 100,
+        length_penalty: float = 1.0,
+        on_step: Optional[Callable[[int, List[int]], None]] = None,
+    ) -> torch.Tensor:
+        """Beam search over the recurrent cache, one sample at a time.
+
+        The uncached beam search in `evaluate_report_generation.py` re-runs the full prefix for
+        every beam at every step: O(beam * L) work per token and O(beam * L^2) per sequence. Here
+        the beams live in the batch axis of one cache, so a step costs O(beam) and the prompt is
+        consumed once.
+
+        Same tie-breaking and length-penalty convention as the uncached version, so the two
+        return identical token sequences (asserted in tests/test_mamba3_numerics.py).
+
+        `on_step(step, best_ids)` is called once per step with the current best beam's ids, before
+        that step's forward. It only observes. Raising from it stops decoding, which is how the chat
+        app cancels a turn. The default `None` leaves this method unchanged.
+        """
+        if input_ids.shape[0] != 1:
+            raise ValueError(
+                "beam_search_cached operates on one sample at a time (got batch "
+                "{})".format(input_ids.shape[0])
+            )
+        if not self.supports_cached_decode():
+            raise NotImplementedError("cached decode needs every mixer to implement step()")
+        self.eval()
+        device = input_ids.device
+        param = self.lm_head.weight
+
+        with torch.no_grad():
+            hidden = self.embeddings(input_ids)
+            if prefix_embeds is not None:
+                hidden = torch.cat([prefix_embeds, hidden], dim=1)
+            # All beams start from the same prompt, so prefill once, replicated.
+            hidden = hidden.expand(beam_size, -1, -1).contiguous()
+            caches = self.allocate_inference_cache(
+                beam_size, device=param.device, dtype=param.dtype
+            )
+            logits = self.prefill(hidden, caches)                    # (beam, vocab)
+
+            tokens = input_ids.expand(beam_size, -1).contiguous()
+            # Only beam 0 is live at the start; the rest are -inf so the first expansion picks
+            # the true top-k of a single hypothesis rather than k copies of it.
+            scores = torch.full((beam_size,), float("-inf"), device=device)
+            scores[0] = 0.0
+
+            for step in range(max_new_tokens):
+                log_probs = torch.log_softmax(logits.float(), dim=-1)     # (beam, vocab)
+                total = scores.unsqueeze(-1) + log_probs
+                length = tokens.shape[1] + 1
+                ranked = total / (length ** length_penalty)
+                flat_rank, flat_idx = ranked.view(-1).topk(beam_size)
+                beam_idx = torch.div(flat_idx, log_probs.shape[-1], rounding_mode="floor")
+                token_idx = flat_idx % log_probs.shape[-1]
+
+                scores = total.view(-1)[flat_idx]
+                tokens = torch.cat([tokens.index_select(0, beam_idx),
+                                    token_idx.unsqueeze(-1)], dim=1)
+                caches = self.reorder_cache(caches, beam_idx)
+                if on_step is not None:
+                    # CHAT_UI_PLAN.md P2-B: observe only. All beams have the same length here, so
+                    # argmax(scores) is also the length-penalised best. Raising stops decoding.
+                    on_step(step, tokens[int(torch.argmax(scores))].tolist())
+                logits = self.step_logits(self.embeddings(token_idx.unsqueeze(-1))[:, 0], caches)
+
+            best = int(torch.argmax(scores / (tokens.shape[1] ** length_penalty)))
+        return tokens[best : best + 1]
+
+    def beam_search_cached_eos(
+        self,
+        input_ids: torch.Tensor,
+        prefix_embeds: Optional[torch.Tensor] = None,
+        beam_size: int = 3,
+        max_new_tokens: int = 100,
+        length_penalty: float = 1.0,
+        eos_token_id: int = 50256,
+        on_step: Optional[Callable[[int, List[int]], None]] = None,
+    ) -> Tuple[torch.Tensor, bool]:
+        """`beam_search_cached` that stops at an end-of-report token (CHAT_UI_PLAN.md P9-G2). -> (ids, ended_by_eos).
+
+        The cached twin of `beam_search_decode_eos` in `scripts/evaluate_report_generation.py`; the two return the same ids, flag and
+        callback stream (tests/test_beam_search_eos.py) when no two candidates tie exactly, as the published pair do. On an exact tie
+        each follows its own published twin, and those can differ. `beam_search_cached` is untouched.
+        At every step:
+          1. take the candidates published-first: exactly the `ranked.view(-1).topk(beam_size)` that `beam_search_cached` takes, in its
+             order, then the entries of the top 2 * beam_size that it did not take. Ties break as there, because the first beam_size
+             candidates ARE the published ones; the later ones only fill a live slot that an EOS has freed, and can never rank among
+             the first beam_size;
+          2. walk them in rank order. An EOS candidate within the first beam_size is set aside as finished, scored like any other
+             candidate (the EOS counts in the length); the rest fill the beam_size live slots, in the cache's batch axis as there; an
+             EOS further down is dropped, and so is one at step 0, before any token has been generated: no turn ends with an empty
+             report (Hugging Face's min_new_tokens=1);
+          3. the ANSWER is the best normalised score of the best finished hypothesis and the live beams (a tie goes to the finished
+             one, then to the live beams in rank order). on_step gets its ids, and the search returns right after that call once the
+             answer is a finished hypothesis (OpenNMT-style top-hypothesis stopping), or at max_new_tokens. A live answer at the
+             budget has the full length, and ended_by_eos is False.
+        `ids` is shaped like `beam_search_cached`'s (prompt + generated), without the EOS of a finished hypothesis. With no EOS among
+        the first beam_size candidates at any step nothing ever finishes, and this is `beam_search_cached`: the same ids and the same
+        on_step stream, ties included (tests build exact ties on purpose).
+
+        `on_step(step, answer_ids)` is called once per step, after the step's selection and before the next forward. While the answer is
+        a live beam it is `tokens[argmax(scores)]`, as in `beam_search_cached`; the returned live answer is row 0, which that decoder
+        returns too (the two differ only on a float32 normalisation tie). It only observes, with one exception: raising `StopDecoding`
+        ends the search, which returns the best finished hypothesis if there is one, and lets the same exception propagate if there is
+        none. Any other exception propagates (the chat app's cancel).
+        """
+        if input_ids.shape[0] != 1:
+            raise ValueError(
+                "beam_search_cached_eos operates on one sample at a time (got batch "
+                "{})".format(input_ids.shape[0])
+            )
+        if not self.supports_cached_decode():
+            raise NotImplementedError("cached decode needs every mixer to implement step()")
+        self.eval()
+        device = input_ids.device
+        param = self.lm_head.weight
+        best_done = None   # the best hypothesis that ended: (normalised score, ids without the EOS); of equals, the earliest
+
+        with torch.no_grad():
+            hidden = self.embeddings(input_ids)
+            if prefix_embeds is not None:
+                hidden = torch.cat([prefix_embeds, hidden], dim=1)
+            # All beams start from the same prompt, so prefill once, replicated.
+            hidden = hidden.expand(beam_size, -1, -1).contiguous()
+            caches = self.allocate_inference_cache(
+                beam_size, device=param.device, dtype=param.dtype
+            )
+            logits = self.prefill(hidden, caches)                    # (beam, vocab)
+
+            tokens = input_ids.expand(beam_size, -1).contiguous()
+            # Only beam 0 is live at the start, as in beam_search_cached.
+            scores = torch.full((beam_size,), float("-inf"), device=device)
+            scores[0] = 0.0
+
+            for step in range(max_new_tokens):
+                log_probs = torch.log_softmax(logits.float(), dim=-1)     # (beam, vocab)
+                total = scores.unsqueeze(-1) + log_probs
+                length = tokens.shape[1] + 1
+                ranked = total / (length ** length_penalty)
+                flat = ranked.view(-1)
+                flat_rank, flat_idx = flat.topk(beam_size)                          # exactly the published call, and its order ...
+                wide_rank, wide_idx = flat.topk(min(2 * beam_size, flat.numel()))   # ... then what else the top 2 * beam_size holds
+                fresh = ~torch.isin(wide_idx, flat_idx)
+                flat_rank = torch.cat([flat_rank, wide_rank[fresh]])[: 2 * beam_size]
+                flat_idx = torch.cat([flat_idx, wide_idx[fresh]])[: 2 * beam_size]
+                beam_idx = torch.div(flat_idx, log_probs.shape[-1], rounding_mode="floor")
+                token_idx = flat_idx % log_probs.shape[-1]
+
+                stay = []   # the ranks that fill the live slots, best first
+                for rank, token in enumerate(token_idx.tolist()):
+                    if token == eos_token_id:
+                        if step > 0 and rank < beam_size:   # at step 0 an EOS is dropped like a later one: no empty report
+                            done = float(flat_rank[rank])
+                            if best_done is None or done > best_done[0]:
+                                parent = int(beam_idx[rank])
+                                best_done = (done, tokens[parent : parent + 1].clone())
+                        continue
+                    stay.append(rank)
+                    if len(stay) == beam_size:
+                        break
+                stay = torch.tensor(stay, device=flat_idx.device)
+                flat_idx, beam_idx, token_idx = flat_idx[stay], beam_idx[stay], token_idx[stay]
+
+                scores = total.view(-1)[flat_idx]
+                tokens = torch.cat([tokens.index_select(0, beam_idx),
+                                    token_idx.unsqueeze(-1)], dim=1)
+                # The live beams are in rank order, so row 0 is the best of them: what beam_search_cached shows and returns.
+                live_score = float(scores[0] / (tokens.shape[1] ** length_penalty))
+                answer_done = best_done is not None and best_done[0] >= live_score
+                if on_step is not None:
+                    if answer_done:
+                        shown = best_done[1]
+                    else:   # what beam_search_cached shows: row 0 but for a float32 normalisation tie
+                        row = int(torch.argmax(scores))
+                        shown = tokens[row : row + 1]
+                    try:
+                        on_step(step, shown[0].tolist())
+                    except StopDecoding:
+                        if best_done is None:
+                            raise
+                        return best_done[1], True
+                if answer_done:
+                    return best_done[1], True
+                if step + 1 == max_new_tokens:
+                    break
+                caches = self.reorder_cache(caches, beam_idx)
+                logits = self.step_logits(self.embeddings(token_idx.unsqueeze(-1))[:, 0], caches)
+        return tokens[:1], False
+
+    def get_num_params(self, non_embedding: bool = True) -> int:
+        """Get number of parameters.
+        
+        Args:
+            non_embedding: Whether to exclude embedding parameters
+            
+        Returns:
+            Number of parameters
+        """
+        n_params = sum(p.numel() for p in self.parameters())
+        
+        if non_embedding:
+            n_params -= self.embeddings.token_embedding.weight.numel()
+            if hasattr(self.embeddings, 'position_embedding'):
+                n_params -= self.embeddings.position_embedding.weight.numel()
+        
+        return n_params
+    
+    def get_layer_types(self) -> list:
+        """Get the sequence of layer types in the model.
+
+        Returns:
+            List of layer type strings
+        """
+        return [layer.layer_type for layer in self.layers]
+
+
+class AttentionPooling(nn.Module):
+    """Single-query attention pooling over a sequence of hidden states.
+
+    Computes a weighted sum of token vectors using a learnable query,
+    with proper masking of padding positions before softmax.
+    Handles the all-padding edge case (e.g. during smoke tests) by
+    falling back to uniform weights when every position is masked.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.q = nn.Parameter(torch.zeros(dim))
+        nn.init.normal_(self.q, std=0.02)
+        self._scale = dim ** -0.5
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden: (B, L, D)
+            mask:   (B, L) — 1 for real tokens, 0 for padding; None = all real.
+        Returns:
+            (B, D) pooled representation.
+        """
+        scores = torch.matmul(hidden, self.q) * self._scale  # (B, L)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+            # Fall back to uniform if every token is masked (edge case)
+            all_masked = (mask.sum(dim=-1) == 0)  # (B,)
+            if all_masked.any():
+                uniform = torch.zeros_like(scores)
+                scores = torch.where(all_masked.unsqueeze(-1), uniform, scores)
+        weights = torch.softmax(scores, dim=-1)  # (B, L)
+        return torch.einsum('bl,bld->bd', weights, hidden)
+
+
+class HybridTextEncoder(nn.Module):
+    """Hybrid Mamba-xLSTM text encoder for contrastive / retrieval tasks.
+
+    Wraps HybridLanguageModel and adds a projection head that maps the
+    last-token hidden state to a normalised embedding vector suitable for
+    contrastive learning (SimCSE, CLIP-style alignment, etc.).
+
+    The underlying LM head is kept intact so the same checkpoint can be
+    used for both language-modelling pretraining and contrastive fine-tuning.
+
+    Args:
+        config:         HybridConfig instance (same as HybridLanguageModel).
+        embed_dim:      Output embedding dimension (default 512).
+        freeze_lm:      If True, freeze all LM backbone weights and only
+                        train the projection head (useful for light fine-tuning).
+    """
+
+    def __init__(
+        self,
+        config: HybridConfig,
+        embed_dim: int = 512,
+        freeze_lm: bool = False,
+    ):
+        super().__init__()
+        self.config = config
+        self.embed_dim = embed_dim
+
+        # Full LM backbone — reuse existing class
+        self.lm = HybridLanguageModel(config)
+
+        # Attention pooler — only instantiated when strategy is "attention"
+        # so baseline checkpoints (pooling_strategy="mean") stay unaffected.
+        self.pooling_strategy = getattr(config, "pooling_strategy", "mean")
+        if self.pooling_strategy == "attention":
+            self.attn_pool = AttentionPooling(config.dim)
+        else:
+            self.attn_pool = None
+
+        # Phase 6E — bidirectional encode. Adds no parameters (it is a second
+        # pass over the same weights), so toggling it never changes the state
+        # dict and existing checkpoints stay loadable either way.
+        self.bidirectional_encode = bool(getattr(config, "bidirectional_encode", False))
+
+        # Projection head: hidden_dim → embed_dim (no bias, standard in CLIP).
+        # Dropout between layers provides the stochastic augmentation that
+        # SimCSE relies on — without it both forward passes produce identical
+        # vectors and InfoNCE loss collapses to zero immediately.
+        proj_dropout = getattr(config, "proj_head_dropout", 0.1)
+        self.projection_head = nn.Sequential(
+            nn.Linear(config.dim, config.dim, bias=False),
+            nn.GELU(),
+            nn.Dropout(p=proj_dropout),
+            nn.Linear(config.dim, embed_dim, bias=False),
+        )
+
+        # Learnable temperature for contrastive loss (initialised to ln(1/0.07))
+        self.logit_scale = nn.Parameter(torch.ones([]) * 2.6592)
+
+        # Phase 6D-3: learnable bias for the SigLIP pairwise sigmoid loss.
+        # Initialised at -10 so the B positives dominate the B^2 - B negatives
+        # early in training (Zhai et al. 2023). Always allocated — one scalar —
+        # so a single checkpoint works with either clip_loss_type. Older
+        # checkpoints lack the key and load fine under strict=False, which is
+        # what every eval path already uses.
+        self.logit_bias = nn.Parameter(torch.ones([]) * -10.0)
+
+        if freeze_lm:
+            for param in self.lm.parameters():
+                param.requires_grad = False
+
+    def _reverse_index(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Index that reverses only the REAL tokens, leaving right padding put.
+
+        For a sequence of length n inside an L-wide right-padded row, position i
+        maps to n-1-i for i < n and to itself for i >= n. Gathering with this
+        index both builds the reversed input and maps the reverse pass's hidden
+        states back onto their original token positions.
+
+        Returns:
+            (B, L) int64 index tensor.
+        """
+        b, seq_len = input_ids.shape
+        if attention_mask is not None:
+            lengths = attention_mask.sum(dim=1)
+        else:
+            lengths = torch.full(
+                (b,), seq_len, dtype=torch.long, device=input_ids.device
+            )
+        idx = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(b, seq_len)
+        lengths = lengths.to(idx.dtype).unsqueeze(1)
+        return torch.where(idx < lengths, lengths - 1 - idx, idx)
+
+    def encode(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        bidirectional: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Encode a batch of token sequences into normalised embeddings.
+
+        Pools the final hidden states — attention pooling when
+        ``pooling_strategy == "attention"``, otherwise mean pooling over
+        non-padding positions. Both beat last-token pooling for similarity and
+        retrieval (BIOSSES, STS-B, etc.).
+
+        Args:
+            input_ids: Token IDs (B, L)
+            attention_mask: (B, L) 1 for real tokens, 0 for padding. If None,
+                all positions are treated as real tokens.
+            bidirectional: override for ``config.bidirectional_encode``. When
+                enabled, a second pass runs over the length-aware reversed
+                sequence and its states are averaged back onto the original
+                positions, giving every token a right-context view that a causal
+                scan cannot provide. Adds no parameters — checkpoint-compatible.
+
+        Returns:
+            L2-normalised embeddings (B, embed_dim)
+        """
+        if bidirectional is None:
+            bidirectional = self.bidirectional_encode
+
+        outputs = self.lm(
+            input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        last_hidden = outputs.hidden_states[-1]   # (B, L, dim)
+
+        if bidirectional:
+            rev_idx = self._reverse_index(input_ids, attention_mask)
+            rev_ids = input_ids.gather(1, rev_idx)
+            rev_out = self.lm(
+                rev_ids,
+                # Padding stays on the right, so the mask is unchanged.
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            # The reverse index is its own inverse on the real-token block, so
+            # the same gather maps reverse-pass states back to original slots.
+            rev_hidden = rev_out.hidden_states[-1].gather(
+                1, rev_idx.unsqueeze(-1).expand_as(last_hidden)
+            )
+            last_hidden = 0.5 * (last_hidden + rev_hidden)
+
+        if self.pooling_strategy == "attention":
+            seq_repr = self.attn_pool(last_hidden, mask=attention_mask)
+        else:
+            # Mean pooling over non-padding positions
+            if attention_mask is not None:
+                mask = attention_mask.to(last_hidden.dtype).unsqueeze(-1)  # (B, L, 1)
+            else:
+                mask = torch.ones(
+                    last_hidden.shape[:2], dtype=last_hidden.dtype, device=last_hidden.device
+                ).unsqueeze(-1)
+            seq_repr = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+
+        projected = self.projection_head(seq_repr)
+        return nn.functional.normalize(projected, dim=-1, eps=1e-8)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
+    ) -> CausalLMOutput:
+        """Forward pass — delegates to the underlying LM (for LM pretraining).
+
+        Call encode() instead when you need contrastive embeddings.
+        """
+        return self.lm(
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            return_dict=return_dict,
+        )
+
+    def get_num_params(self, non_embedding: bool = True) -> int:
+        return self.lm.get_num_params(non_embedding=non_embedding)

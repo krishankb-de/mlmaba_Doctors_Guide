@@ -1,0 +1,128 @@
+# BiomedCLIP-text-KD joint config — v2 (Phase 10/11 of HYBRID_ARCH_REFACTOR_PLAN).
+#
+# Clone of biomedclip_kd_joint.yaml (the Phase 6e recipe that hit MIMIC R@10
+# 8.23%) held CONSTANT for attributable comparison, with three deltas:
+#   (1) freq-decoupled KD (Phase 10B) — opt-in, decomposes the z_text↔t_emb
+#       distillation into a low-frequency band (coarse semantics, full weight)
+#       and a high-frequency band (fine detail, down-weighted) plus the cosine
+#       term. Goal: let KD transfer global semantic structure without forcing
+#       the student to match teacher high-frequency noise.
+#   (2) ViT-unfreeze (Phase 10F / supervisor Step 6) — unfreeze last 2 BiomedCLIP
+#       image blocks at a tiny LR so the image tower adapts slightly to CXR.
+#   (3) moco_queue_size: 0 — Phase 6e recipe (K=256 in v1 yaml was Phase 6f;
+#       lessons-learned: queue post-KD-warmup is harmful → hold at 0 for clean
+#       attribution vs Phase 6e's 8.23% ceiling).
+#
+# Everything else (teacher, α_kd schedule 1.0→0.3, freeze=1000, LRs) is identical
+# to biomedclip_kd_joint.yaml so any retrieval uplift is attributable to the new
+# v2 backbone + these three deltas, not a different contrastive recipe.
+
+teacher: "biomedclip_text"
+
+# Joint loss weights (unchanged from Phase 6e).
+alpha_kd: 0.3
+alpha_kd_warmup: 1.0
+alpha_kd_post: 0.3
+beta_clip: 1.0
+gamma_simcse: 0.1
+
+# --- Phase 10B: frequency-decoupled KD --------------------------------------
+# When freq_kd=true, L_KD = λ_low·MSE(low_band) + α_high·MSE(high_band)
+#                            + 0.5·(1 - cos(z_text, t_emb))
+# computed via rFFT along the 512-d embedding feature axis.
+#
+# CANONICAL = FALSE (2026-06-18 ablation, jobs 1922/1923 vs 1930/1931):
+#   freq_kd=true  -> MIMIC 10.94% / Indiana 2.96%
+#   freq_kd=false -> MIMIC 10.45% / Indiana 3.90%   <-- dominates
+# MIMIC is flat within noise but Indiana is clearly worse with it ON, so
+# freq-decoupled KD is a cross-domain REGRESSION. Do not re-enable it without
+# new evidence; it directly attacks the Indiana >= 4.04% floor that Phase 7
+# exists to clear. The default was left `true` until 2026-07-21 and was only
+# false in practice because every launch script passed distill.freq_kd=false.
+freq_kd: false
+freq_kd_low_bins: 32       # first 32 rFFT bins = low-frequency (coarse) band
+freq_kd_alpha_high: 0.1    # down-weight high-frequency (fine-detail) band
+
+# --- Phase 6D-2: KD-anchor decay --------------------------------------------
+# The 2026-07-25 post-mortem established that cos_text_teacher ~0.57 is a
+# KD-vs-CLIP EQUILIBRIUM, not an architecture ceiling: under the KD-only warmup
+# (CLIP gated off, backbone frozen, only the 15.2M head training) it reaches
+# 0.874-0.892, then falls to ~0.57 once CLIP engages, and holds there across a
+# 2x LR range, both batch sizes and both model scales. alpha_kd_post is
+# therefore a permanent restoring force toward the teacher for the whole
+# post-warmup run.
+#
+# kd_decay_steps > 0 turns the alpha_kd step function into a linear ramp
+#   alpha_kd_post -> alpha_kd_floor
+# over that many steps after the unfreeze — KD as initialisation rather than as
+# a standing anchor. 6D-2 arm: kd_decay_steps=2000, alpha_kd_floor=0.0.
+#
+# CANONICAL = 0 (step function preserved exactly) so the 6D-0 control is
+# bit-identical to the Phase-6B recipe. Watch pos_cosine_mean and val/clip_loss
+# when enabling: if the text space drifts/collapses without the anchor, retry
+# with alpha_kd_floor=0.05.
+kd_decay_steps: 0
+alpha_kd_floor: 0.0
+
+# --- Phase 6D-3: objective repair -------------------------------------------
+# clip_loss_type:
+#   infonce (canonical) — symmetric softmax InfoNCE, hard one-hot arange(B)
+#                         targets. Every off-diagonal pair is a negative.
+#   siglip              — pairwise sigmoid loss (Zhai et al. 2023). Each pair is
+#                         judged independently, so the objective is decoupled
+#                         from batch size and is robust to label noise. Uses the
+#                         learnable logit_bias on HybridTextEncoder (init -10).
+#
+# use_multipos:
+#   Replaces the single arange(B) target with an averaged log-probability over a
+#   positive SET built from exact normalised-report matches within the batch
+#   (dataset emits text_hash). MIMIC reports are heavily templated, so
+#   word-for-word identical reports are currently pushed apart as negatives.
+#   Composes with either clip_loss_type. Run 6C-3 first — the audit reports the
+#   measured false-negative rate per batch size and tells you whether the mask
+#   has anything to fix.
+#
+# val/false_neg_rate is logged whenever the dataset emits text_hash, regardless
+# of these settings — that is how the lever earns (or loses) its justification.
+clip_loss_type: "infonce"
+use_multipos: false
+
+# Per-group learning rates (unchanged).
+backbone_lr: 1.0e-5
+head_lr: 3.0e-4
+
+# Backbone freeze during head warm-up (unchanged from Phase 6e).
+freeze_text_encoder_steps: 1000
+
+# --- Phase 6e recipe: NO MoCo queue (held constant for attribution) ---------
+moco_queue_size: 0
+moco_momentum: 0.999
+
+# --- Phase 10F / supervisor Step 6: ViT unfreeze ----------------------------
+# Unfreeze the last 2 BiomedCLIP image-tower blocks at a tiny LR. Scaffolding
+# exists in lightning_module.py (vit_unfreeze_blocks ctor kwarg, 4th param
+# group, _get_vit_blocks). Never enabled in any production config until now.
+#
+# PHASE 6D RESULT (2026-07-26) — THIS IS THE LEVER. Unfreeze depth is the only
+# thing that has ever moved MIMIC retrieval, and it moves it monotonically:
+#   depth  2 -> i2t R@10 0.116   (control)
+#   depth  4 -> 0.132
+#   depth  6 -> 0.150
+#   depth 12 -> 0.168   (+5.2pp over control, ~9x the 0.57pp SE)
+# val/clip_loss falls monotonically alongside (2.897 -> 2.585) and i2t R@1 nearly
+# doubles, so it is generalization, not a metric artifact. Ten other levers are
+# flat. The canonical value stays 2 for attribution against the historical runs;
+# override with VIT_UNFREEZE in the launch script.
+vit_unfreeze_blocks: 2
+# Phase 6G-1: vit_lr has been pinned here for the entire project — three orders
+# of magnitude below head_lr — so even the winning depth-12 arm is one where the
+# whole tower is unfrozen but barely moving. Depth is exhausted at 12 (ViT-B/16
+# has 12 blocks); LR is the untouched half of the dose. Sweep via VIT_LR.
+vit_lr: 1.0e-6
+# Phase 6G-2: which image-tower params the unfreeze covers.
+#   blocks (canonical) — the last N transformer blocks ONLY. Note this leaves
+#       patch_embed, cls_token, pos_embed, the final norm and the visual
+#       projection frozen even at depth 12, so "unfreeze everything" has never
+#       actually been tested.
+#   all — every image-tower parameter.
+vit_unfreeze_scope: "blocks"

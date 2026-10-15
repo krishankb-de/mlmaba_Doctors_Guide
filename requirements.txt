@@ -1,0 +1,75 @@
+# Core Deep Learning
+torch>=2.1.0
+torchvision>=0.16.0
+pytorch-lightning>=2.1.0
+transformers>=4.35.0
+
+# Kernel Development
+einops>=0.7.0
+ninja>=1.11.0
+
+# Configuration Management
+hydra-core>=1.3.0
+omegaconf>=2.3.0
+
+# Data Processing
+datasets>=2.14.0
+tokenizers>=0.15.0
+sentencepiece>=0.1.99
+
+# Optimization (Colab-compatible)
+# apex  # COMMENTED OUT: Requires manual compilation from source
+#       # Install manually if needed: pip install git+https://github.com/NVIDIA/apex
+#
+# flash-attn (OPTIONAL, H100/CUDA only): speeds up the BiomedCLIP ViT image tower.
+#   The Mamba/mLSTM text mixers do NOT use attention, so the benefit is marginal.
+#   Deliberately NOT in base requirements — it needs nvcc/CUDA to build and would
+#   break CPU/local installs + the willi/H100 parity harness. On the H100 box, opt in:
+#     pip install "flash-attn>=2.3.0" --no-build-isolation
+
+# Utilities
+wandb>=0.15.0
+tensorboard>=2.14.0
+tqdm>=4.65.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Development & Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.5.0
+pre-commit>=3.3.0
+
+# Profiling
+py-spy>=0.3.14
+torch-tb-profiler>=0.4.0
+
+# Contrastive / medical CLIP (Stage 2)
+open-clip-torch>=2.24.0   # BiomedCLIP image encoder (frozen, used in clip mode)
+Pillow>=10.0.0            # Image loading for ImageTextDataset
+
+# Phase 8 (H100_SCALING_PLAN.md): local PhysioNet MIMIC-CXR-JPG build
+pandas>=2.0.0              # manifest/pack stages of build_mimic_cxr_local.py
+requests>=2.31.0           # PhysioNet fetch — reads ~/.netrc automatically, no
+                            # subprocess/credential-in-argv (already a transitive
+                            # dep via huggingface_hub; pinned directly since we
+                            # now import it in a shipped script)
+pyarrow>=14.0.0             # parquet read/write (also a transitive `datasets` dep)
+
+# Phase 11A (H100_SCALING_PLAN.md): report-generation eval metrics
+nltk>=3.8                  # METEOR only; ROUGE-L/BLEU are pure Python (no dep).
+                            # METEOR needs the wordnet corpus (nltk.download("wordnet")),
+                            # which requires internet -- compute nodes have none, so
+                            # evaluate_report_generation.py catches the missing-corpus
+                            # case and reports METEOR as skipped rather than failing.
+
+# Phase 11B (H100_SCALING_PLAN.md): CheXbert F1, --chexbert flag only
+f1chexbert>=0.0.2           # downloads chexbert.pth on first use (needs network --
+                            # confirmed OK per the cluster support desk's 1 Gbit/s compute-
+                            # node uplink, same as the PhysioNet fetch). UNVERIFIED
+                            # against real weights as of this writing --
+                            # label_reports_with_chexbert() catches any import/API/
+                            # download failure and reports CheXbert F1 as skipped
+                            # rather than failing, same pattern as nltk/METEOR above.

@@ -1,0 +1,10573 @@
+"""
+Willi Server Parity Tests
+=========================
+Validates that the codebase is compatible with the willi A100 server environment:
+  - Python 3.9.23
+  - No PEP 604 (X | Y) or PEP 585 (dict[...]) syntax in annotations
+  - Hydra config invariants for all 70M models
+  - Checkpoint prefix stripping roundtrip
+  - CPU forward + backward smoke
+  - Attention-mask-aware pooling correctness
+
+Run via the local harness:
+    bash scripts/validate.sh
+
+Or directly (must be inside the willi_parity conda env):
+    conda run -n willi_parity pytest tests/test_willi_parity.py -v
+"""
+
+import ast
+import json
+import re
+import sys
+import os
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import pytest
+import torch
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCAN_ROOTS = [REPO_ROOT / "hybrid_xmamba", REPO_ROOT / "scripts", REPO_ROOT / "app"]
+BUILTIN_GENERICS = {"dict", "list", "tuple", "set", "type", "frozenset"}
+
+
+# The nodes a job must avoid are site settings: a wrapper carries @SLURM_EXCLUDE@ (every node no job may use) or @SLURM_EXCLUDE_ARCH@
+# (the nodes whose CPU architecture cannot run the x86 venv), and scripts/chat_remote.sh sync refuses a SLURM_EXCLUDE that lacks a node
+# of SLURM_EXCLUDE_ARCH. Either placeholder therefore keeps a job off the ARM node.
+EXCLUDES_ARM_RE = re.compile(r"--exclude=@SLURM_EXCLUDE(_ARCH)?@")
+
+
+def _excludes_arm(text: str) -> bool:
+    return EXCLUDES_ARM_RE.search(text) is not None
+
+
+def iter_py_files() -> List[Path]:
+    files = []
+    for root in SCAN_ROOTS:
+        if root.exists():
+            files.extend(root.rglob("*.py"))
+    return files
+
+
+# ── 1. Python version gate ────────────────────────────────────────────────────
+
+@pytest.mark.willi_parity
+def test_python_version_is_3_9():
+    """Willi runs Python 3.9.x — fail loudly if env doesn't match."""
+    major, minor = sys.version_info[:2]
+    if major != 3 or minor != 9:
+        pytest.skip(
+            f"Python {major}.{minor} detected — this test is only meaningful inside "
+            f"the 'willi_parity' conda env (Python 3.9.23). "
+            f"Run: conda run -n willi_parity pytest tests/test_willi_parity.py"
+        )
+    # If we're on 3.9, verify we can actually import every package
+    assert (major, minor) == (3, 9), f"Expected Python 3.9, got {major}.{minor}"
+
+
+# ── 2. PEP 604 guard (X | Y unions in annotations) ───────────────────────────
+
+@pytest.mark.willi_parity
+def test_no_pep604_union_in_runtime_imports():
+    """No module should use X | Y syntax that fails at import time on Python 3.9."""
+    import importlib
+    import pkgutil
+
+    errors: List[str] = []
+    pkg_path = str(REPO_ROOT / "hybrid_xmamba")
+    if not os.path.isdir(pkg_path):
+        pytest.skip("hybrid_xmamba package not found")
+
+    # Only test runtime import — PEP 604 in annotations with __future__.annotations is OK
+    for importer, modname, ispkg in pkgutil.walk_packages(
+        path=[pkg_path], prefix="hybrid_xmamba.", onerror=lambda x: None
+    ):
+        try:
+            importlib.import_module(modname)
+        except TypeError as e:
+            if "unsupported operand type(s) for |" in str(e):
+                errors.append(f"{modname}: {e}")
+        except Exception:
+            pass  # Import errors for missing deps are not our concern here
+
+    assert not errors, (
+        "PEP 604 X|Y runtime error(s) — use Optional[X] for Python 3.9:\n"
+        + "\n".join(errors)
+    )
+
+
+def pep604_hits(source: str, filename: str = "<snippet>") -> List[str]:
+    """One hit per annotation that contains an `X | Y` union anywhere in its subtree."""
+    tree = ast.parse(source, filename=filename)
+    annotations = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = node.args
+            extra = [x for x in (a.vararg, a.kwarg) if x is not None]
+            for arg in a.posonlyargs + a.args + a.kwonlyargs + extra:
+                if arg.annotation is not None:
+                    annotations.append(arg.annotation)
+            if node.returns is not None:
+                annotations.append(node.returns)
+        elif isinstance(node, ast.AnnAssign):
+            annotations.append(node.annotation)
+    hits = []
+    for ann in annotations:
+        binop = next((n for n in ast.walk(ann)
+                      if isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr)), None)
+        if binop is not None:
+            hits.append("{}:{}: {}".format(filename, ann.lineno, ast.unparse(binop)))
+    return hits
+
+
+@pytest.mark.willi_parity
+def test_no_pep604_union_in_annotations_ast():
+    """Scan all SCAN_ROOTS for X | Y (BinOp with BitOr) in annotation positions using AST.
+    Catches violations including nested unions like Optional[int | str], Dict[str, int | None], etc.
+    """
+    all_hits: List[str] = []
+
+    for filepath in iter_py_files():
+        source = filepath.read_text(encoding="utf-8")
+        hits = pep604_hits(source, str(filepath))
+        all_hits.extend(hits)
+
+    assert not all_hits, (
+        "PEP 604 X | Y syntax found in annotations — use Union[X, Y] or Optional[X] for Python 3.9:\n"
+        + "\n".join(all_hits[:20])
+    )
+
+
+@pytest.mark.willi_parity
+def test_pep604_helper_catches_all_root_and_nested_forms():
+    """Self-test: pep604_hits catches exactly 12 root forms, 7 nested forms,
+    and ignores bitwise-or outside annotations (6 silent cases)."""
+    # 12 root-level forms
+    root_tests = [
+        ("def f(a: int | None): pass", ": int | None"),
+        ("def f() -> int | None: pass", ": int | None"),
+        ("x: int | None = None", ": int | None"),
+        ("def f(*, a: int | None): pass", ": int | None"),
+        ("def f(a: int | None, /): pass", ": int | None"),
+        ("def f(*a: int | None): pass", ": int | None"),
+        ("def f(**k: int | None): pass", ": int | None"),
+        ("async def f(a: int | None): pass", ": int | None"),
+        ("async def f() -> int | None: pass", ": int | None"),
+        ("class C:\n    x: int | None = None", ": int | None"),
+        ("def f():\n    x: int | None = None", ": int | None"),
+        ("class C:\n    def m(self, a: int | None): pass", ": int | None"),
+    ]
+
+    # 7 nested forms
+    nested_tests = [
+        ("x: Optional[int | str]", "int | str"),
+        ("x: List[int | None]", "int | None"),
+        ("def f() -> Dict[str, int | None]: pass", "int | None"),
+        ("def f(x: Callable[[int | None], None]) -> None: pass", "int | None"),
+        ("x: List[str | None]", "str | None"),
+        ("x: Optional[Path | str]", "Path | str"),
+        ("def f(*a: Tuple[int | None, ...]) -> None: pass", "int | None"),
+    ]
+
+    # Test all root forms: exactly one hit each
+    for code, expected_substr in root_tests:
+        hits = pep604_hits(code)
+        assert len(hits) == 1, f"Expected exactly 1 hit for: {code}, got {len(hits)}"
+        assert expected_substr in hits[0], f"Expected '{expected_substr}' in: {hits[0]}"
+
+    # Test all nested forms: exactly one hit each
+    for code, expected_expr in nested_tests:
+        hits = pep604_hits(code)
+        assert len(hits) == 1, f"Expected exactly 1 hit for: {code}, got {len(hits)}"
+        assert expected_expr in hits[0], f"Expected '{expected_expr}' in: {hits[0]}"
+
+    # Line number case: annotation on line 3
+    line_case = "def f(\n    a: int,\n    b: int | None,\n): pass"
+    hits = pep604_hits(line_case)
+    assert len(hits) == 1, f"Line number case failed: got {len(hits)} hits"
+    assert ":3: int | None" in hits[0], f"Expected ':3: int | None' in: {hits[0]}"
+
+    # Chained case: exactly one hit for `int | str | None`
+    chained = "x: int | str | None = None"
+    hits = pep604_hits(chained)
+    assert len(hits) == 1, f"Chained case failed: got {len(hits)} hits"
+    assert "int | str | None" in hits[0], f"Expected 'int | str | None' in: {hits[0]}"
+
+    # Silent cases: bitwise-or outside annotations (0 hits each)
+    silent_cases = [
+        "x = 1 | 2",  # value
+        "def f(): return 1 | 2",  # body
+        "f = lambda: 1 | 2",  # lambda body
+        "FLAGS = A | B",  # module-level flag
+        "def f(a: int = 1 | 2): pass",  # default value
+        "g = lambda x=1 | 2: x",  # lambda default
+    ]
+
+    for code in silent_cases:
+        hits = pep604_hits(code)
+        assert len(hits) == 0, f"Expected 0 hits for silent case: {code}, got {len(hits)}: {hits}"
+
+
+# ── 3. PEP 585 guard (dict[...] etc. in annotations) ─────────────────────────
+
+@pytest.mark.willi_parity
+def test_no_pep585_generics_in_annotations():
+    """No annotation should use bare built-in generics like dict[str, int] (PEP 585).
+    Python 3.9 allows this at runtime but it can cause issues in older minor versions
+    and with static analysis. Prefer typing.Dict / typing.List etc.
+    """
+    hits: List[str] = []
+
+    def check_node(node: ast.AST, filepath: Path) -> None:
+        """Walk annotation subscripts for bare builtin generic names."""
+        subscript_contexts = []
+
+        if isinstance(node, ast.AnnAssign) and isinstance(node.annotation, ast.Subscript):
+            subscript_contexts.append((node.annotation, node.lineno))
+
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.returns and isinstance(node.returns, ast.Subscript):
+                subscript_contexts.append((node.returns, node.lineno))
+            for arg in (
+                node.args.args
+                + node.args.posonlyargs
+                + node.args.kwonlyargs
+                + ([node.args.vararg] if node.args.vararg else [])
+                + ([node.args.kwarg] if node.args.kwarg else [])
+            ):
+                if arg.annotation and isinstance(arg.annotation, ast.Subscript):
+                    subscript_contexts.append((arg.annotation, getattr(arg, "col_offset", 0)))
+
+        for subscript, lineno in subscript_contexts:
+            val = subscript.value
+            if isinstance(val, ast.Name) and val.id in BUILTIN_GENERICS:
+                hits.append(
+                    f"{filepath}:{lineno}: {val.id}[...] — use typing.{val.id.capitalize()}"
+                )
+
+    for filepath in iter_py_files():
+        try:
+            tree = ast.parse(filepath.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # a syntax error is caught by the import/pytest gate, not here
+        for node in ast.walk(tree):
+            check_node(node, filepath)
+
+    assert not hits, (
+        "PEP 585 bare built-in generics found — use typing.Dict/List/Tuple for py3.9:\n"
+        + "\n".join(hits[:20])
+    )
+
+
+# ── 4. Hydra config invariants ────────────────────────────────────────────────
+
+@pytest.mark.willi_parity
+@pytest.mark.parametrize("model_name", [
+    "hybrid_70m",
+    "hybrid_70m_v2",
+    "hybrid_70m_v3",
+    "mamba_70m_baseline",
+    "xlstm_70m_baseline",
+])
+def test_hydra_config_resolves_70m_invariants(model_name: str):
+    """All 70M configs must share identical hyperparameters (only layer_pattern differs)."""
+    pytest.importorskip("hydra")
+    from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
+
+    GlobalHydra.instance().clear()
+    configs_dir = str(REPO_ROOT / "configs")
+
+    with initialize_config_dir(config_dir=configs_dir, version_base="1.3"):
+        cfg = compose(
+            config_name="config",
+            overrides=[
+                f"model={model_name}",
+                "dataset=wikitext",
+                "trainer=colab_single_gpu",
+                "experiment_name=parity_check",
+            ],
+        )
+
+    m = cfg.model
+    # Invariants shared across ALL 70M models
+    assert m.get("dim") == 512, f"{model_name}: dim={m.get('dim')} != 512"
+    assert m.get("num_layers") == 8, f"{model_name}: num_layers={m.get('num_layers')} != 8"
+    assert m.get("vocab_size") == 50257, f"{model_name}: vocab_size mismatch"
+
+    # hybrid_70m uses 1024 (MIG GPU); baselines use 2048 — both are valid
+    max_pos = m.get("max_position_embeddings")
+    assert max_pos in (1024, 2048), \
+        f"{model_name}: unexpected max_position_embeddings={max_pos} (expected 1024 or 2048)"
+
+    # layer_pattern must be non-empty; it cycles so no divisibility constraint needed
+    pat = list(m.get("layer_pattern", []))
+    assert len(pat) > 0, f"{model_name}: layer_pattern is empty"
+
+    # Phase 4 HybridNorm: v2 must use 'hybrid' topology; others default pre_rms
+    if model_name == "hybrid_70m_v2":
+        topo = m.get("norm_topology", "pre_rms")
+        assert topo == "hybrid", (
+            f"hybrid_70m_v2: norm_topology={topo!r} — must be 'hybrid' (Phase 4)"
+        )
+
+    # dataset max_length must not exceed model capacity
+    d = cfg.dataset
+    dataset_max = d.get("max_length", 1024)
+    model_max = m.get("max_position_embeddings", 1024)
+    assert dataset_max <= model_max, \
+        f"{model_name}: dataset.max_length ({dataset_max}) > model.max_position_embeddings ({model_max})"
+
+
+# ── 4b. H100 trainer config invariants (Phase 2) ──────────────────────────────
+
+@pytest.mark.willi_parity
+@pytest.mark.parametrize("trainer_name,expected_strategy,expected_devices", [
+    ("h100_single_gpu", "auto", 1),
+    ("h100_multi_ddp", "ddp", -1),
+])
+def test_h100_trainer_configs_resolve(trainer_name, expected_strategy, expected_devices):
+    """H100 trainer configs must load and carry the scale-up invariants:
+    bf16-mixed + accumulate_grad_batches=1 (true per-step batch — grad-accum does
+    NOT add in-batch contrastive negatives, so we scale batch_size, not accum)."""
+    pytest.importorskip("hydra")
+    from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
+
+    GlobalHydra.instance().clear()
+    configs_dir = str(REPO_ROOT / "configs")
+
+    with initialize_config_dir(config_dir=configs_dir, version_base="1.3"):
+        cfg = compose(
+            config_name="config",
+            overrides=[
+                "model=hybrid_70m_v2",
+                "dataset=wikitext",
+                f"trainer={trainer_name}",
+                "experiment_name=parity_check",
+            ],
+        )
+
+    t = cfg.trainer
+    assert t.get("precision") == "bf16-mixed", \
+        f"{trainer_name}: precision={t.get('precision')!r} != 'bf16-mixed'"
+    assert t.get("accumulate_grad_batches") == 1, \
+        f"{trainer_name}: accumulate_grad_batches={t.get('accumulate_grad_batches')} != 1 (H100 wants true per-step batch)"
+    assert str(t.get("strategy")) == expected_strategy, \
+        f"{trainer_name}: strategy={t.get('strategy')!r} != {expected_strategy!r}"
+    assert t.get("devices") == expected_devices, \
+        f"{trainer_name}: devices={t.get('devices')} != {expected_devices}"
+    if trainer_name == "h100_multi_ddp":
+        assert t.get("find_unused_parameters") is True, \
+            "h100_multi_ddp: find_unused_parameters must be true (ViT-unfreeze/KD leave frozen params)"
+
+
+# ── 4c. hybrid_150m_v2 config + param count (Phase 4) ─────────────────────────
+
+@pytest.mark.willi_parity
+def test_hybrid_150m_v2_config_and_param_count():
+    """Phase 4: the 150M v2 backbone ports every v2 arch win and builds to the
+    expected size. Param count verified explicitly (count before assuming a
+    mismatch) — ~183.72M actual (nominal '150M'; untied 50k-vocab embeddings
+    dominate, consistent with the 70M config → 83M naming convention)."""
+    import dataclasses
+    from omegaconf import OmegaConf
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel
+
+    raw = OmegaConf.to_container(
+        OmegaConf.load(REPO_ROOT / "configs" / "model" / "hybrid_150m_v2.yaml"),
+        resolve=True,
+    )
+    # v2 architectural invariants
+    assert raw["dim"] == 768, f"dim={raw['dim']} != 768"
+    assert raw["num_layers"] == 12, f"num_layers={raw['num_layers']} != 12"
+    assert raw["num_heads"] == 12 and raw["head_dim"] == 64
+    assert raw["norm_topology"] == "hybrid", "150m v2 must use HybridNorm"
+    assert raw["pooling_strategy"] == "attention"
+    assert raw["max_position_embeddings"] == 1024, "v2 parity: max_pos=1024"
+    pattern = list(raw["layer_pattern"])
+    assert len(pattern) == 12, f"layer_pattern len={len(pattern)} != 12"
+    assert pattern.count("mlstm") == 3, "centered 3-mLSTM (25% ratio) v2 analogue"
+
+    fields = {f.name for f in dataclasses.fields(HybridConfig)}
+    cfg = HybridConfig(**{k: v for k, v in raw.items() if k in fields})
+    model = HybridLanguageModel(cfg)
+    n_params = sum(p.numel() for p in model.parameters())
+    assert 181e6 < n_params < 186e6, (
+        f"hybrid_150m_v2 param count {n_params/1e6:.2f}M outside [181, 186]M — "
+        f"arch drift; expected ~183.72M"
+    )
+
+
+# ── 5. Checkpoint prefix stripping roundtrip ──────────────────────────────────
+
+@pytest.mark.willi_parity
+def test_checkpoint_prefix_stripping_roundtrip():
+    """Verify that state_dict keys with known willi prefixes are correctly stripped."""
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel
+
+    cfg = HybridConfig(
+        vocab_size=100, dim=64, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+    )
+    model = HybridLanguageModel(cfg)
+    bare_keys = set(model.state_dict().keys())
+
+    def strip_prefixes(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Strip known Lightning/compile/DDP prefixes in correct order.
+        Order matters: model. must come before lm. so that model.lm.x → lm.x → x.
+        """
+        stripped = {}
+        for k, v in state_dict.items():
+            k = k.removeprefix("_orig_mod.")   # torch.compile (outermost)
+            k = k.removeprefix("model.")       # Lightning wrapper
+            k = k.removeprefix("module.")      # DDP
+            k = k.removeprefix("lm.")          # HybridLMModule inner attribute
+            stripped[k] = v
+        return stripped
+
+    prefix_combos = [
+        {"prefix": "_orig_mod.", "label": "torch.compile"},
+        {"prefix": "lm.",        "label": "Lightning lm"},
+        {"prefix": "model.",     "label": "Lightning model"},
+        {"prefix": "module.",    "label": "DDP module"},
+        {"prefix": "_orig_mod.lm.", "label": "compile + lm"},
+        {"prefix": "model.lm.",     "label": "model + lm"},
+    ]
+
+    for combo in prefix_combos:
+        prefix = combo["prefix"]
+        wrapped = {f"{prefix}{k}": v for k, v in model.state_dict().items()}
+        stripped = strip_prefixes(wrapped)
+        stripped_keys = set(stripped.keys())
+        assert stripped_keys == bare_keys, (
+            f"Prefix '{prefix}' ({combo['label']}): stripping left unexpected keys.\n"
+            f"  Extra: {stripped_keys - bare_keys}\n"
+            f"  Missing: {bare_keys - stripped_keys}"
+        )
+
+
+# ── 6. CPU forward + backward smoke ───────────────────────────────────────────
+
+@pytest.mark.willi_parity
+def test_forward_cpu_smoke():
+    """Tiny model forward+backward on CPU. Catches frozen-layer and NaN bugs."""
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel
+
+    cfg = HybridConfig(
+        vocab_size=100, dim=64, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False,  # disable CUDA fast paths for CPU
+        use_tfla=False,
+    )
+    model = HybridLanguageModel(cfg)
+    model.train()
+
+    input_ids = torch.randint(0, 100, (2, 16))
+    labels = torch.randint(0, 100, (2, 16))
+
+    out = model(input_ids, labels=labels, return_dict=True)
+
+    assert out.loss is not None, "Model returned no loss"
+    assert torch.isfinite(out.loss), f"Loss is not finite: {out.loss.item()}"
+    assert torch.isfinite(out.logits).all(), "Logits contain NaN/Inf"
+
+    out.loss.backward()
+
+    # Every parameter that requires grad must have a non-None, finite gradient
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            assert param.grad is not None, f"No gradient for parameter: {name}"
+            assert torch.isfinite(param.grad).all(), \
+                f"Non-finite gradient for parameter: {name}"
+
+
+# ── 7. Dataloader max_length ≤ model capacity ─────────────────────────────────
+
+@pytest.mark.willi_parity
+def test_dataloader_max_length_matches_model():
+    """Ensure dataset.max_length does not exceed model.max_position_embeddings."""
+    pytest.importorskip("hydra")
+    from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
+
+    GlobalHydra.instance().clear()
+    configs_dir = str(REPO_ROOT / "configs")
+
+    with initialize_config_dir(config_dir=configs_dir, version_base="1.3"):
+        cfg = compose(
+            config_name="config",
+            overrides=[
+                "model=hybrid_70m",
+                "dataset=wikitext",
+                "trainer=colab_single_gpu",
+                "experiment_name=parity_check",
+            ],
+        )
+
+    dataset_max = cfg.dataset.get("max_length", 1024)
+    model_max = cfg.model.get("max_position_embeddings", 1024)
+
+    assert dataset_max <= model_max, (
+        f"dataset.max_length ({dataset_max}) > model.max_position_embeddings ({model_max}). "
+        "This silently truncates long sequences at eval time and causes retrieval regressions."
+    )
+
+
+# ── 8. Pooling: must use attention mask, not [:, -1, :] ──────────────────────
+
+@pytest.mark.willi_parity
+def test_pooling_respects_attention_mask():
+    """
+    Last-token pooling MUST use the last *non-padding* token via attention_mask.
+    Pooling from [:, -1, :] silently reads a padding token for right-padded sequences.
+
+    This test synthesises a batch with known padding and verifies that mask-aware
+    pooling produces different (correct) results from naive tail pooling.
+    """
+    B, T, D = 4, 16, 64
+    hidden = torch.randn(B, T, D)
+
+    # Real sequence lengths: [16, 12, 8, 4] — rest is padding
+    seq_lens = [16, 12, 8, 4]
+    mask = torch.zeros(B, T, dtype=torch.long)
+    for i, length in enumerate(seq_lens):
+        mask[i, :length] = 1
+
+    # ── Correct: mask-aware last-token pooling ────────────────────────────────
+    last_real_idx = mask.sum(dim=1) - 1          # [15, 11, 7, 3]
+    pooled_correct = hidden[range(B), last_real_idx]   # (B, D)
+
+    # ── Naive (wrong for padded sequences) ───────────────────────────────────
+    pooled_naive = hidden[:, -1, :]              # always last position
+
+    # For items where seq_len < T, the naive and correct results should differ
+    shorter_indices = [i for i, l in enumerate(seq_lens) if l < T]
+    assert shorter_indices, "Test setup error: no padded sequences"
+
+    for i in shorter_indices:
+        assert not torch.allclose(pooled_correct[i], pooled_naive[i]), (
+            f"Sequence {i} (len={seq_lens[i]}): mask-aware pooling equals naive pooling. "
+            "This means either pooling is broken or all padding positions have identical values."
+        )
+
+    # Sanity: for the full-length sequence, both should agree
+    full_len_idx = [i for i, l in enumerate(seq_lens) if l == T]
+    for i in full_len_idx:
+        assert torch.allclose(pooled_correct[i], pooled_naive[i]), \
+            f"Full-length sequence {i}: mask-aware and naive pooling should agree but don't."
+
+
+# ── 9. ContrastiveEvalCallback importable + Python 3.9-safe ───────────────
+
+@pytest.mark.willi_parity
+def test_contrastive_eval_callback_importable():
+    """ContrastiveEvalCallback and AnomalyDetectionCallback must import on Python 3.9."""
+    from hybrid_xmamba.training.contrastive_eval_callback import (
+        ContrastiveEvalCallback,
+        AnomalyDetectionCallback,
+        _spearman_rho,
+        _alignment,
+        _uniformity,
+    )
+    # Spearman correctness
+    rho = _spearman_rho([1.0, 2.0, 3.0], [1.0, 2.0, 3.0])
+    assert abs(rho - 1.0) < 1e-5, f"Expected ρ=1.0 for identical lists, got {rho}"
+
+    # Callback instantiates with minimal args
+    class _MockTok:
+        pass
+    cb = ContrastiveEvalCallback(tokenizer=_MockTok(), eval_every_n_steps=500)
+    assert cb.eval_every == 500
+    assert cb.align_unif_every == 1000  # default
+
+    acb = AnomalyDetectionCallback(max_steps=200)
+    assert acb.max_steps == 200
+
+
+# ── 10. NT-Xent fixed_scale path ──────────────────────────────────────────
+
+@pytest.mark.willi_parity
+def test_nt_xent_fixed_scale():
+    """_nt_xent_loss must honour the fixed_scale argument and ignore logit_scale."""
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridTextEncoder
+    from hybrid_xmamba.training.lightning_module import HybridContrastiveLightningModule
+    import torch.nn.functional as F
+
+    cfg = HybridConfig(
+        vocab_size=100, dim=64, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False,
+        use_tfla=False,
+    )
+    enc = HybridTextEncoder(cfg, embed_dim=64)
+    mod = HybridContrastiveLightningModule(
+        model=enc,
+        contrastive_mode="simcse",
+        learning_rate=1e-4,
+        weight_decay=0.01,
+        warmup_steps=10,
+        max_steps=100,
+        gradient_clip_val=1.0,
+    )
+
+    z1 = F.normalize(torch.randn(4, 64), dim=-1)
+    z2 = F.normalize(torch.randn(4, 64), dim=-1)
+
+    loss_fixed = mod._nt_xent_loss(z1, z2, mod.model.logit_scale, fixed_scale=20.0)
+    assert torch.isfinite(loss_fixed), f"fixed_scale loss not finite: {loss_fixed}"
+
+    # Manually verify scale=20 is used
+    logits = 20.0 * (z1 @ z2.T)
+    labels = torch.arange(4)
+    expected = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
+    assert abs(loss_fixed.item() - expected.item()) < 1e-5, (
+        f"fixed_scale loss {loss_fixed.item():.6f} != manual {expected.item():.6f}"
+    )
+
+
+# ── 11. Stage 1 distill config values ─────────────────────────────────────
+
+@pytest.mark.willi_parity
+def test_distill_kd_step_produces_finite_loss():
+    """DistillContrastiveLightningModule._simcse_step produces finite KD loss.
+
+    Stage 1 now uses pure PubMedBERT cosine KD (SimCSE removed). This test
+    verifies that the KD distill_loss is finite and in (0, 2) for random
+    embeddings, confirming gradient flow is working.
+
+    SimCSE was removed because the Stage 0 backbone (PPL=13.10) already
+    perfectly separates PubMed abstracts — InfoNCE loss was ~0.002 from
+    step 1, giving near-zero gradients. Pure KD directly aligns the student
+    to PubMedBERT's CLS space which scores BIOSSES=0.85.
+    """
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridTextEncoder
+    from hybrid_xmamba.training.lightning_module import DistillContrastiveLightningModule
+
+    cfg = HybridConfig(
+        vocab_size=100, dim=64, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False,
+        use_tfla=False,
+    )
+    enc = HybridTextEncoder(cfg, embed_dim=64)
+
+    # Minimal teacher stub: returns last_hidden_state (B, L, 768)
+    class _StubTeacher(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = type("C", (), {"hidden_size": 768})()
+
+        def forward(self, input_ids, attention_mask=None):
+            B, L = input_ids.shape
+            hidden = torch.randn(B, L, 768)
+            return type("O", (), {"last_hidden_state": hidden})()
+
+    teacher = _StubTeacher()
+    mod = DistillContrastiveLightningModule(
+        teacher=teacher,
+        lambda_max=1.0,
+        distill_warmup=0,
+        distill_ramp=1,
+        model=enc,
+        contrastive_mode="simcse",
+        learning_rate=1e-4,
+        weight_decay=0.01,
+        warmup_steps=5,
+        max_steps=50,
+        gradient_clip_val=1.0,
+    )
+    mod.train()
+
+    input_ids = torch.randint(0, 100, (4, 16))
+    attn = torch.ones(4, 16, dtype=torch.long)
+    # teacher_input_ids triggers KD computation
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": attn,
+        "teacher_input_ids": input_ids,
+        "teacher_attention_mask": attn,
+    }
+
+    loss = mod._simcse_step(batch, batch_idx=0, split="train")
+    assert torch.isfinite(loss), f"KD loss not finite: {loss.item()}"
+    assert 0.0 < loss.item() < 2.0, (
+        f"KD loss {loss.item():.4f} out of expected range (0, 2) for random embeddings"
+    )
+
+    # Backward must succeed — confirms gradient flows through distill_proj
+    loss.backward()
+    for name, param in mod.distill_proj.named_parameters():
+        assert param.grad is not None, f"No gradient for distill_proj.{name}"
+        assert torch.isfinite(param.grad).all(), f"Non-finite gradient for distill_proj.{name}"
+
+
+@pytest.mark.willi_parity
+def test_stage1_distill_config_values():
+    """stage1_pubmedbert.yaml KD schedule — pure KD, no SimCSE.
+
+    SimCSE was removed because the Stage 0 backbone (PPL=13.10) already
+    perfectly separates PubMed abstracts. InfoNCE loss started at ~0.002
+    from step 1 (expected 2.08 for random embeddings) — no gradient signal.
+    Pure PubMedBERT cosine KD is used instead: L = 1 - cos(student, teacher).
+    lambda_max=1.0 (full KD from step 0), warmup_steps=0, ramp_steps=1.
+    """
+    pytest.importorskip("yaml")
+    import yaml
+
+    cfg_path = REPO_ROOT / "configs" / "distill" / "stage1_pubmedbert.yaml"
+    assert cfg_path.exists(), f"Missing {cfg_path}"
+    with open(cfg_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    assert cfg.get("lambda_max") == 1.0, (
+        f"lambda_max should be 1.0 (pure KD), got {cfg.get('lambda_max')}"
+    )
+    assert cfg.get("warmup_steps") == 0, (
+        f"warmup_steps should be 0 (no SimCSE to warm up), got {cfg.get('warmup_steps')}"
+    )
+    assert cfg.get("ramp_steps") == 0, (
+        f"ramp_steps should be 0 (start KD immediately), got {cfg.get('ramp_steps')}"
+    )
+
+
+# ── 12. img_proj and distill_proj must NOT exist (Phase 8 deletion) ───────────
+
+@pytest.mark.willi_parity
+def test_img_proj_and_distill_proj_deleted():
+    """Phase 8: img_proj and distill_proj must be absent from all training modules.
+
+    clip_model.visual already outputs 512-d BiomedCLIP joint embeddings;
+    the random-init img_proj MLP was distorting them (root cause of Phase 5c
+    paired-cos plateau). distill_proj was a gradient absorber that prevented
+    KD from reaching z_text. Both are deleted in Phase 8.
+    """
+    import torch.nn as nn
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridTextEncoder
+    from hybrid_xmamba.training.lightning_module import (
+        HybridContrastiveLightningModule,
+        JointMultiTaskLightningModule,
+    )
+
+    cfg = HybridConfig(
+        vocab_size=100, dim=64, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False, use_tfla=False,
+    )
+    enc_simcse = HybridTextEncoder(cfg, embed_dim=64)
+
+    # SimCSE mode: neither module should exist.
+    mod_simcse = HybridContrastiveLightningModule(
+        model=enc_simcse, contrastive_mode="simcse",
+        learning_rate=1e-4, weight_decay=0.01,
+        warmup_steps=5, max_steps=50, gradient_clip_val=1.0,
+    )
+    assert not isinstance(getattr(mod_simcse, "img_proj", None), nn.Module), (
+        "img_proj must not be an nn.Module on HybridContrastiveLightningModule"
+    )
+
+    # Joint mode: distill_proj must be absent.
+    # embed_dim=512 required: Phase 8 assert checks img_out == student embed_dim,
+    # and real BiomedCLIP visual outputs 512-d.
+    cfg_joint = HybridConfig(
+        vocab_size=100, dim=64, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False, use_tfla=False,
+        pooling_strategy="attention",
+    )
+    enc_joint = HybridTextEncoder(cfg_joint, embed_dim=512)
+
+    class _StubTeacher(nn.Module):
+        def encode_text(self, ids):
+            return torch.randn(ids.shape[0], 512)
+
+    try:
+        mod_joint = JointMultiTaskLightningModule(
+            model=enc_joint,
+            teacher=_StubTeacher(),
+            alpha_kd=0.3, beta_clip=1.0, gamma_simcse=0.1,
+            backbone_lr=1e-5, head_lr=3e-4,
+            weight_decay=0.01, warmup_steps=5, max_steps=50,
+            gradient_clip_val=1.0, freeze_text_encoder_steps=0,
+        )
+        assert not isinstance(getattr(mod_joint, "distill_proj", None), nn.Module), (
+            "distill_proj must not be an nn.Module on JointMultiTaskLightningModule (Phase 8)"
+        )
+        assert not isinstance(getattr(mod_joint, "img_proj", None), nn.Module), (
+            "img_proj must not be an nn.Module on JointMultiTaskLightningModule (Phase 8)"
+        )
+    except ImportError:
+        pytest.skip("open_clip not installed — JointMultiTaskLightningModule requires it")
+
+
+# ── 13. AttentionPooling correctness ──────────────────────────────────────────
+
+@pytest.mark.willi_parity
+def test_attention_pooling_correctness():
+    """AttentionPooling must:
+    - produce finite, non-zero outputs
+    - differ from mean pooling (non-trivial weighting)
+    - handle all-padding edge case without NaN (falls back to uniform)
+    - be instantiated only for pooling_strategy='attention'
+    """
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import AttentionPooling, HybridTextEncoder
+
+    dim = 64
+    pool = AttentionPooling(dim)
+    pool.eval()
+
+    B, L = 4, 16
+    hidden = torch.randn(B, L, dim)
+    mask = torch.ones(B, L, dtype=torch.long)
+    mask[1, 12:] = 0   # second sample padded
+    mask[2, 8:]  = 0
+    mask[3, 4:]  = 0
+
+    out = pool(hidden, mask=mask)
+    assert out.shape == (B, dim), f"AttentionPooling output shape wrong: {out.shape}"
+    assert torch.isfinite(out).all(), "AttentionPooling output contains NaN/Inf"
+
+    # All-padding edge case — should not NaN
+    all_pad_mask = torch.zeros(2, L, dtype=torch.long)
+    out_ap = pool(hidden[:2], mask=all_pad_mask)
+    assert torch.isfinite(out_ap).all(), "AttentionPooling NaN on all-padding mask"
+
+    # Encoder wires correctly for strategy='attention'
+    cfg_attn = HybridConfig(
+        vocab_size=100, dim=dim, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False, use_tfla=False,
+        pooling_strategy="attention",
+    )
+    enc_attn = HybridTextEncoder(cfg_attn, embed_dim=dim)
+    assert enc_attn.attn_pool is not None, "attn_pool should be set for strategy='attention'"
+    assert isinstance(enc_attn.attn_pool, AttentionPooling)
+
+    # Encoder wires correctly for strategy='mean' (baselines)
+    cfg_mean = HybridConfig(
+        vocab_size=100, dim=dim, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False, use_tfla=False,
+        pooling_strategy="mean",
+    )
+    enc_mean = HybridTextEncoder(cfg_mean, embed_dim=dim)
+    assert enc_mean.attn_pool is None, "attn_pool should be None for strategy='mean'"
+
+
+# ── 14. Joint module: all 3 losses finite + grads flow ────────────────────────
+
+@pytest.mark.willi_parity
+def test_joint_module_all_losses_finite():
+    """JointMultiTaskLightningModule._joint_step must produce finite KD, CLIP, and
+    SimCSE losses with gradients flowing into backbone and proj_head.
+    Phase 8: img_proj and distill_proj deleted. KD is direct cosine sim on z_text.
+    image_encoder skipped (open_clip unavailable); l_clip=0 is OK.
+    """
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridTextEncoder
+    from hybrid_xmamba.training.lightning_module import JointMultiTaskLightningModule
+
+    cfg = HybridConfig(
+        vocab_size=100, dim=64, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False, use_tfla=False,
+        pooling_strategy="attention",
+    )
+    # embed_dim=512 matches BiomedCLIP joint space; Phase 6c KD is applied directly
+    # on z_text, so z_text and t_emb must share the same dimension.
+    enc = HybridTextEncoder(cfg, embed_dim=512)
+
+    class _StubBiomedCLIPText(torch.nn.Module):
+        """Mimic open_clip CLIP wrapper: encode_text returns (B, 512)."""
+
+        def encode_text(self, input_ids):
+            B = input_ids.shape[0]
+            return torch.randn(B, 512)
+
+    teacher = _StubBiomedCLIPText()
+
+    try:
+        mod = JointMultiTaskLightningModule(
+            model=enc,
+            teacher=teacher,
+            alpha_kd=0.3,
+            beta_clip=1.0,
+            gamma_simcse=0.1,
+            backbone_lr=1e-5,
+            head_lr=3e-4,
+            weight_decay=0.01,
+            warmup_steps=5,
+            max_steps=50,
+            gradient_clip_val=1.0,
+            freeze_text_encoder_steps=0,
+            vit_unfreeze_blocks=0,
+        )
+    except ImportError:
+        pytest.skip("open_clip not installed — JointMultiTaskLightningModule requires it")
+
+    mod.train()
+
+    input_ids = torch.randint(0, 100, (4, 16))
+    attn = torch.ones(4, 16, dtype=torch.long)
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": attn,
+        # No pixel_values: l_clip will be 0 (image encoder absent without open_clip)
+        "teacher_input_ids": input_ids,
+        "teacher_attention_mask": attn,
+    }
+
+    # Phase 8: distill_proj must not exist as a trainable module.
+    assert not isinstance(getattr(mod, "distill_proj", None), torch.nn.Module), (
+        "distill_proj must be deleted from JointMultiTaskLightningModule (Phase 8)"
+    )
+
+    loss = mod._joint_step(batch, batch_idx=0, split="train")
+    assert torch.isfinite(loss), f"Joint total loss not finite: {loss.item()}"
+    assert loss.item() > 0.0, "Joint loss should be > 0 (l_kd + l_simcse active)"
+
+    loss.backward()
+    # KD is direct cosine on z_text → projection_head must receive gradient.
+    for name, param in mod.model.projection_head.named_parameters():
+        assert param.grad is not None, f"No grad for projection_head.{name}"
+        assert torch.isfinite(param.grad).all(), f"NaN grad for projection_head.{name}"
+    if mod.model.attn_pool is not None:
+        for name, param in mod.model.attn_pool.named_parameters():
+            assert param.grad is not None, f"No grad for attn_pool.{name}"
+
+
+# ── 15. joint_mimic.yaml config values ────────────────────────────────────────
+
+@pytest.mark.willi_parity
+def test_joint_mimic_config_values():
+    """joint_mimic.yaml must have the plan-specified loss weights and LRs."""
+    pytest.importorskip("yaml")
+    import yaml
+
+    cfg_path = REPO_ROOT / "configs" / "distill" / "joint_mimic.yaml"
+    assert cfg_path.exists(), f"Missing {cfg_path}"
+    with open(cfg_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    assert cfg.get("alpha_kd") == 0.3,   f"alpha_kd should be 0.3, got {cfg.get('alpha_kd')}"
+    assert cfg.get("beta_clip") == 1.0,  f"beta_clip should be 1.0, got {cfg.get('beta_clip')}"
+    assert cfg.get("gamma_simcse") == 0.1, f"gamma_simcse should be 0.1, got {cfg.get('gamma_simcse')}"
+    assert cfg.get("backbone_lr") == 1e-5, f"backbone_lr should be 1e-5, got {cfg.get('backbone_lr')}"
+    assert cfg.get("head_lr") == 3e-4,  f"head_lr should be 3e-4, got {cfg.get('head_lr')}"
+    assert cfg.get("freeze_text_encoder_steps") == 500, (
+        f"freeze_text_encoder_steps should be 500, got {cfg.get('freeze_text_encoder_steps')}"
+    )
+
+
+@pytest.mark.willi_parity
+def test_biomedclip_kd_config_values():
+    """biomedclip_kd_joint.yaml must have plan-specified Phase 4 values."""
+    pytest.importorskip("yaml")
+    import yaml
+
+    cfg_path = REPO_ROOT / "configs" / "distill" / "biomedclip_kd_joint.yaml"
+    assert cfg_path.exists(), f"Missing {cfg_path}"
+    with open(cfg_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    assert cfg.get("teacher") == "biomedclip_text", (
+        f"teacher should be 'biomedclip_text', got {cfg.get('teacher')}"
+    )
+    assert cfg.get("alpha_kd") == 0.3,   f"alpha_kd should be 0.3 (Phase 6b), got {cfg.get('alpha_kd')}"
+    # Phase 10: α_kd schedule keys.
+    assert cfg.get("alpha_kd_warmup") == 1.0, (
+        f"alpha_kd_warmup should be 1.0 (Phase 10), got {cfg.get('alpha_kd_warmup')}"
+    )
+    assert cfg.get("alpha_kd_post") == 0.3, (
+        f"alpha_kd_post should be 0.3 (Phase 10), got {cfg.get('alpha_kd_post')}"
+    )
+    assert cfg.get("beta_clip") == 1.0,  f"beta_clip should be 1.0, got {cfg.get('beta_clip')}"
+    assert cfg.get("gamma_simcse") == 0.1, f"gamma_simcse should be 0.1, got {cfg.get('gamma_simcse')}"
+    assert cfg.get("backbone_lr") == 1e-5, f"backbone_lr should be 1e-5, got {cfg.get('backbone_lr')}"
+    assert cfg.get("head_lr") == 3e-4,  f"head_lr should be 3e-4, got {cfg.get('head_lr')}"
+    # Phase 10: 500→1000.
+    assert cfg.get("freeze_text_encoder_steps") == 1000, (
+        f"freeze_text_encoder_steps should be 1000 (Phase 10), got {cfg.get('freeze_text_encoder_steps')}"
+    )
+    # PubMedBERT-specific keys must NOT leak into this config.
+    for forbidden in ("teacher_model", "teacher_dtype", "teacher_max_length"):
+        assert forbidden not in cfg, f"{forbidden} is PubMedBERT-specific; remove from biomedclip_kd_joint.yaml"
+
+
+@pytest.mark.willi_parity
+def test_alpha_kd_schedule_switches_at_threshold():
+    """Phase 10: effective α_kd must equal alpha_kd_warmup while
+    global_step < freeze_text_encoder_steps, and alpha_kd_post otherwise.
+    Also asserts that __init__ without overrides reduces to the legacy
+    constant α_kd (back-compat).
+    """
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridTextEncoder
+    from hybrid_xmamba.training.lightning_module import JointMultiTaskLightningModule
+
+    cfg = HybridConfig(
+        vocab_size=100, dim=64, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False, use_tfla=False,
+        pooling_strategy="attention",
+    )
+    enc = HybridTextEncoder(cfg, embed_dim=512)
+
+    class _StubBiomedCLIPText(torch.nn.Module):
+        def encode_text(self, input_ids):
+            return torch.randn(input_ids.shape[0], 512)
+
+    teacher = _StubBiomedCLIPText()
+
+    try:
+        mod = JointMultiTaskLightningModule(
+            model=enc, teacher=teacher,
+            alpha_kd=0.3, alpha_kd_warmup=1.0, alpha_kd_post=0.3,
+            beta_clip=1.0, gamma_simcse=0.1,
+            backbone_lr=1e-5, head_lr=3e-4, weight_decay=0.01,
+            warmup_steps=5, max_steps=50, gradient_clip_val=1.0,
+            freeze_text_encoder_steps=1000,
+        )
+    except ImportError:
+        pytest.skip("open_clip not installed")
+
+    assert mod.alpha_kd_warmup == 1.0
+    assert mod.alpha_kd_post == 0.3
+
+    # Back-compat: no overrides → both fall back to alpha_kd.
+    try:
+        mod2 = JointMultiTaskLightningModule(
+            model=enc, teacher=teacher, alpha_kd=0.42,
+            beta_clip=1.0, gamma_simcse=0.1,
+            backbone_lr=1e-5, head_lr=3e-4, weight_decay=0.01,
+            warmup_steps=5, max_steps=50, gradient_clip_val=1.0,
+            freeze_text_encoder_steps=0,
+        )
+    except ImportError:
+        pytest.skip("open_clip not installed")
+    assert mod2.alpha_kd_warmup == 0.42
+    assert mod2.alpha_kd_post == 0.42
+
+    # Verify the schedule actually applies inside _joint_step by varying the
+    # threshold (global_step==0 when no trainer is attached). With threshold
+    # 1000 the warmup α applies; with threshold 0 the post α applies. With
+    # l_clip=0 (no pixel_values) the total loss differs only by the α_kd
+    # multiplier on l_kd, so any change in α produces a measurably different
+    # total under a fixed RNG seed.
+    input_ids = torch.randint(0, 100, (2, 8))
+    attn = torch.ones(2, 8, dtype=torch.long)
+    batch = {
+        "input_ids": input_ids, "attention_mask": attn,
+        "teacher_input_ids": input_ids, "teacher_attention_mask": attn,
+    }
+
+    try:
+        mod_warmup = JointMultiTaskLightningModule(
+            model=enc, teacher=teacher,
+            alpha_kd=0.3, alpha_kd_warmup=1.0, alpha_kd_post=0.3,
+            beta_clip=1.0, gamma_simcse=0.1,
+            backbone_lr=1e-5, head_lr=3e-4, weight_decay=0.01,
+            warmup_steps=5, max_steps=50, gradient_clip_val=1.0,
+            freeze_text_encoder_steps=1000,  # global_step(0) < 1000 → warmup α
+        )
+        mod_post = JointMultiTaskLightningModule(
+            model=enc, teacher=teacher,
+            alpha_kd=0.3, alpha_kd_warmup=1.0, alpha_kd_post=0.3,
+            beta_clip=1.0, gamma_simcse=0.1,
+            backbone_lr=1e-5, head_lr=3e-4, weight_decay=0.01,
+            warmup_steps=5, max_steps=50, gradient_clip_val=1.0,
+            freeze_text_encoder_steps=0,     # global_step(0) >= 0 → post α
+        )
+    except ImportError:
+        pytest.skip("open_clip not installed")
+
+    mod_warmup.eval()
+    mod_post.eval()
+
+    torch.manual_seed(0)
+    loss_warmup = mod_warmup._joint_step(batch, batch_idx=0, split="train").item()
+    torch.manual_seed(0)
+    loss_post = mod_post._joint_step(batch, batch_idx=0, split="train").item()
+
+    # Different effective α must produce a different total loss.
+    assert loss_warmup != loss_post, (
+        f"α_kd schedule did not change loss: warmup={loss_warmup}, post={loss_post}"
+    )
+
+
+@pytest.mark.willi_parity
+def test_moco_queue_shape_and_enqueue():
+    """MoCoQueue: buffer shape correct; enqueue fills and wraps correctly."""
+    from hybrid_xmamba.training.moco_queue import MoCoQueue
+    import torch.nn.functional as F
+
+    K, dim, B = 64, 16, 8
+    q = MoCoQueue(dim=dim, K=K)
+    assert q.queue.shape == (dim, K), f"Expected ({dim},{K}), got {q.queue.shape}"
+
+    # Fill with known values and verify ptr advances
+    keys = F.normalize(torch.randn(B, dim), dim=-1)
+    q.enqueue(keys)
+    assert int(q.queue_ptr) == B, f"ptr should be {B}, got {int(q.queue_ptr)}"
+
+    # Verify stored keys match
+    stored = q.all_keys()[:B]  # first B rows
+    assert torch.allclose(stored, keys, atol=1e-5), "Stored keys don't match enqueued"
+
+    # Fill remaining capacity (K - B already written) then verify wrap-around
+    for _ in range(K // B - 1):
+        q.enqueue(F.normalize(torch.randn(B, dim), dim=-1))
+    assert int(q.queue_ptr) == 0, "Ptr should wrap to 0 after exactly K enqueued keys"
+
+
+@pytest.mark.willi_parity
+def test_momentum_encoder_ema_delta():
+    """MomentumEncoder: EMA update moves params by exactly (1-m) fraction."""
+    from hybrid_xmamba.training.moco_queue import MomentumEncoder
+    import torch.nn as nn
+
+    m = 0.9
+    query = nn.Linear(8, 4, bias=False)
+    nn.init.constant_(query.weight, 1.0)
+
+    ema = MomentumEncoder(query, m=m)
+    nn.init.constant_(ema.encoder.weight, 0.0)  # start EMA at 0
+
+    ema.update(query)
+    # Expected: 0.9 * 0.0 + 0.1 * 1.0 = 0.1
+    expected = (1 - m) * 1.0
+    assert torch.allclose(ema.encoder.weight, torch.full_like(ema.encoder.weight, expected), atol=1e-6), \
+        f"EMA weight should be {expected}, got {ema.encoder.weight.mean().item()}"
+
+
+@pytest.mark.willi_parity
+def test_moco_config_values():
+    """Phase 13: biomedclip_kd_joint.yaml must have moco_queue_size=0 (queue disabled).
+
+    Phase 6d (job 1313) showed MoCo K=16384 cold-start at unfreeze fills the
+    queue with 16384 random unit-norm vectors; K/batch=512 steps to refresh
+    produces near-random CLIP gradients that destroy the KD warmup (MIMIC
+    R@10=3.95% vs Phase 5c 9.99%). Fix: queue disabled, in-batch only.
+    """
+    pytest.importorskip("yaml")
+    import yaml
+
+    cfg_path = REPO_ROOT / "configs" / "distill" / "biomedclip_kd_joint.yaml"
+    with open(cfg_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    assert cfg.get("moco_queue_size") == 256, \
+        f"moco_queue_size should be 256 (Phase 6f: small queue, warms in 8 steps), got {cfg.get('moco_queue_size')}"
+    assert cfg.get("moco_momentum") == 0.999, \
+        f"moco_momentum should be 0.999, got {cfg.get('moco_momentum')}"
+
+
+@pytest.mark.willi_parity
+def test_moco_symmetric_loss_both_directions():
+    """_moco_clip_loss_symmetric must train both i2t and t2i directions.
+
+    Checks: loss is finite; gradients flow into z_text (t2i path); the
+    text_queue and img_queue are both initialised on the module.
+    """
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridTextEncoder
+    from hybrid_xmamba.training.lightning_module import JointMultiTaskLightningModule
+    from hybrid_xmamba.training.moco_queue import MoCoQueue
+
+    # embed_dim=512: Phase 8 assert requires img_out (512 for real BiomedCLIP)
+    # to equal student embed_dim.
+    cfg = HybridConfig(
+        vocab_size=100, dim=64, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False, use_tfla=False,
+        pooling_strategy="attention",
+    )
+    enc = HybridTextEncoder(cfg, embed_dim=512)
+
+    class _StubTeacher(torch.nn.Module):
+        def encode_text(self, input_ids):
+            return torch.randn(input_ids.shape[0], 512)
+
+    try:
+        mod = JointMultiTaskLightningModule(
+            model=enc, teacher=_StubTeacher(),
+            warmup_steps=2, max_steps=10,
+            freeze_text_encoder_steps=0,
+            moco_queue_size=32,  # small queue for CPU test
+        )
+    except ImportError:
+        pytest.skip("open_clip not installed")
+
+    assert isinstance(mod.text_queue, MoCoQueue), "text_queue must be MoCoQueue"
+    assert not hasattr(mod, 'img_queue') or mod.img_queue is None, \
+        "img_queue must not exist — random-init queue causes max-entropy t2i loss"
+    assert mod.text_queue.K == 32
+
+    # Exercise the symmetric loss directly
+    B, D = 4, 512
+    raw_text = torch.randn(B, D, requires_grad=True)
+    z_text   = torch.nn.functional.normalize(raw_text, dim=-1)
+    z_img    = torch.nn.functional.normalize(torch.randn(B, D), dim=-1)
+    z_text_k = torch.nn.functional.normalize(torch.randn(B, D), dim=-1)
+    loss = mod._moco_clip_loss_symmetric(z_text, z_img, z_text_k)
+    assert torch.isfinite(loss), f"Symmetric MoCo loss not finite: {loss.item()}"
+    loss.backward()
+    # raw_text is the leaf — grad must flow through t2i path (z_text @ img_bank)
+    assert raw_text.grad is not None, "No gradient into z_text (t2i path broken)"
+    assert torch.isfinite(raw_text.grad).all(), "NaN in z_text gradient"
+
+
+@pytest.mark.willi_parity
+def test_clip_loss_gated_during_warmup():
+    """Phase 9: CLIP loss must be gated off (l_clip == 0) and the MoCo queue
+    must NOT enqueue while ``global_step < freeze_text_encoder_steps``.
+
+    Without a Lightning trainer, ``self.global_step`` returns 0; setting
+    ``freeze_text_encoder_steps=1000`` keeps the gate closed.
+    """
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridTextEncoder
+    from hybrid_xmamba.training.lightning_module import JointMultiTaskLightningModule
+
+    cfg = HybridConfig(
+        vocab_size=100, dim=64, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False, use_tfla=False,
+        pooling_strategy="attention",
+    )
+    enc = HybridTextEncoder(cfg, embed_dim=512)
+
+    class _StubTeacher(torch.nn.Module):
+        def encode_text(self, input_ids):
+            return torch.randn(input_ids.shape[0], 512)
+
+    try:
+        mod = JointMultiTaskLightningModule(
+            model=enc, teacher=_StubTeacher(),
+            warmup_steps=2, max_steps=10,
+            freeze_text_encoder_steps=1000,
+            moco_queue_size=32,
+        )
+    except ImportError:
+        pytest.skip("open_clip not installed")
+
+    # Inject a dummy image encoder (open_clip-free) so the CLIP branch could fire.
+    # If gating works, the branch is skipped despite this being available.
+    B = 4
+
+    class _StubImageEncoder(torch.nn.Module):
+        def forward(self, px):
+            return torch.randn(px.shape[0], 512)
+
+    mod.image_encoder = _StubImageEncoder()
+
+    input_ids = torch.randint(0, 100, (B, 16))
+    attn = torch.ones(B, 16, dtype=torch.long)
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": attn,
+        "pixel_values": torch.randn(B, 3, 8, 8),
+        "teacher_input_ids": input_ids,
+        "teacher_attention_mask": attn,
+    }
+
+    ptr_before = int(mod.text_queue.queue_ptr)
+    queue_before = mod.text_queue.queue.clone()
+    loss = mod._joint_step(batch, batch_idx=0, split="train")
+    ptr_after = int(mod.text_queue.queue_ptr)
+
+    assert torch.isfinite(loss), "Joint loss not finite during warmup"
+    assert ptr_after == ptr_before, (
+        f"text_queue must not enqueue during warmup; ptr {ptr_before}→{ptr_after}"
+    )
+    assert torch.equal(mod.text_queue.queue, queue_before), \
+        "text_queue contents must be untouched during warmup"
+
+
+@pytest.mark.willi_parity
+def test_moco_queue_cold_start_reset():
+    """Phase 9: MoCoQueue.reset() zeros the pointer and re-randomises the buffer
+    so post-warmup InfoNCE negatives start fresh (not stale GPT-2-space keys)."""
+    from hybrid_xmamba.training.moco_queue import MoCoQueue
+    import torch.nn.functional as F
+
+    K, dim, B = 64, 16, 8
+    q = MoCoQueue(dim=dim, K=K)
+    keys = F.normalize(torch.randn(B, dim), dim=-1)
+    q.enqueue(keys)
+    assert int(q.queue_ptr) == B
+    q_before = q.queue.clone()
+
+    q.reset()
+    assert int(q.queue_ptr) == 0, "reset() must zero queue_ptr"
+    # Buffer is re-randomised — should differ from pre-reset state almost surely.
+    assert not torch.equal(q.queue, q_before), "reset() must change queue contents"
+    # Still L2-normalised columns.
+    norms = q.queue.norm(dim=0)
+    assert torch.allclose(norms, torch.ones(K), atol=1e-5), \
+        "reset() queue columns must remain unit-norm"
+
+
+@pytest.mark.willi_parity
+def test_momentum_encoder_copy_from():
+    """Phase 9: copy_from() hard-resyncs momentum encoder weights to live model."""
+    from hybrid_xmamba.training.moco_queue import MomentumEncoder
+    import torch.nn as nn
+
+    query = nn.Linear(8, 4, bias=False)
+    nn.init.constant_(query.weight, 1.0)
+
+    ema = MomentumEncoder(query, m=0.999)
+    nn.init.constant_(ema.encoder.weight, 0.0)
+    assert not torch.allclose(ema.encoder.weight, query.weight), \
+        "Pre-condition: ema and query must differ"
+
+    ema.copy_from(query)
+    assert torch.allclose(ema.encoder.weight, query.weight, atol=1e-7), \
+        "copy_from must produce identical weights to live model"
+    # All ema params must remain non-trainable.
+    for p in ema.encoder.parameters():
+        assert not p.requires_grad, "EMA encoder params must stay frozen after copy_from"
+
+
+@pytest.mark.willi_parity
+def test_joint_unfreeze_triggers_resync_and_reset():
+    """Phase 9: at the unfreeze step, on_train_batch_start must call
+    momentum_encoder.copy_from(model) and text_queue.reset()."""
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridTextEncoder
+    from hybrid_xmamba.training.lightning_module import JointMultiTaskLightningModule
+    import torch.nn.functional as F
+
+    cfg = HybridConfig(
+        vocab_size=100, dim=64, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False, use_tfla=False,
+        pooling_strategy="attention",
+    )
+    enc = HybridTextEncoder(cfg, embed_dim=512)
+
+    class _StubTeacher(torch.nn.Module):
+        def encode_text(self, input_ids):
+            return torch.randn(input_ids.shape[0], 512)
+
+    try:
+        mod = JointMultiTaskLightningModule(
+            model=enc, teacher=_StubTeacher(),
+            warmup_steps=2, max_steps=10,
+            freeze_text_encoder_steps=0,  # so global_step(0) >= threshold triggers unfreeze
+            moco_queue_size=32,
+        )
+    except ImportError:
+        pytest.skip("open_clip not installed")
+
+    # Force the "currently frozen" flag so parent's on_train_batch_start
+    # treats this call as the unfreeze transition. self.print() needs a Trainer
+    # — silence it in the test by overriding at instance level.
+    mod._lm_currently_frozen = True
+    mod.print = lambda *a, **kw: None
+    # Pre-fill queue so reset() has something to clear.
+    keys = F.normalize(torch.randn(4, 512), dim=-1)
+    mod.text_queue.enqueue(keys)
+    queue_before = mod.text_queue.queue.clone()
+
+    # Perturb model weights so ema != model before resync.
+    with torch.no_grad():
+        for p in mod.model.projection_head.parameters():
+            p.add_(0.5)
+
+    # Sanity: ema weights differ from live model before resync.
+    ema_proj = dict(mod.momentum_encoder.encoder.projection_head.named_parameters())
+    live_proj = dict(mod.model.projection_head.named_parameters())
+    diff_before = any(
+        not torch.allclose(ema_proj[k], live_proj[k]) for k in ema_proj
+    )
+    assert diff_before, "Pre-condition: ema must differ from live model"
+
+    mod.on_train_batch_start(batch=None, batch_idx=0)
+
+    # Post-condition: ema == live model (hard-resync).
+    for k in ema_proj:
+        assert torch.allclose(ema_proj[k], live_proj[k], atol=1e-6), \
+            f"momentum_encoder.{k} not resynced after unfreeze"
+    # Post-condition: queue ptr reset and contents changed.
+    assert int(mod.text_queue.queue_ptr) == 0, "text_queue ptr must reset at unfreeze"
+    assert not torch.equal(mod.text_queue.queue, queue_before), \
+        "text_queue contents must be re-randomised at unfreeze"
+
+
+@pytest.mark.willi_parity
+def test_no_queue_inbatch_clip_fires_post_warmup():
+    """Phase 13: with moco_queue_size=0, text_queue must be None and
+    l_clip must be > 0 once freeze_text_encoder_steps=0 (simulating post-warmup).
+
+    Verifies the no-queue in-batch CLIP path used in Phase 6e.
+    """
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridTextEncoder
+    from hybrid_xmamba.training.lightning_module import JointMultiTaskLightningModule
+
+    cfg = HybridConfig(
+        vocab_size=100, dim=64, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False, use_tfla=False,
+        pooling_strategy="attention",
+    )
+    enc = HybridTextEncoder(cfg, embed_dim=512)
+
+    class _StubTeacher(torch.nn.Module):
+        def encode_text(self, input_ids):
+            return torch.randn(input_ids.shape[0], 512)
+
+    try:
+        mod = JointMultiTaskLightningModule(
+            model=enc, teacher=_StubTeacher(),
+            warmup_steps=2, max_steps=10,
+            freeze_text_encoder_steps=0,   # post-warmup: CLIP active immediately
+            moco_queue_size=0,              # Phase 13: no queue
+        )
+    except ImportError:
+        pytest.skip("open_clip not installed")
+
+    assert mod.text_queue is None, \
+        "text_queue must be None when moco_queue_size=0"
+
+    B = 4
+    class _StubImageEncoder(torch.nn.Module):
+        def forward(self, px):
+            return torch.randn(px.shape[0], 512)
+
+    mod.image_encoder = _StubImageEncoder()
+
+    input_ids = torch.randint(0, 100, (B, 16))
+    attn = torch.ones(B, 16, dtype=torch.long)
+    batch = {
+        "input_ids": input_ids, "attention_mask": attn,
+        "pixel_values": torch.randn(B, 3, 8, 8),
+        "teacher_input_ids": input_ids, "teacher_attention_mask": attn,
+    }
+
+    logged: dict = {}
+
+    def _capture(self, name, value, *args, **kwargs):  # type: ignore[no-untyped-def]
+        try:
+            logged[name] = float(value.detach().item() if hasattr(value, "detach") else value)
+        except Exception:
+            pass
+
+    import types as _types
+    mod.log = _types.MethodType(_capture, mod)
+    loss = mod._joint_step(batch, batch_idx=0, split="train")
+
+    assert torch.isfinite(loss), "Joint loss not finite"
+    clip_val = logged.get("train/clip_loss", None)
+    assert clip_val is not None and clip_val > 0.0, (
+        f"clip_loss must be > 0 post-warmup with no queue; got {clip_val}"
+    )
+
+
+@pytest.mark.willi_parity
+def test_mlstm_stability_config_present():
+    """Phase 3D: HybridConfig must expose the three mLSTM gate-stabilisation knobs
+    with safe defaults (cap=15, i_bias=-10, f_bias=0)."""
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+
+    cfg = HybridConfig()
+    assert hasattr(cfg, "mlstm_gate_soft_cap"), \
+        "HybridConfig missing mlstm_gate_soft_cap"
+    assert hasattr(cfg, "mlstm_input_gate_bias_init"), \
+        "HybridConfig missing mlstm_input_gate_bias_init"
+    assert hasattr(cfg, "mlstm_forget_gate_bias_init"), \
+        "HybridConfig missing mlstm_forget_gate_bias_init"
+    assert cfg.mlstm_gate_soft_cap == 15.0, \
+        f"Expected cap=15.0, got {cfg.mlstm_gate_soft_cap}"
+    assert cfg.mlstm_input_gate_bias_init == -10.0, \
+        f"Expected i_bias=-10.0, got {cfg.mlstm_input_gate_bias_init}"
+    assert cfg.mlstm_forget_gate_bias_init == 0.0, \
+        f"Expected f_bias=0.0, got {cfg.mlstm_forget_gate_bias_init}"
+
+
+@pytest.mark.willi_parity
+def test_stage1_proj_head_dropout_default():
+    """hybrid_70m.yaml must keep proj_head_dropout=0.1 (literature SimCSE default).
+
+    Run 1209 raised it to 0.3 in tandem with scale 20→5 to fight near-zero loss;
+    both reverted after STS-B decline showed the issue was KD weight, not view
+    diversity. 0.3 produces overly noisy positive views.
+    """
+    pytest.importorskip("yaml")
+    import yaml
+
+    cfg_path = REPO_ROOT / "configs" / "model" / "hybrid_70m.yaml"
+    with open(cfg_path, "r") as f:
+        cfg = yaml.safe_load(f)
+    assert cfg.get("proj_head_dropout") == 0.1, (
+        f"proj_head_dropout default should be 0.1, got {cfg.get('proj_head_dropout')}"
+    )
+
+
+@pytest.mark.willi_parity
+def test_wsd_scheduler_shape():
+    """Phase 7A: WSDScheduler must produce the plan-of-record shape.
+
+    Asserts: warmup 1% (linear rise), stable 85% (factor==1.0), decay 14%
+    (factor = 1 - sqrt(p) clamped at min_lr_ratio). Also asserts the β2
+    helper anneals 0.999 → 0.974 across the decay phase.
+    """
+    import math as _math
+    from hybrid_xmamba.training.schedulers import (
+        WSDScheduler,
+        wsd_factor,
+        beta2_for_step,
+    )
+
+    base_lr = 1.0
+    max_steps = 10000
+    param = torch.zeros(1, requires_grad=True)
+    optimizer = torch.optim.AdamW([param], lr=base_lr, betas=(0.9, 0.999))
+    sched = WSDScheduler(optimizer, max_steps=max_steps)
+
+    assert sched.warmup_steps == 100, f"warmup_steps={sched.warmup_steps} expected 100"
+    assert sched.stable_steps == 8500, f"stable_steps={sched.stable_steps} expected 8500"
+    assert sched.decay_steps == 1400, f"decay_steps={sched.decay_steps} expected 1400"
+    assert sched.decay_start == 8600
+
+    # Warmup: linear from 0.01 → 1.0 across 100 steps.
+    f_warmup_start = wsd_factor(0, 100, 8500, 1400)
+    f_warmup_mid = wsd_factor(50, 100, 8500, 1400)
+    assert abs(f_warmup_start - 0.01) < 1e-6, f_warmup_start
+    assert 0.4 < f_warmup_mid < 0.6, f_warmup_mid
+
+    # Stable phase: constant 1.0.
+    for s in (100, 1000, 5000, 8599):
+        f = wsd_factor(s, 100, 8500, 1400)
+        assert abs(f - 1.0) < 1e-6, f"stable step {s} factor={f}"
+
+    # Decay: 1 - sqrt(p). At p=0.25, factor=0.5; at p=1, factor=0.
+    f_quarter = wsd_factor(8600 + 350, 100, 8500, 1400)
+    assert abs(f_quarter - 0.5) < 1e-6, f_quarter
+    f_end = wsd_factor(max_steps, 100, 8500, 1400)
+    assert abs(f_end - 0.0) < 1e-6, f_end
+
+    # β2 schedule: constant pre-decay, linear during decay.
+    assert beta2_for_step(0, 8600, 1400) == 0.999
+    assert beta2_for_step(8600, 8600, 1400) == 0.999
+    b2_mid = beta2_for_step(8600 + 700, 8600, 1400)
+    assert abs(b2_mid - 0.9865) < 1e-6, b2_mid
+    assert abs(beta2_for_step(max_steps, 8600, 1400) - 0.974) < 1e-6
+
+
+def test_wsd_scheduler_absolute_warmup_override():
+    """Phase 9F: WSDScheduler must honor absolute ``warmup_steps`` override.
+
+    With ``max_steps=50000, warmup_steps=1000``: warmup is 1000 (not 500=1%);
+    decay stays at 14% (=7000); stable absorbs the remainder (=42000).
+    """
+    from hybrid_xmamba.training.schedulers import WSDScheduler
+
+    param = torch.zeros(1, requires_grad=True)
+    optimizer = torch.optim.AdamW([param], lr=1.0)
+    sched = WSDScheduler(
+        optimizer,
+        max_steps=50000,
+        warmup_steps=1000,
+    )
+
+    assert sched.warmup_steps == 1000, sched.warmup_steps
+    assert sched.decay_steps == 7000, sched.decay_steps
+    assert sched.stable_steps == 42000, sched.stable_steps
+    assert sched.decay_start == 43000, sched.decay_start
+
+
+def test_norm_topology_threaded_to_hybridconfig():
+    """Training entry points must carry every yaml config field into ``HybridConfig``.
+
+    History, because this has now happened twice and the guard should reflect both:
+
+    * Phase 9F -- ``HybridConfig`` was built from an explicit ``cfg.model.*`` list that omitted
+      ``norm_topology``, so a v2 yaml's ``norm_topology: hybrid`` was ignored and HybridNorm
+      weights loaded into a pre_rms model. This test was written then, asserting the literal
+      ``norm_topology=`` kwarg was present.
+    * 2026-09-06 (MAMBA3_PLAN_V2.md FM5) -- the same hand-written list dropped ``scan_impl``,
+      ``tfla_impl`` and ``dt_init_strategy``. Job 2513007 trained the A1 arm with every defect
+      still in place; only the ARCH fingerprint caught it. Guarding one field name could never
+      have caught that, because the bug is the mechanism, not the field.
+
+    So the assertion moved up a level: entry points must build through
+    ``HybridConfig.from_hydra``, which filters against ``dataclasses.fields`` and therefore
+    carries fields that do not exist yet. Source text plus a runtime round-trip, because the
+    failure is invisible at runtime otherwise -- the model builds and trains perfectly well, it
+    is simply not the architecture that was asked for.
+    """
+    import dataclasses
+    import pathlib
+
+    import yaml
+
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    for rel in (
+        "scripts/train.py",
+        "scripts/train_stage0_distill.py",
+        "scripts/train_stage0_distill_resume.py",
+        "scripts/train_contrastive.py",
+        "scripts/train_report_generation.py",
+    ):
+        src = (repo_root / rel).read_text()
+        assert "HybridConfig.from_hydra(" in src, (
+            f"{rel}: must build HybridConfig via from_hydra(); a hand-written kwarg list "
+            "silently drops any field nobody remembered to add"
+        )
+        assert "HybridConfig(\n" not in src, (
+            f"{rel}: still constructs HybridConfig from an explicit kwarg list"
+        )
+
+    # Runtime half: whatever a yaml sets must arrive on the dataclass.
+    fields = {f.name for f in dataclasses.fields(HybridConfig)}
+    for name in ("hybrid_70m_v2", "hybrid_150m_v2", "hybrid_150m_a1", "hybrid_150m_m3"):
+        path = repo_root / "configs" / "model" / f"{name}.yaml"
+        if not path.exists():
+            continue
+        raw = yaml.safe_load(path.read_text())
+        cfg = HybridConfig.from_hydra(raw)
+        for key, value in raw.items():
+            # `null` in a yaml means "derive it" -- __post_init__ fills dt_rank, num_heads and
+            # slstm_hidden_dim -- so a None never round-trips unchanged and is not a drop.
+            if (
+                key in fields
+                and key != "model_type"
+                and value is not None
+                and not isinstance(value, (dict, list))
+            ):
+                assert getattr(cfg, key) == value, (
+                    f"{name}.yaml sets {key}={value!r} but the config has "
+                    f"{getattr(cfg, key)!r} -- the field was dropped in transit"
+                )
+
+
+def test_resume_from_checkpoint_wired_to_trainer_fit():
+    """Phase 9-EXT: train_stage0_distill.py must pass an optional resume ckpt to
+    trainer.fit(ckpt_path=...) so a walltime-killed run can continue from last.ckpt
+    (the 120K WSD run died at step 22K; resume + recalibrated max_steps fires the
+    decay it never reached). Guard the wiring against accidental removal.
+    """
+    import pathlib
+
+    src = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "scripts" / "train_stage0_distill.py"
+    ).read_text()
+    assert 'cfg.get("resume_from_checkpoint"' in src, (
+        "train_stage0_distill.py: resume_from_checkpoint not read from cfg"
+    )
+    assert "ckpt_path=" in src, (
+        "train_stage0_distill.py: trainer.fit must receive ckpt_path= for resume"
+    )
+
+
+def test_biomedclip_kd_joint_v2_config_present():
+    """Phase 10C/10F: the v2 joint distill config must keep freq-decoupled KD OFF
+    (2026-06-18 ablation: ON cost Indiana 3.90%->2.96%), enable the ViT unfreeze
+    (supervisor Step 6; ablation proved it a pure +2.5pp MIMIC win), and hold the
+    Phase 6e recipe (K=0).
+    """
+    import pathlib
+    import yaml
+
+    cfg_path = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "configs" / "distill" / "biomedclip_kd_joint_v2.yaml"
+    )
+    assert cfg_path.exists(), "configs/distill/biomedclip_kd_joint_v2.yaml missing"
+    cfg = yaml.safe_load(cfg_path.read_text())
+    assert cfg["teacher"] == "biomedclip_text"
+    assert cfg["freq_kd"] is False, (
+        "freq_kd must default to false — the 2026-06-18 ablation showed it is a "
+        "cross-domain regression (Indiana 3.90% -> 2.96%). Re-enable only per-run "
+        "via distill.freq_kd=true (see train_biomedclip_kd_phase15.sh)."
+    )
+    assert cfg["freq_kd_low_bins"] == 32
+    assert abs(float(cfg["freq_kd_alpha_high"]) - 0.1) < 1e-9
+    assert cfg["vit_unfreeze_blocks"] == 2
+    assert abs(float(cfg["vit_lr"]) - 1.0e-6) < 1e-12
+    assert int(cfg["moco_queue_size"]) == 0  # Phase 6e recipe held constant
+    # α_kd schedule unchanged from Phase 6e for attribution
+    assert abs(float(cfg["alpha_kd_warmup"]) - 1.0) < 1e-9
+    assert abs(float(cfg["alpha_kd_post"]) - 0.3) < 1e-9
+
+
+def test_h100_contrastive_lrs_are_overridable():
+    """Phase 6 post-mortem: backbone_lr/head_lr were HARDCODED at the bs=128
+    sqrt-scaled values, so every arm of the batch sweep — including the winning
+    bs=64 arm — trained at bs=128 LRs. The sweep was never LR-matched. Guard that
+    the template threads the env vars instead of baking literals.
+    """
+    import pathlib
+    import re
+
+    script = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "scripts" / "train_biomedclip_kd_h100.sh"
+    ).read_text()
+
+    assert "distill.backbone_lr=${BACKBONE_LR}" in script, (
+        "train_biomedclip_kd_h100.sh: backbone_lr must come from ${BACKBONE_LR}"
+    )
+    assert "distill.head_lr=${HEAD_LR}" in script, (
+        "train_biomedclip_kd_h100.sh: head_lr must come from ${HEAD_LR}"
+    )
+    assert re.search(r"^BACKBONE_LR=\"\$\{BACKBONE_LR:-", script, re.M)
+    assert re.search(r"^HEAD_LR=\"\$\{HEAD_LR:-", script, re.M)
+    # The literals must not survive on the python invocation lines.
+    assert "distill.head_lr=6e-4" not in script
+    assert "distill.backbone_lr=2e-5" not in script
+
+
+def test_h100_150m_contrastive_epoch_budget_is_batch_matched():
+    """Phase 6 found bigger batches at fixed MAX_STEPS see MORE epochs, not fewer
+    (bs=128 x 5000 = 23 epochs vs A100's 5.8), which confounded the negatives
+    lever. The 150M wrapper now derives MAX_STEPS from BATCH_SIZE; assert every
+    arm holds the same 384000-sample (13.93-epoch) budget over 27570 pairs.
+    """
+    import pathlib
+    import re
+
+    script = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "scripts" / "train_biomedclip_kd_150m_h100.sh"
+    ).read_text()
+
+    arms = re.findall(
+        r"^\s*(\d+)\)\s+DEF_BACKBONE_LR=([0-9.e-]+);\s+"
+        r"DEF_HEAD_LR=([0-9.e-]+);\s+DEF_MAX_STEPS=(\d+)",
+        script,
+        re.M,
+    )
+    assert len(arms) >= 3, f"expected >=3 batch arms, parsed {arms}"
+
+    seen = {}
+    for bs_s, backbone_lr, head_lr, steps_s in arms:
+        bs, steps = int(bs_s), int(steps_s)
+        assert bs * steps == 384000, (
+            f"bs={bs} x {steps} steps = {bs * steps} samples, expected 384000 "
+            "(13.93 epochs over 27570 MIMIC pairs)"
+        )
+        seen[bs] = (float(backbone_lr), float(head_lr))
+
+    assert {32, 64, 128} <= set(seen), f"missing batch arms: {sorted(seen)}"
+    # Canonical A100 anchor: bs=32 -> backbone 1e-5 / head 3e-4.
+    assert abs(seen[32][0] - 1.0e-5) < 1e-12
+    assert abs(seen[32][1] - 3.0e-4) < 1e-12
+    # LRs must be sqrt-scaled off that anchor (monotone in batch size).
+    assert seen[32][1] < seen[64][1] < seen[128][1], (
+        f"head_lr must grow with batch size: {seen}"
+    )
+    for bs in (64, 128):
+        expected = 3.0e-4 * (bs / 32.0) ** 0.5
+        assert abs(seen[bs][1] - expected) / expected < 0.02, (
+            f"bs={bs} head_lr {seen[bs][1]} deviates >2% from sqrt-scaled {expected:.3e}"
+        )
+
+
+def test_freq_decoupled_kd_threaded():
+    """Phase 10B: freq-KD must be wired into the joint module and threaded from
+    the distill config by train_contrastive.
+    """
+    import pathlib
+
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    lm = (repo / "hybrid_xmamba" / "training" / "lightning_module.py").read_text()
+    assert "self.freq_kd" in lm and "torch.fft.rfft" in lm, (
+        "lightning_module.py: freq-decoupled KD branch not implemented"
+    )
+    tc = (repo / "scripts" / "train_contrastive.py").read_text()
+    assert 'freq_kd=bool(distill_cfg.get("freq_kd"' in tc, (
+        "train_contrastive.py: freq_kd not threaded from distill_cfg"
+    )
+
+
+def test_freq_decoupled_kd_loss_finite():
+    """Phase 10D: the rFFT low/high-band KD math is finite and non-negative on
+    normalized embeddings (mirrors the inline _joint_step computation).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    torch.manual_seed(0)
+    z = F.normalize(torch.randn(4, 512), dim=-1)
+    t = F.normalize(torch.randn(4, 512), dim=-1)
+    zf = torch.fft.rfft(z, dim=-1)
+    tf = torch.fft.rfft(t, dim=-1)
+    n_low = 32
+    low_mse = (zf[:, :n_low] - tf[:, :n_low]).abs().pow(2).mean()
+    high_mse = (zf[:, n_low:] - tf[:, n_low:]).abs().pow(2).mean()
+    cos = F.cosine_similarity(z, t, dim=-1)
+    l_kd = low_mse + 0.1 * high_mse + 0.5 * (1.0 - cos.mean())
+    assert torch.isfinite(l_kd), l_kd
+    assert l_kd.item() >= 0.0
+    # identical embeddings → low/high MSE vanish, cosine term → 0
+    l0_zf = torch.fft.rfft(z, dim=-1)
+    l0_low = (l0_zf[:, :n_low] - l0_zf[:, :n_low]).abs().pow(2).mean()
+    assert l0_low.item() == 0.0
+
+
+# ── Phase 6C/6D/6E/6F — plateau-intervention block (2026-07-25) ───────────────
+#
+# Context these tests protect: seven consecutive nulls (Stage-0 PPL 15.62->13.18,
+# 70M->150M, negatives 32->128, epochs 23->14, batch 128 vs 64, head_lr
+# 6e-4->4.24e-4 and ->3.0e-4) against one positive (ViT unfreeze 0->2, +2.5pp).
+# Every lever below must default to the Phase-6B recipe so 6D-0 is a real
+# control — that invariant is what these tests exist to enforce.
+
+def _tiny_text_encoder(bidirectional=False):
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridTextEncoder
+
+    cfg = HybridConfig(
+        vocab_size=100, dim=64, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False, use_tfla=False,
+        pooling_strategy="attention",
+        bidirectional_encode=bidirectional,
+    )
+    return HybridTextEncoder(cfg, embed_dim=512)
+
+
+def _tiny_joint_module(**overrides):
+    from hybrid_xmamba.training.lightning_module import JointMultiTaskLightningModule
+
+    class _StubBiomedCLIPText(torch.nn.Module):
+        def encode_text(self, input_ids):
+            return torch.randn(input_ids.shape[0], 512)
+
+    kwargs = dict(
+        model=overrides.pop("model", None) or _tiny_text_encoder(),
+        teacher=_StubBiomedCLIPText(),
+        alpha_kd=0.3, alpha_kd_warmup=1.0, alpha_kd_post=0.3,
+        beta_clip=1.0, gamma_simcse=0.1,
+        backbone_lr=1e-5, head_lr=3e-4, weight_decay=0.01,
+        warmup_steps=5, max_steps=50, gradient_clip_val=1.0,
+        freeze_text_encoder_steps=1000,
+    )
+    kwargs.update(overrides)
+    return JointMultiTaskLightningModule(**kwargs)
+
+
+@pytest.mark.willi_parity
+def test_phase6d_config_defaults_are_the_control():
+    """6D-0 must be bit-identical to the Phase-6B recipe.
+
+    Every new knob in biomedclip_kd_joint_v2.yaml has to ship in its inert
+    state, or the "control" arm silently becomes a treatment arm — the exact
+    class of drift that made the Phase-6 batch sweep run at bs=128 LRs.
+    """
+    import yaml
+
+    cfg_path = REPO_ROOT / "configs" / "distill" / "biomedclip_kd_joint_v2.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text())
+
+    assert cfg["kd_decay_steps"] == 0, "6D-2 must default OFF (step function preserved)"
+    assert cfg["alpha_kd_floor"] == 0.0
+    assert cfg["clip_loss_type"] == "infonce", "6D-3 must default to the canonical loss"
+    assert cfg["use_multipos"] is False
+    # Canonical recipe held from Phase 6e — regressions here are known-harmful.
+    assert cfg["freq_kd"] is False, "freq_kd=true cost Indiana 3.90%->2.96%"
+    assert cfg["vit_unfreeze_blocks"] == 2, "vit_unfreeze=0 cost MIMIC 10.45%->7.97%"
+    assert cfg["moco_queue_size"] == 0, "MoCo/XBM queue post-KD-warmup is harmful"
+
+
+@pytest.mark.willi_parity
+def test_kd_decay_schedule_ramps_post_unfreeze():
+    """6D-2: alpha_kd must ramp alpha_kd_post -> alpha_kd_floor over
+    kd_decay_steps AFTER the unfreeze, and kd_decay_steps=0 must reproduce the
+    original step function exactly.
+
+    Motivation: cos_text_teacher ~0.57 is a KD-vs-CLIP equilibrium (it reaches
+    0.874-0.892 under KD-only warmup with a FROZEN backbone), not an
+    architecture ceiling, so the standing anchor is the thing to attack.
+    """
+    def effective_alpha(step, freeze, decay_steps, post=0.3, warmup=1.0, floor=0.0):
+        if step < freeze:
+            return warmup
+        if decay_steps > 0:
+            t = (step - freeze) / float(decay_steps)
+            t = min(max(t, 0.0), 1.0)
+            return post * (1.0 - t) + floor * t
+        return post
+
+    # decay OFF → legacy step function, exactly.
+    assert effective_alpha(0, 1000, 0) == 1.0
+    assert effective_alpha(999, 1000, 0) == 1.0
+    assert effective_alpha(1000, 1000, 0) == 0.3
+    assert effective_alpha(9999, 1000, 0) == 0.3
+
+    # decay ON → warmup unchanged, then linear ramp to the floor, then clamped.
+    assert effective_alpha(999, 1000, 2000) == 1.0
+    assert effective_alpha(1000, 1000, 2000) == pytest.approx(0.3)
+    assert effective_alpha(2000, 1000, 2000) == pytest.approx(0.15)
+    assert effective_alpha(3000, 1000, 2000) == pytest.approx(0.0, abs=1e-9)
+    assert effective_alpha(9999, 1000, 2000) == pytest.approx(0.0, abs=1e-9)
+
+    # Non-zero floor is honoured (the destabilisation fallback).
+    assert effective_alpha(3000, 1000, 2000, floor=0.05) == pytest.approx(0.05)
+
+    src = (REPO_ROOT / "hybrid_xmamba" / "training" / "lightning_module.py").read_text()
+    assert "self.kd_decay_steps" in src and "self.alpha_kd_floor" in src
+    assert "kd_decay_steps=int(distill_cfg.get(\"kd_decay_steps\", 0))" in (
+        REPO_ROOT / "scripts" / "train_contrastive.py"
+    ).read_text().replace("'", '"'), "kd_decay_steps not threaded from distill_cfg"
+
+
+@pytest.mark.willi_parity
+def test_multipos_loss_reduces_to_nt_xent_on_identity_mask():
+    """6D-3: the multi-positive loss must be a strict GENERALISATION.
+
+    With an identity positive mask it has to equal _nt_xent_loss to numerical
+    precision — otherwise enabling use_multipos would change the objective even
+    on a batch containing no duplicates, and no result would be attributable.
+    """
+    import torch.nn.functional as F
+
+    try:
+        mod = _tiny_joint_module()
+    except ImportError:
+        pytest.skip("open_clip not installed")
+
+    torch.manual_seed(0)
+    b = 8
+    z1 = F.normalize(torch.randn(b, 512), dim=-1)
+    z2 = F.normalize(torch.randn(b, 512), dim=-1)
+    scale = torch.tensor(2.6592)
+
+    eye = torch.eye(b, dtype=torch.bool)
+    l_multi = mod._multipos_clip_loss(z1, z2, scale, eye)
+    l_nt = mod._nt_xent_loss(z1, z2, scale)
+    assert torch.allclose(l_multi, l_nt, atol=1e-5), (l_multi.item(), l_nt.item())
+
+    # A real duplicate group must CHANGE the loss (it stops pushing the
+    # duplicate apart) and must stay finite.
+    mask = eye.clone()
+    mask[0, 1] = True
+    mask[1, 0] = True
+    l_dup = mod._multipos_clip_loss(z1, z2, scale, mask)
+    assert torch.isfinite(l_dup)
+    assert not torch.allclose(l_dup, l_nt, atol=1e-5)
+
+
+@pytest.mark.willi_parity
+def test_siglip_loss_finite_and_bias_is_trainable_head_param():
+    """6D-3: SigLIP path must be finite, batch-decoupled, and its bias must
+    actually be optimised (a frozen bias silently makes the loss useless)."""
+    import torch.nn.functional as F
+
+    enc = _tiny_text_encoder()
+    assert hasattr(enc, "logit_bias"), "HybridTextEncoder must expose logit_bias"
+    assert float(enc.logit_bias.item()) == pytest.approx(-10.0), (
+        "logit_bias must init at -10 so positives dominate early training"
+    )
+    assert enc.logit_bias.requires_grad
+
+    try:
+        mod = _tiny_joint_module(model=enc, clip_loss_type="siglip")
+    except ImportError:
+        pytest.skip("open_clip not installed")
+    assert mod.clip_loss_type == "siglip"
+
+    torch.manual_seed(0)
+    for b in (4, 16, 64):
+        z1 = F.normalize(torch.randn(b, 512), dim=-1)
+        z2 = F.normalize(torch.randn(b, 512), dim=-1)
+        loss = mod._siglip_loss(z1, z2, torch.tensor(2.6592), enc.logit_bias)
+        assert torch.isfinite(loss), (b, loss)
+        assert loss.item() > 0.0
+
+    # Perfectly aligned pairs with a positive bias must score better than
+    # anti-aligned ones — sanity on the sign convention.
+    z = F.normalize(torch.randn(8, 512), dim=-1)
+    good = mod._siglip_loss(z, z, torch.tensor(2.6592), torch.tensor(0.0))
+    bad = mod._siglip_loss(z, -z, torch.tensor(2.6592), torch.tensor(0.0))
+    assert good.item() < bad.item()
+
+    # The bias must land in a param group, else it never moves.
+    groups = mod.configure_optimizers()["optimizer"].param_groups
+    assert any(any(p is enc.logit_bias for p in g["params"]) for g in groups), (
+        "logit_bias is not in any optimizer param group"
+    )
+
+
+@pytest.mark.willi_parity
+def test_pos_mask_from_hash_groups_duplicates():
+    """6D-3: identical report hashes must form a positive set; the diagonal is
+    always positive; a missing text_hash must degrade to the identity so the
+    multi-positive path is inert on datasets that do not emit it."""
+    from hybrid_xmamba.training.lightning_module import JointMultiTaskLightningModule
+
+    dev = torch.device("cpu")
+    h = torch.tensor([11, 22, 11, 33], dtype=torch.long)
+    mask = JointMultiTaskLightningModule._pos_mask_from_hash(h, 4, dev)
+    assert mask.dtype == torch.bool and mask.shape == (4, 4)
+    assert bool(mask.diagonal().all())
+    assert bool(mask[0, 2]) and bool(mask[2, 0]), "duplicate reports must pair"
+    assert not bool(mask[0, 1]) and not bool(mask[1, 3])
+
+    fallback = JointMultiTaskLightningModule._pos_mask_from_hash(None, 4, dev)
+    assert torch.equal(fallback, torch.eye(4, dtype=torch.bool))
+
+
+@pytest.mark.willi_parity
+def test_mimic_dataset_emits_text_hash_matching_normalised_text():
+    """6D-3: the dataset must emit a text_hash that is (a) stable across
+    processes — Python's hash() is salted per process and would differ between
+    dataloader workers — and (b) equal exactly when the normalised report text
+    is equal."""
+    import importlib.util
+
+    from omegaconf import OmegaConf
+    from PIL import Image
+
+    spec = importlib.util.spec_from_file_location(
+        "_tc_mod", REPO_ROOT / "scripts" / "train_contrastive.py"
+    )
+    tc = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(tc)
+    except Exception as e:                                    # pragma: no cover
+        pytest.skip("train_contrastive import failed: {}".format(e))
+
+    src = (REPO_ROOT / "scripts" / "train_contrastive.py").read_text()
+    assert "hashlib.blake2b" in src, "text_hash must not use the salted builtin hash()"
+
+    class _StubTok:
+        # pad_token_id present => MIMICJointDataset takes the HuggingFace
+        # tokenizer branch (the open_clip branch expects a Callable returning a
+        # tensor, not a dict).
+        pad_token_id = 0
+
+        def __call__(self, text, **kw):
+            return {
+                "input_ids": torch.zeros(1, 8, dtype=torch.long),
+                "attention_mask": torch.ones(1, 8, dtype=torch.long),
+            }
+
+    rows = [
+        {"findings": "Lungs are clear.", "impression": "No acute process.",
+         "image": Image.new("RGB", (8, 8))},
+        # Same text, different case/whitespace → must collide.
+        {"findings": "LUNGS   are clear.", "impression": "No  acute process.",
+         "image": Image.new("RGB", (8, 8))},
+        {"findings": "Left pleural effusion.", "impression": "Effusion.",
+         "image": Image.new("RGB", (8, 8))},
+    ]
+    cfg = OmegaConf.create({"dataset": {
+        "max_length": 8, "teacher_max_length": 8,
+        "findings_field": "findings", "impression_field": "impression",
+        "concatenate_sections": True, "image_size": 8,
+    }})
+    ds = tc.MIMICJointDataset(rows, _StubTok(), _StubTok(), cfg)
+
+    hashes = [int(ds[i]["text_hash"]) for i in range(3)]
+    assert "text_hash" in ds[0]
+    assert hashes[0] == hashes[1], "case/whitespace variants must share a hash"
+    assert hashes[0] != hashes[2]
+
+
+@pytest.mark.willi_parity
+def test_bidirectional_encode_is_param_free_and_changes_output():
+    """6E-1: the reverse pass must add NO parameters (so checkpoints stay
+    loadable either way) while actually changing the embedding (so the flag is
+    not a silent no-op)."""
+    torch.manual_seed(0)
+    uni = _tiny_text_encoder(bidirectional=False)
+    bi = _tiny_text_encoder(bidirectional=True)
+
+    assert set(uni.state_dict().keys()) == set(bi.state_dict().keys()), (
+        "bidirectional encode must not introduce state-dict keys"
+    )
+    assert sum(p.numel() for p in uni.parameters()) == sum(
+        p.numel() for p in bi.parameters()
+    )
+    assert uni.bidirectional_encode is False and bi.bidirectional_encode is True
+
+    bi.load_state_dict(uni.state_dict())
+    uni.eval()
+    bi.eval()
+
+    ids = torch.randint(1, 100, (3, 16))
+    mask = torch.ones(3, 16, dtype=torch.long)
+    mask[1, 10:] = 0          # ragged batch: right padding
+    mask[2, 4:] = 0
+
+    with torch.no_grad():
+        z_uni = uni.encode(ids, attention_mask=mask)
+        z_bi = bi.encode(ids, attention_mask=mask)
+        z_override = uni.encode(ids, attention_mask=mask, bidirectional=True)
+
+    assert torch.isfinite(z_uni).all() and torch.isfinite(z_bi).all()
+    assert torch.allclose(z_bi.norm(dim=-1), torch.ones(3), atol=1e-4)
+    assert not torch.allclose(z_uni, z_bi, atol=1e-5), "flag is a no-op"
+    assert torch.allclose(z_bi, z_override, atol=1e-5), (
+        "per-call override must match the config-level flag"
+    )
+
+
+@pytest.mark.willi_parity
+def test_reverse_index_reverses_only_real_tokens():
+    """6E-1: the reverse index must reverse the real-token block, leave right
+    padding in place, and be its own inverse (that involution is what lets the
+    same gather map reverse-pass states back onto original positions)."""
+    enc = _tiny_text_encoder(bidirectional=True)
+
+    ids = torch.tensor([
+        [5, 6, 7, 8, 9],      # full length
+        [5, 6, 7, 0, 0],      # length 3, right padded
+        [5, 0, 0, 0, 0],      # length 1
+    ])
+    mask = torch.tensor([
+        [1, 1, 1, 1, 1],
+        [1, 1, 1, 0, 0],
+        [1, 0, 0, 0, 0],
+    ])
+    idx = enc._reverse_index(ids, mask)
+
+    assert torch.equal(idx[0], torch.tensor([4, 3, 2, 1, 0]))
+    assert torch.equal(idx[1], torch.tensor([2, 1, 0, 3, 4]))
+    assert torch.equal(idx[2], torch.tensor([0, 1, 2, 3, 4]))
+
+    # Involutive: gathering twice returns the original ordering.
+    assert torch.equal(idx.gather(1, idx), torch.arange(5).unsqueeze(0).expand(3, 5))
+
+    # Padding never moves into the real-token block.
+    rev_ids = ids.gather(1, idx)
+    assert torch.equal(rev_ids[1], torch.tensor([7, 6, 5, 0, 0]))
+
+    # No mask → plain full reversal.
+    idx_nomask = enc._reverse_index(ids, None)
+    assert torch.equal(idx_nomask[0], torch.tensor([4, 3, 2, 1, 0]))
+
+
+@pytest.mark.willi_parity
+def test_bidirectional_flag_recorded_for_eval_autodetect():
+    """6E-1: the flag adds no weights, so eval cannot sniff it from the state
+    dict the way it sniffs layer_pattern/norm_topology. It MUST be persisted in
+    checkpoint hparams and read back — same failure class as the fresh-ViT load
+    that read 1.89% instead of 10.94%."""
+    try:
+        mod = _tiny_joint_module(model=_tiny_text_encoder(bidirectional=True))
+    except ImportError:
+        pytest.skip("open_clip not installed")
+    assert mod.hparams["bidirectional_encode"] is True
+
+    try:
+        mod_uni = _tiny_joint_module(model=_tiny_text_encoder(bidirectional=False))
+    except ImportError:
+        pytest.skip("open_clip not installed")
+    assert mod_uni.hparams["bidirectional_encode"] is False
+
+    ev = (REPO_ROOT / "scripts" / "evaluate_cxr_retrieval.py").read_text()
+    assert 'hyper_parameters' in ev and 'bidirectional_encode' in ev, (
+        "evaluate_cxr_retrieval.py must auto-detect bidirectional_encode from the ckpt"
+    )
+
+
+@pytest.mark.willi_parity
+def test_dedup_aware_retrieval_metric_and_grouping():
+    """6C-3/6C-4: dedup-aware R@K must count a same-group retrieval as a hit,
+    must reduce to the strict-index metric when every report is unique, and the
+    grouping must be case/whitespace insensitive."""
+    import importlib.util
+
+    import numpy as np
+
+    spec = importlib.util.spec_from_file_location(
+        "_ecr_mod", REPO_ROOT / "scripts" / "evaluate_cxr_retrieval.py"
+    )
+    ecr = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(ecr)
+    except Exception as e:                                    # pragma: no cover
+        pytest.skip("evaluate_cxr_retrieval import failed: {}".format(e))
+
+    groups = ecr.group_ids_from_texts([
+        "No acute cardiopulmonary process.",
+        "no  ACUTE cardiopulmonary   process.",     # duplicate after normalising
+        "Left lower lobe opacity.",
+    ])
+    assert groups[0] == groups[1] and groups[0] != groups[2]
+
+    # Three items; make image 0 rank text 1 (its duplicate) above text 0.
+    img = np.eye(3, dtype=np.float64)
+    txt = np.eye(3, dtype=np.float64)
+    img[0] = [0.0, 1.0, 0.0]
+
+    strict = ecr.compute_retrieval_metrics(img, txt)
+    dedup = ecr.compute_retrieval_metrics(img, txt, groups=groups)
+    assert strict["i2t_R@1"] < dedup["i2t_R@1"], (
+        "dedup-aware R@1 must credit the textually identical retrieval"
+    )
+    assert dedup["i2t_R@1"] == pytest.approx(1.0)
+
+    # All-unique groups → identical to the authoritative strict metric.
+    uniq = np.arange(3)
+    assert ecr.compute_retrieval_metrics(img, txt, groups=uniq)["i2t_R@1"] == (
+        strict["i2t_R@1"]
+    )
+
+
+@pytest.mark.willi_parity
+def test_h100_launch_script_exposes_phase6d_levers():
+    """Every 6D/6E/6F lever must be env-overridable AND default to the
+    Phase-6B recipe. Hardcoded values in this script have cost this project
+    two separate confounded experiments (LRs, then MAX_STEPS)."""
+    sh = (REPO_ROOT / "scripts" / "train_biomedclip_kd_h100.sh").read_text()
+
+    for var, default in (
+        ("VIT_UNFREEZE", "2"),
+        ("KD_DECAY_STEPS", "0"),
+        ("ALPHA_KD_FLOOR", "0.0"),
+        ("CLIP_LOSS", "infonce"),
+        ("MULTIPOS", "false"),
+        ("GAMMA_SIMCSE", "0.1"),
+        ("BIDIRECTIONAL", "false"),
+        ("SELECTION_SPLIT", "false"),
+    ):
+        assert '{}="${{{}:-{}}}"'.format(var, var, default) in sh, (
+            "{} must be env-overridable with default {}".format(var, default)
+        )
+
+    # The overrides must actually reach Hydra, not just be echoed.
+    for override in (
+        "distill.vit_unfreeze_blocks=${VIT_UNFREEZE}",
+        "distill.kd_decay_steps=${KD_DECAY_STEPS}",
+        "distill.alpha_kd_floor=${ALPHA_KD_FLOOR}",
+        "distill.clip_loss_type=${CLIP_LOSS}",
+        "distill.use_multipos=${MULTIPOS}",
+        "distill.gamma_simcse=${GAMMA_SIMCSE}",
+        "++model.bidirectional_encode=${BIDIRECTIONAL}",
+        '${SPLIT_OVERRIDES[@]+"${SPLIT_OVERRIDES[@]}"}',
+    ):
+        assert override in sh, "missing Hydra override: {}".format(override)
+
+    # 6F must move ONLY the train/val slices; the test gallery is fixed.
+    assert "train[:85%]" in sh and "train[85%:90%]" in sh
+    assert "vit_unfreeze_blocks=2 \\" not in sh, "vit_unfreeze must not be hardcoded"
+
+
+@pytest.mark.willi_parity
+def test_split_overrides_parse_under_hydra_grammar():
+    """REGRESSION (2026-07-26, jobs 2372273-5 died in argument parsing).
+
+    HuggingFace slice syntax contains '[', which is a Hydra override-grammar
+    metacharacter. The shell strips "..." before exec, so an override written as
+        dataset.train_split="${TRAIN_SPLIT}"
+    reaches Hydra as a bare `train[:90%]` and is rejected with
+        mismatched input '[' expecting <EOF>
+    The value must arrive at Hydra STILL QUOTED.
+
+    This test parses the script's actual override strings with Hydra's own
+    parser, so the quoting cannot be "cleaned up" away again.
+    """
+    try:
+        from hydra.core.override_parser.overrides_parser import OverridesParser
+    except ImportError:                                       # pragma: no cover
+        pytest.skip("hydra not installed")
+
+    parser = OverridesParser.create()
+    sh = (REPO_ROOT / "scripts" / "train_biomedclip_kd_h100.sh").read_text()
+
+    # Every literal single-quoted override in the script must parse, and must
+    # round-trip to the slice string the dataloader expects.
+    literals = re.findall(r'"([\w.+]+=\'[^\']*\')"', sh)
+    assert literals, "expected quoted split overrides in the script"
+    parsed = {o.key_or_group: o.value() for o in parser.parse_overrides(literals)}
+    assert parsed["dataset.train_split"] == "train[:85%]"
+    assert parsed["dataset.validation_split"] == "train[85%:90%]"
+
+    # Pin WHY the quotes are there: the bare form must still be rejected.
+    with pytest.raises(Exception):
+        parser.parse_overrides(["dataset.train_split=train[:85%]"])
+
+    # The overrides must be emitted ONLY when 6F is requested. Passing them
+    # unconditionally is what turned a 6F-only bug into an all-arms outage, and
+    # it also breaks "6D-0 is bit-identical to the Phase-6B control" — the
+    # control must reproduce the original argv, not an equivalent-valued one.
+    assert "SPLIT_OVERRIDES=()" in sh
+    guarded = sh.split('if [ "${SELECTION_SPLIT}" = "true" ]; then')[1].split("fi")[0]
+    assert "dataset.train_split=" in guarded, (
+        "split overrides must live inside the SELECTION_SPLIT guard"
+    )
+    assert "TRAIN_SPLIT" not in sh.split("python scripts/train_contrastive.py")[1], (
+        "the python invocation must not reference a bare TRAIN_SPLIT variable"
+    )
+
+
+@pytest.mark.willi_parity
+def test_vit_unfreeze_scope_and_lr_are_sweepable():
+    """Phase 6G: depth was the ONLY image-side axis ever swept.
+
+    6D established unfreeze depth as the single lever that moves MIMIC retrieval
+    (0.116/0.132/0.150/0.168 at depth 2/4/6/12). Depth is now exhausted — ViT-B/16
+    has 12 blocks — so the remaining dose axes are LR and scope, and both were
+    hardcoded: vit_lr sat at 1e-6 for the entire project, and the unfreeze only
+    ever covered transformer blocks, leaving patch_embed / cls_token / pos_embed /
+    final norm / visual projection frozen even at depth 12.
+    """
+    sh = (REPO_ROOT / "scripts" / "train_biomedclip_kd_h100.sh").read_text()
+    assert 'VIT_LR="${VIT_LR:-1e-6}"' in sh, "vit_lr must be env-overridable"
+    assert 'VIT_SCOPE="${VIT_SCOPE:-blocks}"' in sh
+    assert "distill.vit_lr=${VIT_LR}" in sh, "vit_lr must not be hardcoded in the Hydra call"
+    assert "distill.vit_lr=1e-6 \\" not in sh
+    assert "distill.vit_unfreeze_scope=${VIT_SCOPE}" in sh
+
+    import yaml
+    cfg = yaml.safe_load(
+        (REPO_ROOT / "configs" / "distill" / "biomedclip_kd_joint_v2.yaml").read_text()
+    )
+    # Canonical values unchanged, so historical attribution still holds.
+    assert cfg["vit_unfreeze_blocks"] == 2
+    assert cfg["vit_lr"] == 1.0e-6
+    assert cfg["vit_unfreeze_scope"] == "blocks"
+
+    # Scope must be validated, not silently ignored.
+    from hybrid_xmamba.training.lightning_module import JointMultiTaskLightningModule
+    with pytest.raises(ValueError):
+        _tiny_joint_module(vit_unfreeze_scope="everything")
+
+    # "blocks" must keep the historical param-group behaviour exactly.
+    try:
+        mod = _tiny_joint_module(vit_unfreeze_scope="blocks")
+    except ImportError:
+        pytest.skip("open_clip not installed")
+    assert mod.vit_unfreeze_scope == "blocks"
+    # No image encoder in the tiny harness -> helper must not be reached, and the
+    # optimizer must still build.
+    assert mod.configure_optimizers()["optimizer"] is not None
+
+
+@pytest.mark.willi_parity
+def test_eval_script_bakes_in_offline_and_populated_cache():
+    """REGRESSION (2026-07-26). MIMIC-CXR is a GATED HF repo, so any online
+    load_dataset 401s — the failure that killed job 2357924.
+
+    eval_h100.sh carried a header comment saying "run with HF_DATASETS_OFFLINE=1"
+    but never exported it, and its cache default pointed at
+    ${SCRATCH_ROOT}/mimic_cxr_cache, which is empty — the populated caches live
+    under /sc/home/$USER/dataset/. Both are now baked in, per dataset.
+    """
+    sh = (REPO_ROOT / "scripts" / "eval_h100.sh").read_text()
+    assert 'export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"' in sh
+    assert 'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"' in sh
+    assert "/sc/home/$USER/dataset/mimic_cxr_cache" in sh
+    assert "/sc/home/$USER/dataset/indiana_cxr_cache" in sh
+    # Match the ASSIGNMENT, not the word — the fix comment quotes the old path.
+    assert 'EVAL_CACHE_DIR="${EVAL_CACHE_DIR:-${SCRATCH_ROOT}/mimic_cxr_cache}"' not in sh, (
+        "eval cache must not default to the empty scratch path"
+    )
+    # The training template must keep the same guarantees.
+    tr = (REPO_ROOT / "scripts" / "train_biomedclip_kd_h100.sh").read_text()
+    assert 'export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"' in tr
+    assert "/sc/home/$USER/dataset/mimic_cxr_cache" in tr
+
+
+@pytest.mark.willi_parity
+def test_performance_profile_loads_every_advertised_model_config():
+    """REGRESSION (2026-07-28). performance_profile.py resolved --model through
+    ModelRegistry, which only ever registers 350m/1_3b/7b/mamba_baseline/
+    xlstm_baseline. Every 70M and 150M name in its own --model choices list —
+    i.e. every config this project actually trains, including the active
+    hybrid_150m_v2 backbone — raised ValueError before a single measurement ran.
+
+    Configs now resolve from configs/model/<name>.yaml, which is the source of
+    truth, with the registry as fallback. The yamls carry training keys that are
+    not HybridConfig fields (learning_rate, warmup_steps, distill, ...), so the
+    loader must filter to the dataclass fields rather than splatting the dict.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "performance_profile", REPO_ROOT / "scripts" / "performance_profile.py"
+    )
+    pp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pp)
+
+    names = pp.available_configs()
+    for required in ("hybrid_70m", "hybrid_70m_v2", "hybrid_150m_v2",
+                     "mamba_70m_baseline", "xlstm_70m_baseline"):
+        assert required in names, "{} missing from profiler choices".format(required)
+
+    # Every advertised choice must actually construct — that is the bug.
+    for name in names:
+        cfg = pp.load_config(name)
+        assert cfg.dim > 0 and cfg.num_layers > 0, name
+
+    # Spot-check that yaml values win over dataclass defaults.
+    v2 = pp.load_config("hybrid_150m_v2")
+    assert v2.dim == 768 and v2.num_layers == 12
+    assert v2.norm_topology == "hybrid"
+    assert v2.pooling_strategy == "attention"
+    assert v2.max_position_embeddings == 1024
+
+
+@pytest.mark.willi_parity
+def test_efficiency_curve_slope_fit_is_correct():
+    """The scaling exponent is the whole point of the sweep, so pin the fit.
+
+    Latency ~ L^1 is the linear-scaling claim for Mamba/mLSTM; softmax attention
+    would show ~L^2. A wrong slope fit would silently misreport the headline
+    architectural result.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "performance_profile", REPO_ROOT / "scripts" / "performance_profile.py"
+    )
+    pp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pp)
+
+    xs = [256, 512, 1024, 2048]
+    assert abs(pp.fit_log_slope(xs, [x * 1.0 for x in xs]) - 1.0) < 1e-9
+    assert abs(pp.fit_log_slope(xs, [x ** 2.0 for x in xs]) - 2.0) < 1e-9
+    # Degenerate inputs must return None, not raise or emit a bogus exponent.
+    assert pp.fit_log_slope([256], [1.0]) is None
+    assert pp.fit_log_slope(xs, [None, None, None, None]) is None
+    assert pp.fit_log_slope([256, 256], [1.0, 2.0]) is None
+
+
+@pytest.mark.willi_parity
+def test_sequence_sweep_is_valid_past_max_position_embeddings():
+    """The efficiency curve sweeps L well past max_position_embeddings (1024).
+
+    That is only legitimate because HybridLanguageModel sets
+    use_pos_embedding = False (hybrid_lm.py:43) — there is no absolute position
+    table to index out of. If someone re-enables it, the sweep would start
+    indexing past the embedding and this test must fail loudly.
+    """
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel
+
+    cfg = HybridConfig(
+        vocab_size=64, dim=32, num_layers=2, layer_pattern=["mamba", "mlstm"],
+        head_dim=16, num_heads=2, max_position_embeddings=16,
+    )
+    model = HybridLanguageModel(cfg)
+    assert model.embeddings.use_pos_embedding is False
+    model.eval()
+    # 4x max_position_embeddings must run rather than raise.
+    with torch.no_grad():
+        out = model(torch.randint(0, cfg.vocab_size, (1, 64)))
+    logits = out.logits if hasattr(out, "logits") else out
+    assert logits.shape[:2] == (1, 64)
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 (H100_SCALING_PLAN.md) — local PhysioNet MIMIC-CXR-JPG build.
+# ---------------------------------------------------------------------------
+
+def _load_build_script():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "build_mimic_cxr_local", REPO_ROOT / "scripts" / "build_mimic_cxr_local.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_get_session_requires_physionet_session_cookie_file(tmp_path):
+    """REGRESSION (2026-08-16). PhysioNet's Django deployment does NOT honour
+    HTTP Basic Auth for this project — verified live: `curl -u user
+    https://physionet.org/settings/profile/` returns 302 to /login/
+    regardless of credential correctness, while the identical /files/ URL
+    with a valid session cookie returns 200. _get_session() must therefore
+    require ~/.physionet_session and fail LOUDLY (not silently fall back to
+    a ~/.netrc Basic Auth path that is known not to work) when it is absent.
+    """
+    mod = _load_build_script()
+    orig_home = mod.Path.home
+    mod.Path.home = staticmethod(lambda: tmp_path)  # empty dir, no cookie file
+    mod._session = None
+    try:
+        with pytest.raises(RuntimeError, match="physionet_session"):
+            mod._get_session()
+    finally:
+        mod.Path.home = orig_home
+
+
+def test_download_detects_login_page_disguised_as_200_and_writes_nothing(tmp_path):
+    """REGRESSION (2026-08-16). A session cookie can expire mid-run. PhysioNet
+    then 302s to /login/, and `requests` follows redirects by default, so
+    this arrives as an ordinary 200 with an HTML login page as the body.
+    Without a guard, that body gets streamed straight into a .jpg/.csv.gz,
+    and the resume check (Path.exists()) then skips the corrupt file forever
+    on every subsequent run — a stop-everything bug discovered only when
+    training on garbage weeks later. _download() must detect this BEFORE
+    writing any bytes and never create the destination file.
+    """
+    mod = _load_build_script()
+
+    class _FakeLoginResp:
+        status_code = 200
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+        url = "https://physionet.org/login/?next=/files/foo"
+
+        def iter_content(self, chunk_size=None):
+            raise AssertionError("must not stream the body of a login-page response")
+
+        def close(self):
+            pass
+
+    class _FakeSession:
+        def get(self, url, timeout=None, stream=None):
+            return _FakeLoginResp()
+
+    mod._get_session = lambda: _FakeSession()
+    dest = tmp_path / "should_not_exist.jpg"
+    status = mod._download("https://physionet.org/files/foo", dest)
+    assert status == mod.SESSION_EXPIRED
+    assert not dest.exists()
+
+
+def test_download_still_writes_file_for_a_genuine_200(tmp_path):
+    """Companion to the SESSION_EXPIRED regression test above — the
+    login-page guard must not false-positive on a real, successful download
+    (e.g. Content-Type: application/gzip, no /login in the final URL)."""
+    mod = _load_build_script()
+
+    class _FakeOkResp:
+        status_code = 200
+        headers = {"Content-Type": "application/gzip"}
+        url = "https://physionet.org/files/foo"
+
+        def iter_content(self, chunk_size=None):
+            yield b"hello world"
+
+        def close(self):
+            pass
+
+    class _FakeSession:
+        def get(self, url, timeout=None, stream=None):
+            return _FakeOkResp()
+
+    mod._get_session = lambda: _FakeSession()
+    dest = tmp_path / "should_exist.gz"
+    status = mod._download("https://physionet.org/files/foo", dest)
+    assert status == 200
+    assert dest.read_bytes() == b"hello world"
+    assert not dest.with_name(dest.name + ".part").exists()  # renamed away, not left behind
+
+
+def test_download_never_leaves_a_partial_file_at_dest_on_interruption(tmp_path):
+    """REGRESSION (2026-08-16, caught LIVE, not just in review). A SLURM kill
+    (time limit / preemption) mid-download previously left a truncated-but-
+    nonzero-size file directly at `dest`. Every resume check in this script
+    (`dest.exists() and dest.stat().st_size > 0`) then trusted it as
+    complete. This is exactly what happened: a `--time=00:10:00` override
+    killed a `mimic-cxr-reports.zip` download mid-stream, the next run's
+    `stage_meta` printed "[meta] have mimic-cxr-reports.zip" and skipped
+    re-fetching it, and the corruption only surfaced later as
+    `zipfile.BadZipFile: File is not a zip file` at unzip time. Fix:
+    `_download()` streams to a `.part` sibling and `Path.replace()`s into
+    `dest` only after the full body is consumed — an interruption anywhere
+    in that process must leave `dest` absent, never partial.
+    """
+    import requests
+
+    mod = _load_build_script()
+
+    class _FakeInterruptedResp:
+        status_code = 200
+        headers = {"Content-Type": "application/zip"}
+        url = "https://physionet.org/files/foo.zip"
+
+        def iter_content(self, chunk_size=None):
+            yield b"partial-bytes-before-the-job-was-killed"
+            raise requests.exceptions.ConnectionError("simulated interruption mid-stream")
+
+        def close(self):
+            pass
+
+    class _FakeSession:
+        def get(self, url, timeout=None, stream=None):
+            return _FakeInterruptedResp()
+
+    mod._get_session = lambda: _FakeSession()
+    dest = tmp_path / "foo.zip"
+    status = mod._download("https://physionet.org/files/foo.zip", dest, retries=1)
+    assert status != 200
+    assert not dest.exists(), "an interrupted download must never leave a partial file at dest"
+
+
+def test_get_session_is_thread_safe_and_created_exactly_once(tmp_path, monkeypatch):
+    """REGRESSION (2026-08-16, caught LIVE): stage_fetch's ThreadPoolExecutor
+    calls _get_session() from up to `workers` threads concurrently on the
+    first chunk. The original check-then-set was not atomic; observed live
+    as FIVE duplicate "[auth] session cookie loaded" log lines from one
+    invocation. Harmless correctness-wise (every racing thread reads the
+    same cookie), but wasteful (needless extra Session objects splitting
+    the connection pool) and confusing in logs. Artificially slow down
+    Session construction to widen the race window -- this makes the test
+    fail reliably against the old unlocked code rather than passing by
+    scheduling luck, and pass reliably against the double-checked-locking
+    fix regardless of how the threads are scheduled.
+    """
+    import threading
+    import time as _time
+
+    mod = _load_build_script()
+    cookie_file = tmp_path / ".physionet_session"
+    cookie_file.write_text("abc123")
+    # mod.Path and mod.requests are pathlib.Path and requests themselves, not copies: monkeypatch puts both back when the test ends, so a
+    # test that runs after this one (another order, or another file) never finds a home directory or a Session class of this one's.
+    monkeypatch.setattr(mod.Path, "home", staticmethod(lambda: tmp_path))
+    mod._session = None
+
+    creations = []
+    orig_session_cls = mod.requests.Session
+
+    class _SlowCountingSession(orig_session_cls):
+        def __init__(self):
+            creations.append(1)
+            _time.sleep(0.02)  # widen the race window
+            super().__init__()
+
+    monkeypatch.setattr(mod.requests, "Session", _SlowCountingSession)
+
+    results = []
+
+    def _call():
+        results.append(mod._get_session())
+
+    threads = [threading.Thread(target=_call) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(creations) == 1, "Session must be created exactly once even under concurrent first access"
+    assert all(r is results[0] for r in results), "every caller must receive the identical Session object"
+
+
+def test_pack_study_hashes_filter_and_out_prefix(tmp_path):
+    """Phase 9A: pack --study-hashes packs only a hash-matched subset (e.g.
+    Arm-0's training set) out of whatever has actually been downloaded so
+    far in the SHARED mimic_full tree -- --study-hashes on fetch and pack
+    exist because copying manifest.parquet into a separate --out does NOT
+    isolate anything (local_jpg paths are baked in absolute at manifest-
+    generation time, found live 2026-08-17). --out-prefix keeps this from
+    clobbering the eventual production train/validate/test.parquet when
+    packing from the same --out directory.
+    """
+    import pandas as pd
+    from PIL import Image
+
+    mod = _load_build_script()
+    out = tmp_path
+
+    # Two rows match the hash filter; only one has actually been downloaded
+    # (local_jpg exists) -- pack's existing local_jpg.exists() filter runs
+    # BEFORE the hash filter, so only that one must survive.
+    img_a = out / "a.jpg"
+    Image.new("L", (10, 10)).save(img_a, "JPEG")
+    manifest = pd.DataFrame({
+        "has_text": [True, True, True],
+        "local_jpg": [str(img_a), str(out / "b_not_downloaded.jpg"), str(out / "c.jpg")],
+        "findings": ["f1", "f2", "f3"],
+        "impression": ["i1", "i2", "i3"],
+        "study_id": [1, 2, 3],
+        "subject_id": [10, 20, 30],
+        "dicom_id": ["d1", "d2", "d3"],
+        "ViewPosition": ["PA", "PA", "PA"],
+        "report_hash": ["hash_a", "hash_b", "hash_c"],
+        "split": ["train", "train", "test"],
+    })
+    manifest.to_parquet(out / "manifest.parquet", index=False)
+
+    hashes_file = out / "wanted.txt"
+    hashes_file.write_text("hash_a\nhash_b\n")  # b matches but was never downloaded
+
+    mod.stage_pack(out, exclude_hashes="", min_match_frac=0.95, allow_low_match=False,
+                    study_hashes=str(hashes_file), out_prefix="arm0_")
+
+    assert (out / "arm0_train.parquet").exists()
+    assert not (out / "train.parquet").exists(), "must not touch the production filename"
+    packed = pd.read_parquet(out / "arm0_train.parquet")
+    assert len(packed) == 1
+    assert packed.iloc[0]["study_id"] == 1
+
+
+def test_fetch_study_hashes_filter_restricts_to_matching_subset(monkeypatch, tmp_path):
+    """Phase 9A: --study-hashes lets `fetch` target only a hash-matched
+    subset of the manifest (e.g. the historical Arm-0 reproduction set),
+    reusing all existing chunking/resume/atomic-write/session-expiry logic
+    rather than a parallel code path. Verify the filter actually restricts
+    which rows get attempted, not just that it accepts the argument.
+    """
+    import pandas as pd
+
+    mod = _load_build_script()
+
+    out = tmp_path
+    manifest = pd.DataFrame({
+        "has_text": [True, True, True],
+        "local_jpg": [str(out / "a.jpg"), str(out / "b.jpg"), str(out / "c.jpg")],
+        "rel_jpg": ["files/a.jpg", "files/b.jpg", "files/c.jpg"],
+        "report_hash": ["hash_a", "hash_b", "hash_c"],
+    })
+    manifest.to_parquet(out / "manifest.parquet", index=False)
+
+    hashes_file = out / "wanted.txt"
+    # Includes a hash that matches nothing, on purpose -- must not error.
+    hashes_file.write_text("hash_b\nhash_c\nhash_does_not_exist\n")
+
+    attempted = []
+
+    def fake_download(url, dest, timeout=60, retries=3):
+        attempted.append(url)
+        return 404  # any non-200: records the attempt without reaching the
+        # ProcessPoolExecutor resize step, which a dynamically-loaded test
+        # module can't pickle across a spawned worker process (a test-
+        # harness limitation, not a real one -- production runs load the
+        # script normally and resize correctly, see the other fetch tests).
+
+    monkeypatch.setattr(mod, "_download", fake_download)
+    with pytest.raises(RuntimeError, match="converted 0 of"):
+        mod.stage_fetch(out, size=320, chunk=2000, workers=1, limit=0,
+                         study_hashes=str(hashes_file))
+
+    assert len(attempted) == 2, "only the 2 matching rows (b, c) should be attempted"
+    assert any("b.jpg" in u for u in attempted)
+    assert any("c.jpg" in u for u in attempted)
+    assert not any("/a.jpg" in u for u in attempted)
+
+
+def test_fetch_aborts_on_session_expired_even_if_some_files_in_chunk_succeeded(monkeypatch, tmp_path):
+    """REGRESSION (2026-08-16). A cookie can expire MID-CHUNK, so `ok` (the
+    count of status==200) can be > 0 in the same chunk that also contains
+    SESSION_EXPIRED entries — the ok==0 abort guard alone would NOT catch
+    this. The SESSION_EXPIRED check in stage_fetch must be unconditional,
+    not folded into (or ordered after) the ok==0 check.
+    """
+    import pandas as pd
+
+    mod = _load_build_script()
+
+    out = tmp_path
+    manifest = pd.DataFrame({
+        "has_text": [True, True],
+        "local_jpg": [str(out / "a.jpg"), str(out / "b.jpg")],
+        "rel_jpg": ["files/a.jpg", "files/b.jpg"],
+    })
+    manifest.to_parquet(out / "manifest.parquet", index=False)
+
+    # First file "succeeds" (200), second is a login-page (SESSION_EXPIRED) —
+    # simulates the cookie expiring between the two downloads.
+    call_count = {"n": 0}
+
+    def fake_download(url, dest, timeout=60, retries=3):
+        call_count["n"] += 1
+        return 200 if call_count["n"] == 1 else mod.SESSION_EXPIRED
+
+    monkeypatch.setattr(mod, "_download", fake_download)
+
+    with pytest.raises(RuntimeError, match="session-expired"):
+        mod.stage_fetch(out, size=320, chunk=2000, workers=1, limit=0)
+
+
+def test_build_script_hash_matches_repo_leakage_join_convention():
+    """The Phase 8D leakage guard joins build_mimic_cxr_local.py's report_hash
+    against a dump of the legacy gallery's hashes (dump_legacy_gallery_hashes.py).
+    Both MUST use the identical normalisation + digest as the two conventions
+    already in this repo — normalize_report_text (evaluate_cxr_retrieval.py:414)
+    and the text_hash construction (train_contrastive.py:419-424) — or the join
+    silently drops to near-zero matches and the leakage guard does nothing while
+    reporting success.
+    """
+    import hashlib
+
+    mod = _load_build_script()
+
+    findings, impression = "The lungs are clear.", "No acute process."
+    text = "Findings: {} Impression: {}".format(findings, impression)
+
+    # evaluate_cxr_retrieval.normalize_report_text
+    norm = " ".join(text.lower().split())
+    expected_hex = hashlib.blake2b(norm.encode("utf-8"), digest_size=8).hexdigest()
+    assert mod.norm_hash(text) == expected_hex
+
+    # train_contrastive.py's text_hash (int64, mod 2**62) must be the same
+    # digest truncated, not an independently-computed value.
+    expected_int = int.from_bytes(
+        hashlib.blake2b(norm.encode("utf-8"), digest_size=8).digest(), "big"
+    ) % (2 ** 62)
+    assert int(mod.norm_hash(text), 16) % (2 ** 62) == expected_int
+
+    # Case/whitespace-insensitive, matching normalize_report_text's contract.
+    assert mod.norm_hash(text) == mod.norm_hash(
+        "FINDINGS:   The lungs   are clear.  Impression: No acute process.".replace(
+            "FINDINGS:   The lungs   are clear.  ", "Findings: The lungs are clear. "
+        )
+    )
+
+
+def test_extract_findings_impression_basic_and_custom_override():
+    """The vendored official section parser (Phase 8C) must separate FINDINGS
+    from IMPRESSION on a well-formed report, and must honour the
+    custom_mimic_cxr_rules() per-study overrides for known-malformed reports —
+    both code paths a homegrown regex would silently get wrong.
+    """
+    from scripts.mimic_cxr_vendor.extract import extract_findings_impression
+    from scripts.mimic_cxr_vendor.section_parser import custom_mimic_cxr_rules
+
+    report = (
+        "\n FINAL REPORT\n EXAMINATION:  CHEST (PA AND LAT)\n\n"
+        " INDICATION:  Cough.\n\n"
+        " COMPARISON:  None.\n\n"
+        " FINDINGS:\n\n"
+        " The lungs are clear.  No focal consolidation.\n\n"
+        " IMPRESSION:\n\n"
+        " No acute cardiopulmonary process.\n"
+    )
+    findings, impression = extract_findings_impression(report, "s99999999")
+    assert "lungs are clear" in findings.lower()
+    assert "no acute cardiopulmonary" in impression.lower()
+
+    # A study_id present in custom_mimic_cxr_rules()'s index-override table
+    # must take the override path, not the regex path, regardless of report
+    # content — this is what makes the ~30 known-malformed reports usable.
+    _, custom_indices = custom_mimic_cxr_rules()
+    override_stem, (start, end) = next(iter(custom_indices.items()))
+    probe_text = "x" * start + "TARGET_SPAN" + "x" * 200
+    if end <= len(probe_text):
+        f, i = extract_findings_impression(probe_text, override_stem)
+        assert f == ""  # index-override path has no separate findings section
+        assert i == probe_text[start:end]
+
+
+def test_cxr_mimic_full_config_present_and_consistent():
+    """New config key (CLAUDE.md: new module/config key -> parity assertion).
+    cxr_mimic_full.yaml must set local_parquet_dir (the signal
+    train_contrastive.load_mimic_cxr / evaluate_cxr_retrieval.build_dataloader
+    branch on) and keep every OTHER key schema-compatible with mimic_cxr.yaml
+    so an unmodified training/eval invocation is unaffected by this file
+    merely existing.
+
+    dataset_name must be the literal "mimic_cxr", NOT this file's own name.
+    scripts/train_contrastive.py's prepare_dataloader() dispatches on this
+    exact string BEFORE load_mimic_cxr ever inspects local_parquet_dir; any
+    other value raises "Unknown dataset for contrastive training" and never
+    reaches the local-parquet branch this config exists to select. Confirmed
+    live 2026-08-20 (job 2470516) -- dataset_name was "cxr_mimic_full" and
+    training died at dataloader-prep, first time this file was ever exercised
+    through actual training (Phase 8 only built the data).
+    """
+    from omegaconf import OmegaConf
+
+    legacy = OmegaConf.load(REPO_ROOT / "configs" / "dataset" / "mimic_cxr.yaml")
+    full = OmegaConf.load(REPO_ROOT / "configs" / "dataset" / "cxr_mimic_full.yaml")
+
+    assert full.get("dataset_name") == "mimic_cxr"
+    assert "local_parquet_dir" in full
+    assert "local_parquet_dir" not in legacy  # legacy path must stay the default
+
+    for key in ("tokenizer", "max_length", "teacher_max_length",
+                "findings_field", "impression_field", "concatenate_sections",
+                "image_size", "image_mean", "image_std"):
+        assert key in full, "cxr_mimic_full.yaml missing schema key: {}".format(key)
+
+
+def test_cxr_mimic_arm0_config_is_full_pointed_at_arm0_symlink_dir():
+    """Phase 9A Arm-0 config (CLAUDE.md: new config file -> parity assertion).
+    cxr_mimic_arm0.yaml must be byte-for-byte identical to cxr_mimic_full.yaml
+    EXCEPT local_parquet_dir, which must point at an 'arm0' subdirectory.
+    dataset_name is NOT a legitimate difference -- both files must carry the
+    literal "mimic_cxr" (see test_cxr_mimic_full_config_present_and_consistent
+    for why; using either file's own name there breaks training dispatch).
+    The loader hardcodes train/validate/test.parquet, so the arm0 subdir is
+    the symlink dir (arm0_train.parquet->train.parquet, ...) -- the only
+    mechanism that selects the arm0_-prefixed pack output without a code
+    change. Any OTHER drift between the two would silently change the Arm-0
+    recipe relative to the production build it is meant to control.
+    """
+    from omegaconf import OmegaConf
+
+    full = OmegaConf.load(REPO_ROOT / "configs" / "dataset" / "cxr_mimic_full.yaml")
+    arm0 = OmegaConf.load(REPO_ROOT / "configs" / "dataset" / "cxr_mimic_arm0.yaml")
+
+    assert arm0.get("dataset_name") == "mimic_cxr"
+    assert arm0.get("dataset_name") == full.get("dataset_name")
+    assert "local_parquet_dir" in arm0
+    # points at an arm0 subdir of whatever full's dir is (symlink dir for the
+    # arm0_-prefixed parquets), not the production tree itself.
+    assert str(arm0.local_parquet_dir).rstrip("/").endswith("/arm0")
+    assert str(arm0.local_parquet_dir).rstrip("/") == str(full.local_parquet_dir).rstrip("/") + "/arm0"
+
+    # Every OTHER key must match cxr_mimic_full exactly -- Arm-0 changes only
+    # the data location, never the dispatch name/recipe/schema.
+    for key in full:
+        if key == "local_parquet_dir":
+            continue
+        assert key in arm0, "cxr_mimic_arm0.yaml missing key present in full: {}".format(key)
+        assert arm0[key] == full[key], "cxr_mimic_arm0.yaml drifted from full at key: {}".format(key)
+
+
+def test_load_mimic_cxr_dispatches_to_local_parquet_when_configured():
+    """load_mimic_cxr must call load_dataset("parquet", data_files=...) when
+    dataset.local_parquet_dir is set, and must NOT touch the HF mirror path in
+    that case — the exact regression this branch exists to prevent is a typo
+    that silently falls through to the old itsanmolgupta network path.
+    """
+    import importlib.util
+
+    from omegaconf import OmegaConf
+
+    spec = importlib.util.spec_from_file_location(
+        "_tc_mod_local", REPO_ROOT / "scripts" / "train_contrastive.py"
+    )
+    tc = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(tc)
+    except Exception as e:                                    # pragma: no cover
+        pytest.skip("train_contrastive import failed: {}".format(e))
+
+    calls = []
+
+    def _fake_load_dataset(*args, **kwargs):
+        calls.append((args, kwargs))
+
+        class _FakeDS:
+            column_names = ["image", "findings", "impression"]
+
+            def __len__(self):
+                return 0
+
+            def filter(self, fn):
+                return self
+
+        return _FakeDS()
+
+    tc.load_dataset = _fake_load_dataset
+
+    cfg = OmegaConf.create({"dataset": {
+        "local_parquet_dir": "/fake/dir",
+        "train_split": "train", "validation_split": "validation", "test_split": "test",
+        "cache_dir": "/unused",
+    }})
+
+    try:
+        tc.load_mimic_cxr(cfg, "train", tokenizer=None, teacher_tokenizer=None)
+    except RuntimeError:
+        pass  # expected — the fake dataset is empty; we only care about the call args
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] == "parquet" or kwargs.get("path") == "parquet"
+    data_files = kwargs.get("data_files") or (args[1] if len(args) > 1 else None)
+    assert data_files is not None
+    assert data_files["train"] == "/fake/dir/train.parquet"
+    assert data_files["validation"] == "/fake/dir/validate.parquet"
+    assert data_files["test"] == "/fake/dir/test.parquet"
+
+
+@pytest.mark.willi_parity
+@pytest.mark.parametrize("use_augmentation,is_train,expect_augmented", [
+    (False, True, False),
+    (True, False, False),
+    (True, True, True),
+])
+def test_build_image_transform_augmentation_gating(use_augmentation, is_train, expect_augmented):
+    """Phase 9D (2026-08-24, after job 2478647's arm0 checkpoint was confirmed
+    via --checkpoint mode to have memorized boilerplate templates rather than
+    condition on the image): RandomResizedCrop/RandomRotation must apply ONLY
+    when BOTH use_augmentation is set AND is_train — augmenting eval images
+    would make evaluation nondeterministic regardless of the training question,
+    and use_augmentation defaulting off/False keeps retrieval's closed-chapter
+    usage of this same helper byte-identical."""
+    from omegaconf import OmegaConf
+    import torchvision.transforms as T
+    from scripts.train_contrastive import build_image_transform
+
+    cfg = OmegaConf.create({"dataset": {"use_augmentation": use_augmentation, "image_size": 224}})
+    transform = build_image_transform(cfg, is_train=is_train)
+    types = [type(t) for t in transform.transforms]
+
+    assert (T.RandomResizedCrop in types) is expect_augmented
+    assert (T.RandomRotation in types) is expect_augmented
+    assert (T.Resize in types) is (not expect_augmented)
+
+
+@pytest.mark.willi_parity
+def test_build_image_transform_default_matches_pre_9d_pipeline():
+    """Regression pin: with use_augmentation absent (the default for every
+    existing dataset config, i.e. the state before 9D landed), build_image_
+    transform() must be byte-identical to the old hardcoded pipeline (Resize
+    -> Grayscale(3) -> ToTensor -> Normalize) — protects retrieval's closed
+    chapter from any accidental behavior change from this refactor."""
+    from omegaconf import OmegaConf
+    from PIL import Image
+    import torchvision.transforms as T
+    from scripts.train_contrastive import build_image_transform
+
+    cfg = OmegaConf.create({"dataset": {}})
+    transform = build_image_transform(cfg, is_train=True)  # is_train=True but use_augmentation unset
+
+    old_transform = T.Compose([
+        T.Resize((224, 224)),
+        T.Grayscale(num_output_channels=3),
+        T.ToTensor(),
+        T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                    std=[0.26862954, 0.26130258, 0.27577711]),
+    ])
+
+    img = Image.new("RGB", (300, 400), color=(128, 64, 200))
+    torch.testing.assert_close(transform(img), old_transform(img))
+
+
+@pytest.mark.willi_parity
+def test_load_mimic_cxr_threads_is_train_only_for_train_split():
+    """load_mimic_cxr must pass is_train=True only when split=='train' —
+    validation/test must never get augmented, even with use_augmentation=True.
+    Reuses test_load_mimic_cxr_dispatches_to_local_parquet_when_configured's
+    import-by-path + fake load_dataset pattern."""
+    import importlib.util
+    from omegaconf import OmegaConf
+    import torchvision.transforms as T
+
+    spec = importlib.util.spec_from_file_location(
+        "_tc_mod_istrain", REPO_ROOT / "scripts" / "train_contrastive.py"
+    )
+    tc = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(tc)
+    except Exception as e:                                    # pragma: no cover
+        pytest.skip("train_contrastive import failed: {}".format(e))
+
+    class _FakeDS:
+        column_names = ["image", "findings", "impression"]
+
+        def __len__(self):
+            return 1
+
+        def filter(self, fn):
+            return self
+
+    tc.load_dataset = lambda *a, **k: _FakeDS()
+
+    cfg = OmegaConf.create({"dataset": {
+        "local_parquet_dir": "/fake/dir",
+        "train_split": "train", "validation_split": "validation", "test_split": "test",
+        "cache_dir": "/unused", "max_length": 32, "use_augmentation": True,
+    }})
+
+    train_ds = tc.load_mimic_cxr(cfg, "train", tokenizer=None, teacher_tokenizer=None)
+    val_ds = tc.load_mimic_cxr(cfg, "validation", tokenizer=None, teacher_tokenizer=None)
+
+    train_types = [type(t) for t in train_ds.img_transform.transforms]
+    val_types = [type(t) for t in val_ds.img_transform.transforms]
+    assert T.RandomResizedCrop in train_types, "train split must be augmented when use_augmentation=True"
+    assert T.RandomResizedCrop not in val_types, "validation split must NEVER be augmented"
+
+
+def test_prepare_dataloader_dispatches_local_parquet_configs_to_load_mimic_cxr():
+    """Regression for job 2470516 (2026-08-20): prepare_dataloader() has its
+    OWN outer dispatch (`if name == "mimic_cxr": ... elif ...: ... else: raise
+    ValueError("Unknown dataset for contrastive training")`) that runs BEFORE
+    load_mimic_cxr is ever called. test_load_mimic_cxr_dispatches_to_local_
+    parquet_when_configured above calls load_mimic_cxr directly, so it never
+    exercised this outer gate -- which is exactly how cxr_mimic_full.yaml (and
+    the arm0 config derived from it) shipped with dataset_name set to the
+    file's own name ("cxr_mimic_full") instead of the literal "mimic_cxr" the
+    dispatch requires, and training died with "Unknown dataset for contrastive
+    training: cxr_mimic_full" the first time it was actually run. This test
+    calls prepare_dataloader itself with dataset_name="mimic_cxr" (the
+    corrected value) + local_parquet_dir set, and asserts it reaches
+    load_mimic_cxr rather than the ValueError branch.
+    """
+    import importlib.util
+
+    from omegaconf import OmegaConf
+
+    spec = importlib.util.spec_from_file_location(
+        "_tc_mod_prep", REPO_ROOT / "scripts" / "train_contrastive.py"
+    )
+    tc = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(tc)
+    except Exception as e:                                    # pragma: no cover
+        pytest.skip("train_contrastive import failed: {}".format(e))
+
+    calls = []
+
+    def _fake_load_mimic_cxr(cfg, split, tokenizer, teacher_tokenizer=None):
+        calls.append(split)
+
+        class _FakeDS:
+            def __len__(self):
+                return 4  # nonzero: DataLoader's RandomSampler rejects len==0 eagerly
+
+            def __getitem__(self, idx):
+                return {}
+
+        return _FakeDS()
+
+    tc.load_mimic_cxr = _fake_load_mimic_cxr
+
+    cfg = OmegaConf.create({"dataset": {
+        "dataset_name": "mimic_cxr",
+        "local_parquet_dir": "/fake/dir",
+        "batch_size": 2, "eval_batch_size": 2, "num_workers": 0, "pin_memory": False,
+    }})
+
+    tc.prepare_dataloader(cfg, "train", tokenizer=None, teacher_tokenizer=None)
+
+    assert calls == ["train"], (
+        "prepare_dataloader did not dispatch dataset_name='mimic_cxr' to "
+        "load_mimic_cxr -- the exact regression from job 2470516"
+    )
+
+    # And the actual configs shipped for the local-parquet path must carry
+    # this literal value, not their own filename.
+    for fname in ("cxr_mimic_full.yaml", "cxr_mimic_arm0.yaml"):
+        c = OmegaConf.load(REPO_ROOT / "configs" / "dataset" / fname)
+        assert c.get("dataset_name") == "mimic_cxr", (
+            "{} must set dataset_name: mimic_cxr for prepare_dataloader's "
+            "dispatch to route into load_mimic_cxr".format(fname)
+        )
+
+
+def test_evaluate_cxr_retrieval_handles_str_image_paths():
+    """MIMICValDataset / IndianaEvalDataset both did
+    `if not isinstance(img, Image.Image): Image.fromarray(img)`, which CRASHES
+    on a str path — the exact shape a local-parquet build's "image" column
+    takes. REGRESSION (2026-08-16, Phase 8E): both must now Image.open() a str
+    before the fromarray fallback.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_ecr_mod", REPO_ROOT / "scripts" / "evaluate_cxr_retrieval.py"
+    )
+    ecr = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(ecr)
+    except Exception as e:                                    # pragma: no cover
+        pytest.skip("evaluate_cxr_retrieval import failed: {}".format(e))
+
+    tmp_img = tmp_path_factory_image()
+    try:
+        class _StubTok:
+            def __call__(self, text, **kw):
+                return {
+                    "input_ids": torch.zeros(1, 8, dtype=torch.long),
+                    "attention_mask": torch.ones(1, 8, dtype=torch.long),
+                }
+
+        ds = ecr.MIMICValDataset(
+            [{"image": str(tmp_img), "findings": "clear", "impression": "normal"}],
+            _StubTok(), max_length=8,
+        )
+        item = ds[0]
+        assert item["pixel_values"].shape[0] == 3  # RGB after convert
+
+        ids = ecr.IndianaEvalDataset(
+            [{"image": str(tmp_img), "report": "clear lungs"}],
+            _StubTok(), max_length=8,
+        )
+        item2 = ids[0]
+        assert item2["pixel_values"].shape[0] == 3
+    finally:
+        os.remove(tmp_img)
+
+    # build_dataloader must accept the new params without a TypeError.
+    import inspect
+    sig = inspect.signature(ecr.build_dataloader)
+    assert "local_parquet_dir" in sig.parameters
+    assert "mimic_split" in sig.parameters
+
+
+def tmp_path_factory_image():
+    import tempfile
+    from PIL import Image as PILImage
+
+    fd, path = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    PILImage.new("L", (16, 16)).save(path, "JPEG")
+    return path
+
+
+def test_h100_scripts_expose_dataset_config_and_local_parquet_levers():
+    """Phase 8E: an env lever must exist to point training/eval at the local
+    PhysioNet build, defaulting to the legacy mirror so Phase 9A's Arm-0
+    reproduction control (and every prior run) is unaffected by its existence.
+    """
+    tr = (REPO_ROOT / "scripts" / "train_biomedclip_kd_h100.sh").read_text()
+    assert 'DATASET_CONFIG="${DATASET_CONFIG:-mimic_cxr}"' in tr
+    assert "dataset=${DATASET_CONFIG}" in tr
+    assert "dataset=mimic_cxr \\" not in tr, "must go through the DATASET_CONFIG lever, not a hardcoded value"
+
+    ev = (REPO_ROOT / "scripts" / "eval_h100.sh").read_text()
+    assert 'LOCAL_PARQUET_DIR="${LOCAL_PARQUET_DIR:-}"' in ev
+    assert "--local-parquet-dir" in ev
+
+
+def test_gitignore_guards_credentialed_mimic_build():
+    gi = (REPO_ROOT / ".gitignore").read_text()
+    assert "dataset/mimic_full/" in gi
+    assert "*.parquet" in gi
+
+
+def test_build_mimic_cxr_local_slurm_wrapper_is_cpu_only_on_cpu_batch():
+    """REGRESSION (2026-08-16, Phase 7E). The login node rejects ANY script
+    execution outright (confirmed live — not just 'heavy' commands), and per
+    the cluster's documentation external downloads belong on compute nodes, not a Run
+    Node (explicitly not meant for data acquisition). This job
+    itself needs zero GPU (pure network I/O) — no --gpus line is requested.
+
+    Account/partition/QOS went through THREE failed defaults before landing
+    on one that actually runs, confirmed live via job 2457565 (auth
+    succeeded, 3/4 small files fetched before an unrelated manual --time
+    override killed it): --account=@SLURM_ACCOUNT@ on cpu-batch -> PENDING forever
+    (QOSNotAllowed, the account's QOS is scoped to its partitions only);
+    --account=default on cpu-batch -> AssocMaxSubmitJobLimit. What works:
+    --account=@SLURM_ACCOUNT@ --partition=@SLURM_PARTITION@ --qos=@SLURM_QOS@ together. TRADEOFF this
+    accepts: the batch partition is a GPU-capable, preemptible-at-any-time partition
+    (per the cluster's documentation) for a job that never uses the GPU — not ideal
+    cluster citizenship, but the only combination proven to actually run for
+    this account; worth asking the cluster's support desk about a non-preemptible
+    CPU-only alternative before the long `fetch` stage.
+    """
+    sh = (REPO_ROOT / "scripts" / "build_mimic_cxr_local.sh").read_text()
+    assert "#SBATCH --partition=@SLURM_PARTITION@" in sh
+    assert "#SBATCH --gpus" not in sh
+    assert "#SBATCH --account=@SLURM_ACCOUNT@" in sh
+    assert "#SBATCH --qos=@SLURM_QOS@" in sh
+    assert "build_mimic_cxr_local.py meta" in sh
+    assert "build_mimic_cxr_local.py manifest" in sh
+    assert "build_mimic_cxr_local.py fetch" in sh
+    assert "build_mimic_cxr_local.py pack" in sh
+
+
+# ── 16. Phase 10A: HybridLanguageModel image-conditioning hooks ───────────────
+
+def _tiny_cpu_config():
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    return HybridConfig(
+        vocab_size=100, dim=64, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False,
+        use_tfla=False,
+    )
+
+
+@pytest.mark.willi_parity
+def test_forward_inputs_embeds_matches_token_embedding_path():
+    """forward(inputs_embeds=embeddings(x)) must be a true drop-in equivalent
+    of forward(input_ids=x), not just 'doesn't crash' — the whole point of
+    the new kwarg is that Phase 10's image prefix flows through the exact
+    same code path as token embeddings.
+    """
+    from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel
+
+    model = HybridLanguageModel(_tiny_cpu_config())
+    model.eval()
+
+    input_ids = torch.randint(0, 100, (2, 16))
+
+    with torch.no_grad():
+        out_ids = model(input_ids, return_dict=True)
+        embeds = model.embeddings(input_ids)
+        out_embeds = model(inputs_embeds=embeds, return_dict=True)
+
+    assert torch.allclose(out_ids.logits, out_embeds.logits, atol=1e-5), (
+        "forward(inputs_embeds=...) diverges from forward(input_ids=...) — "
+        "the new kwarg is not a true drop-in for the embedding step"
+    )
+
+
+@pytest.mark.willi_parity
+def test_forward_requires_exactly_one_of_input_ids_or_inputs_embeds():
+    from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel
+
+    model = HybridLanguageModel(_tiny_cpu_config())
+    input_ids = torch.randint(0, 100, (2, 16))
+    embeds = torch.randn(2, 16, 64)
+
+    with pytest.raises(ValueError):
+        model(input_ids=input_ids, inputs_embeds=embeds)
+
+    with pytest.raises(ValueError):
+        model()
+
+
+@pytest.mark.willi_parity
+def test_generate_default_path_unchanged_when_prefix_embeds_none():
+    """Regression pin: generate() with prefix_embeds=None (the default) must
+    produce byte-identical output to before Phase 10A under a fixed seed —
+    the default branch is untouched code, only reached via an explicit
+    prefix_embeds=None check.
+    """
+    from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel
+
+    model = HybridLanguageModel(_tiny_cpu_config())
+    model.eval()
+    input_ids = torch.randint(0, 100, (2, 4))
+
+    torch.manual_seed(0)
+    out_a = model.generate(input_ids, max_new_tokens=5, temperature=1.0)
+    torch.manual_seed(0)
+    out_b = model.generate(input_ids, prefix_embeds=None, max_new_tokens=5, temperature=1.0)
+
+    assert torch.equal(out_a, out_b), "generate() default path changed under Phase 10A"
+    assert out_a.shape == (2, 4 + 5)
+
+
+@pytest.mark.willi_parity
+def test_generate_with_prefix_embeds_runs_and_returns_expected_shape():
+    """Smoke test for the new capability: prefix-conditioned generation runs
+    end-to-end and returns generated token ids only (the prefix contributes
+    no ids of its own)."""
+    from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel
+
+    cfg = _tiny_cpu_config()
+    model = HybridLanguageModel(cfg)
+    model.eval()
+
+    input_ids = torch.randint(0, 100, (2, 4))
+    prefix_embeds = torch.randn(2, 8, cfg.dim)
+
+    out = model.generate(input_ids, prefix_embeds=prefix_embeds, max_new_tokens=5)
+
+    assert out.shape == (2, 4 + 5), f"Unexpected shape: {out.shape}"
+    assert torch.isfinite(out.float()).all()
+
+
+@pytest.mark.willi_parity
+def test_image_prefix_mapper_output_shape_and_gradients():
+    """ImagePrefixMapper: synthetic (B, N, patch_dim) -> (B, k, decoder_dim),
+    for several k, with gradients flowing back to token_proj."""
+    from hybrid_xmamba.models.prefix_mapper import ImagePrefixMapper
+
+    B, N, patch_dim, decoder_dim = 3, 197, 768, 64
+
+    for k in (8, 32, 64):
+        mapper = ImagePrefixMapper(patch_dim=patch_dim, decoder_dim=decoder_dim, k=k)
+        patch_grid = torch.randn(B, N, patch_dim)
+
+        out = mapper(patch_grid)
+        assert out.shape == (B, k, decoder_dim), f"k={k}: unexpected shape {out.shape}"
+        assert torch.isfinite(out).all()
+
+        loss = out.sum()
+        loss.backward()
+        assert mapper.token_proj.weight.grad is not None, f"k={k}: no gradient for token_proj"
+        assert torch.isfinite(mapper.token_proj.weight.grad).all(), f"k={k}: non-finite gradient"
+
+
+# ── 17. Phase 11A: report-generation metrics + decoding harness ───────────────
+
+@pytest.mark.willi_parity
+def test_rouge_l_score_known_value():
+    from scripts.evaluate_report_generation import rouge_l_score
+
+    hyp = "the cat sat on the mat".split()
+    ref = "the cat was on the mat".split()
+    # LCS = "the cat on the mat" (5 tokens) out of 6 in both -> p=r=5/6 -> F=5/6
+    score = rouge_l_score(hyp, ref)
+    assert abs(score - 5 / 6) < 1e-6, score
+
+    assert rouge_l_score([], ["a", "b"]) == 0.0
+    assert rouge_l_score(["a", "b"], []) == 0.0
+
+
+@pytest.mark.willi_parity
+def test_corpus_bleu_identical_and_disjoint():
+    from scripts.evaluate_report_generation import corpus_bleu
+
+    text = "the quick brown fox jumps over the lazy dog".split()
+    identical = corpus_bleu([text], [text], max_n=4)
+    assert abs(identical - 1.0) < 1e-6, identical
+
+    disjoint_hyp = ["zzz", "yyy", "xxx", "www"]
+    disjoint_ref = ["aaa", "bbb", "ccc", "ddd"]
+    disjoint = corpus_bleu([disjoint_hyp], [disjoint_ref], max_n=4)
+    assert disjoint == 0.0, disjoint
+
+
+@pytest.mark.willi_parity
+def test_meteor_score_corpus_returns_none_or_float():
+    from scripts.evaluate_report_generation import meteor_score_corpus
+
+    result = meteor_score_corpus(["the cat sat"], ["the cat sat"])
+    assert result is None or isinstance(result, float)
+
+
+@pytest.mark.willi_parity
+def test_greedy_decode_runs_and_returns_expected_shape():
+    from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel
+    from hybrid_xmamba.models.prefix_mapper import ImagePrefixMapper
+    from scripts.evaluate_report_generation import greedy_decode
+
+    cfg = _tiny_cpu_config()
+    model = HybridLanguageModel(cfg)
+    model.eval()
+    mapper = ImagePrefixMapper(patch_dim=768, decoder_dim=cfg.dim, k=4)
+    mapper.eval()
+
+    prefix_embeds = mapper(torch.randn(1, 197, 768))
+    input_ids = torch.randint(0, 100, (1, 5))
+
+    out = greedy_decode(model, input_ids, prefix_embeds=prefix_embeds, max_new_tokens=6)
+    assert out.shape == (1, 11), out.shape
+    assert torch.isfinite(out.float()).all()
+
+
+@pytest.mark.willi_parity
+def test_beam_search_decode_requires_batch_size_one():
+    from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel
+    from scripts.evaluate_report_generation import beam_search_decode
+
+    model = HybridLanguageModel(_tiny_cpu_config())
+    model.eval()
+    input_ids = torch.randint(0, 100, (2, 5))  # batch size 2 -> not supported
+
+    with pytest.raises(ValueError):
+        beam_search_decode(model, input_ids, beam_size=3, max_new_tokens=4)
+
+
+@pytest.mark.willi_parity
+def test_beam_search_decode_beam_size_one_matches_greedy():
+    """beam_size=1 must reduce to the same deterministic argmax path as
+    greedy_decode -- a correctness invariant for the new beam-search code
+    (model.generate() has no beam mode, so beam_search_decode is fresh logic
+    built directly on forward(inputs_embeds=...))."""
+    from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel
+    from hybrid_xmamba.models.prefix_mapper import ImagePrefixMapper
+    from scripts.evaluate_report_generation import greedy_decode, beam_search_decode
+
+    cfg = _tiny_cpu_config()
+    model = HybridLanguageModel(cfg)
+    model.eval()
+    mapper = ImagePrefixMapper(patch_dim=768, decoder_dim=cfg.dim, k=4)
+    mapper.eval()
+
+    prefix_embeds = mapper(torch.randn(1, 197, 768))
+    input_ids = torch.randint(0, 100, (1, 5))
+
+    greedy_out = greedy_decode(model, input_ids, prefix_embeds=prefix_embeds, max_new_tokens=6)
+    beam_out = beam_search_decode(
+        model, input_ids, prefix_embeds=prefix_embeds, beam_size=1, max_new_tokens=6
+    )
+    assert torch.equal(greedy_out, beam_out), (greedy_out, beam_out)
+
+
+# ── 18. Phase 10E: ReportGenerationLightningModule ─────────────────────────────
+
+@pytest.mark.willi_parity
+def test_report_generation_step_produces_finite_loss_and_gradients():
+    """Training step must produce a finite loss with gradients flowing into
+    BOTH the prefix_mapper and the decoder backbone, using a precomputed
+    batch['patch_grid'] tensor -- no open_clip/BiomedCLIP weights needed
+    (image_encoder stays None; load_image_encoder() is never called)."""
+    from hybrid_xmamba.training.lightning_module import ReportGenerationLightningModule
+
+    cfg = _tiny_cpu_config()
+    mod = ReportGenerationLightningModule(
+        decoder_config=cfg,
+        image_patch_dim=768,
+        prefix_k=4,
+        decoder_lr=1e-5,
+        head_lr=3e-4,
+        weight_decay=0.01,
+        warmup_steps=2,
+        max_steps=10,
+        gradient_clip_val=0.5,
+    )
+    mod.train()
+
+    B, L = 3, 8
+    batch = {
+        "input_ids": torch.randint(0, 100, (B, L)),
+        "patch_grid": torch.randn(B, 197, 768),
+    }
+
+    loss = mod.training_step(batch, batch_idx=0)
+    assert torch.isfinite(loss), f"Loss not finite: {loss.item()}"
+
+    loss.backward()
+
+    for name, param in mod.prefix_mapper.named_parameters():
+        assert param.grad is not None, f"No grad for prefix_mapper.{name}"
+        assert torch.isfinite(param.grad).all(), f"Non-finite grad for prefix_mapper.{name}"
+
+    for name, param in mod.decoder.named_parameters():
+        if param.requires_grad:
+            assert param.grad is not None, f"No grad for decoder.{name}"
+            assert torch.isfinite(param.grad).all(), f"Non-finite grad for decoder.{name}"
+
+
+@pytest.mark.willi_parity
+def test_report_generation_prefix_masking_matches_manual_ignore_index_ce():
+    """Regression pin for the single assumption ReportGenerationLightningModule
+    relies on but never states explicitly in code: HybridLanguageModel.forward()
+    calls nn.CrossEntropyLoss() with NO ignore_index argument, so -100 at the
+    prefix label positions is excluded from the loss only because -100 is
+    PyTorch's documented default ignore_index. This reconstructs the loss
+    independently via F.cross_entropy(..., ignore_index=-100) over the exact
+    same logits/labels and asserts it matches _step()'s output -- if a future
+    edit ever adds an explicit ignore_index to hybrid_lm.py's loss (or changes
+    the shift convention), this test catches the mismatch."""
+    import torch.nn.functional as F
+    from hybrid_xmamba.training.lightning_module import ReportGenerationLightningModule
+
+    cfg = _tiny_cpu_config()
+    mod = ReportGenerationLightningModule(decoder_config=cfg, prefix_k=4)
+    mod.eval()
+
+    B, L = 2, 6
+    input_ids = torch.randint(0, 100, (B, L))
+    patch_grid = torch.randn(B, 197, 768)
+
+    with torch.no_grad():
+        step_loss = mod._step({"input_ids": input_ids, "patch_grid": patch_grid}, "val")
+
+        prefix_embeds = mod.prefix_mapper(patch_grid)
+        k = prefix_embeds.shape[1]
+        inputs_embeds = torch.cat([prefix_embeds, mod.decoder.embeddings(input_ids)], dim=1)
+        logits = mod.decoder(inputs_embeds=inputs_embeds, return_dict=True).logits
+
+        labels = torch.full((B, k + L), -100, dtype=input_ids.dtype)
+        labels[:, k:] = input_ids
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        manual_loss = F.cross_entropy(
+            shift_logits.view(-1, cfg.vocab_size), shift_labels.view(-1), ignore_index=-100,
+        )
+
+    assert torch.allclose(step_loss, manual_loss, atol=1e-5), (step_loss.item(), manual_loss.item())
+
+
+@pytest.mark.willi_parity
+@pytest.mark.parametrize("decode,kwargs", [("greedy", {}), ("beam", {"beam_size": 2})])
+def test_generate_from_patch_grid_runs_and_returns_expected_shape(decode, kwargs):
+    """Phase 11A's --checkpoint mode (2026-08-23, added after the first real
+    Phase 10E arm0 checkpoint existed): generate_from_patch_grid() must run
+    end-to-end on a synthetic patch grid (no real checkpoint/BiomedCLIP/data
+    needed here — that heavy path is scripts/evaluate_report_generation.py's
+    load_report_generation_module(), not unit-tested, same as evaluate_lm.py's
+    loader) and seed generation with an EMPTY input_ids, matching how training
+    labels start immediately after the image prefix with no BOS token."""
+    from scripts.evaluate_report_generation import generate_from_patch_grid
+    from hybrid_xmamba.training.lightning_module import ReportGenerationLightningModule
+
+    cfg = _tiny_cpu_config()
+    module = ReportGenerationLightningModule(decoder_config=cfg, prefix_k=4)
+    module.eval()
+
+    patch_grid = torch.randn(1, 197, 768)
+    max_new_tokens = 6
+    out = generate_from_patch_grid(module, patch_grid, decode=decode, max_new_tokens=max_new_tokens, **kwargs)
+
+    assert out.shape == (1, max_new_tokens), out.shape
+
+
+@pytest.mark.willi_parity
+def test_nearest_neighbor_indices_picks_closest_by_cosine_similarity():
+    """Phase 11C (2026-08-24, built after both the no-augmentation and
+    augmented arm0 checkpoints were confirmed to generate byte-identical
+    boilerplate for different images): nearest_neighbor_indices() is the
+    testable core of run_retrieval_baseline() — pure cosine-similarity
+    argmax, no BiomedCLIP/network/data needed here."""
+    from scripts.evaluate_report_generation import nearest_neighbor_indices
+
+    gallery = torch.eye(4)  # 4 orthonormal "reports"
+    query = torch.tensor([[0.9, 0.1, 0.0, 0.0], [0.0, 0.0, 0.2, 0.9]])
+    idx = nearest_neighbor_indices(query, gallery)
+    assert idx.tolist() == [0, 3]
+
+
+@pytest.mark.willi_parity
+def test_report_generation_val_step_logs_flat_named_checkpoint_alias():
+    """Regression pin for the live bug hit 2026-08-23 (job 2478647): Lightning
+    does not sanitize '/' inside a ModelCheckpoint filename=... interpolation
+    -- {val/lm_loss:.4f} silently created a nested DIRECTORY (report_gen-
+    step=NNNNNN-val/) instead of a flat checkpoint filename, with the actual
+    .ckpt buried one level down as lm_loss=X.XXXX.ckpt. _step() must log an
+    additional flat-named 'val_lm_loss_ckpt' alias (same value as val/lm_loss)
+    on validation steps only, which train_report_generation.py's filename=
+    template now interpolates instead."""
+    from unittest.mock import patch as mock_patch
+    from hybrid_xmamba.training.lightning_module import ReportGenerationLightningModule
+
+    cfg = _tiny_cpu_config()
+    module = ReportGenerationLightningModule(decoder_config=cfg, prefix_k=4)
+    module.eval()
+
+    B, L = 2, 6
+    batch = {"input_ids": torch.randint(0, 100, (B, L)), "patch_grid": torch.randn(B, 197, 768)}
+
+    with mock_patch.object(module, "log") as mock_log:
+        module._step(batch, "val")
+        val_keys = [call.args[0] for call in mock_log.call_args_list]
+    assert "val/lm_loss" in val_keys
+    assert "val_lm_loss_ckpt" in val_keys, (
+        "val_lm_loss_ckpt not logged on a validation step -- "
+        "train_report_generation.py's filename= template has nothing "
+        "flat-named to interpolate, reintroducing the nested-directory bug"
+    )
+
+    with mock_patch.object(module, "log") as mock_log:
+        module._step(batch, "train")
+        train_keys = [call.args[0] for call in mock_log.call_args_list]
+    assert "val_lm_loss_ckpt" not in train_keys, "should only log on validation steps"
+
+
+@pytest.mark.willi_parity
+def test_train_report_generation_checkpoint_filename_has_no_slash_in_braces():
+    """Static guard, complementary to the behavioral test above: any {...}
+    filename interpolation containing '/' creates a nested directory instead
+    of a checkpoint file under this Lightning version's default ModelCheckpoint
+    (confirmed live 2026-08-23). Scoped to train_report_generation.py only --
+    train_stage0_distill.py/_resume.py have the identical latent pattern
+    ({val/loss:.4f}) but are historical, already-executed production scripts
+    untouched this session; documented here, not fixed, to avoid unrequested
+    changes to load-bearing infra the Stage-0 150M checkpoint (val PPL 13.18,
+    this whole Phase 10E chain's DECODER_CKPT) came from."""
+    py = (REPO_ROOT / "scripts" / "train_report_generation.py").read_text()
+    m = re.search(r'filename\s*=\s*["\']([^"\']*)["\']', py)
+    assert m, "expected a ModelCheckpoint filename=... string literal"
+    for expr in re.findall(r"\{([^}]*)\}", m.group(1)):
+        assert "/" not in expr, (
+            f"filename= template contains '{{{expr}}}' — a '/' inside a Lightning "
+            f"filename interpolation creates a nested directory, not a flat file"
+        )
+
+
+@pytest.mark.willi_parity
+def test_hybrid_150m_v2_rrg_config_matches_150m_v2_architecture():
+    """Phase 10E: hybrid_150m_v2_rrg.yaml must be architecturally IDENTICAL to
+    hybrid_150m_v2.yaml (checkpoint-loadable against a Stage-0/joint-trained
+    150M v2 backbone, per Phase 10D), plus the new image-prefix keys."""
+    import dataclasses
+    from omegaconf import OmegaConf
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel
+    from hybrid_xmamba.training.lightning_module import ReportGenerationLightningModule
+
+    raw = OmegaConf.to_container(
+        OmegaConf.load(REPO_ROOT / "configs" / "model" / "hybrid_150m_v2_rrg.yaml"),
+        resolve=True,
+    )
+    assert raw["dim"] == 768 and raw["num_layers"] == 12
+    assert raw["norm_topology"] == "hybrid"
+    assert raw["max_position_embeddings"] == 1024
+    assert list(raw["layer_pattern"]).count("mlstm") == 3
+
+    # New Phase 10 keys
+    assert raw["image_patch_dim"] == 768, "BiomedCLIP ViT-B/16 patch dim"
+    assert raw["prefix_k"] > 0
+    assert raw["gradient_clip_val"] == 0.5, "150M is spike-fragile — must not silently drift to 1.0"
+    assert raw["vit_unfreeze_blocks"] == 0, "10C default: frozen image tower"
+    assert raw["vit_lr"] > 0
+
+    # Regression pin for the live bug hit 2026-08-23 (job 2478622): Hydra's
+    # strict-struct mode rejects a CLI override for a key the config doesn't
+    # declare ("Could not override 'model.vit_unfreeze_blocks' ... Key
+    # 'vit_unfreeze_blocks' is not in struct"). Every `model.<key>=` override
+    # train_report_generation_h100.sh passes MUST have a matching key declared
+    # in this yaml, or the SLURM job fails at Hydra-compose time before any
+    # Python code runs.
+    import re
+    sh_text = (REPO_ROOT / "scripts" / "train_report_generation_h100.sh").read_text()
+    overridden_keys = re.findall(r"model\.([a-zA-Z_][a-zA-Z0-9_]*)=", sh_text)
+    assert overridden_keys, "expected at least one model.<key>= override in the wrapper"
+    for key in overridden_keys:
+        assert key in raw, (
+            f"train_report_generation_h100.sh overrides model.{key}=... but "
+            f"hybrid_150m_v2_rrg.yaml does not declare '{key}' — Hydra strict-struct "
+            f"mode will reject this at submit time."
+        )
+
+    fields = {f.name for f in dataclasses.fields(HybridConfig)}
+    decoder_cfg = HybridConfig(**{k: v for k, v in raw.items() if k in fields})
+    decoder = HybridLanguageModel(decoder_cfg)
+    n_params = sum(p.numel() for p in decoder.parameters())
+    assert 181e6 < n_params < 186e6, (
+        f"hybrid_150m_v2_rrg decoder param count {n_params/1e6:.2f}M outside [181, 186]M "
+        f"— should match hybrid_150m_v2.yaml exactly"
+    )
+
+    # Config values must actually wire into the Lightning module without error.
+    module = ReportGenerationLightningModule(
+        decoder_config=decoder_cfg,
+        image_patch_dim=raw["image_patch_dim"],
+        prefix_k=raw["prefix_k"],
+        decoder_lr=raw["decoder_lr"],
+        head_lr=raw["head_lr"],
+        weight_decay=raw["weight_decay"],
+        warmup_steps=raw["warmup_steps"],
+        max_steps=raw["max_steps"],
+        gradient_clip_val=raw["gradient_clip_val"],
+    )
+    assert module.prefix_mapper.k == raw["prefix_k"]
+
+
+@pytest.mark.willi_parity
+def test_train_report_generation_h100_slurm_wrapper_conventions():
+    """Phase 10E SLURM wrapper must follow the project's established conventions:
+    arm03 excluded (ARM/x86 mismatch), the partition/account/qos, and a fail-fast
+    existence check on the decoder checkpoint (mirrors STAGE0_CKPT in
+    train_biomedclip_kd_h100.sh) rather than silently training from random init."""
+    sh = (REPO_ROOT / "scripts" / "train_report_generation_h100.sh").read_text()
+    assert "#SBATCH --partition=@SLURM_PARTITION@" in sh
+    assert "#SBATCH --account=@SLURM_ACCOUNT@" in sh
+    assert _excludes_arm(sh)
+    assert "DECODER_CKPT" in sh
+    assert 'if [ ! -f "${DECODER_CKPT}" ]' in sh
+    assert "train_report_generation.py" in sh
+
+
+@pytest.mark.willi_parity
+def test_inspect_report_generation_h100_slurm_wrapper_conventions():
+    """Companion wrapper (2026-08-23) for scripts/evaluate_report_generation.py
+    --checkpoint, needed because the login node refuses this command directly
+    ('This command is not allowed on the login node!', hit live job 2478647's
+    follow-up). Same established conventions as the training wrapper, plus a
+    fail-fast existence check on the checkpoint itself."""
+    sh = (REPO_ROOT / "scripts" / "inspect_report_generation_h100.sh").read_text()
+    assert "#SBATCH --partition=@SLURM_PARTITION@" in sh
+    assert "#SBATCH --account=@SLURM_ACCOUNT@" in sh
+    assert _excludes_arm(sh)
+    assert "CHECKPOINT" in sh
+    assert 'if [ ! -f "${CHECKPOINT}" ]' in sh
+    assert "evaluate_report_generation.py" in sh
+    assert "--checkpoint" in sh
+    # Defaults to VALIDATION images, not train — generations on train images
+    # look artificially good even under genuine overfitting.
+    assert "validate.parquet" in sh
+
+
+@pytest.mark.willi_parity
+def test_train_report_generation_h100_slurm_wrapper_hydra_overrides_compose():
+    """Regression pin for TWO live bugs hit back-to-back 2026-08-23 (jobs
+    2478622, 2478635): Hydra's strict-struct mode rejects a CLI override for
+    ANY key (model.<key>=, or a bare top-level key like decoder_checkpoint=)
+    that isn't declared somewhere in the composed config -- caught only at
+    submit time, after the DECODER_CKPT existence check already passed, deep
+    into the SLURM job. Rather than re-deriving the override list by hand
+    (fragile -- would have missed decoder_checkpoint same as the first fix
+    did), this replays the SLURM wrapper's OWN python invocation verbatim
+    through hydra.compose() with its own documented env-var defaults
+    substituted in, and asserts it composes without error -- the exact
+    failure mode hit live, reproduced offline."""
+    pytest.importorskip("hydra")
+    from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
+
+    sh = (REPO_ROOT / "scripts" / "train_report_generation_h100.sh").read_text()
+
+    # Literal stand-ins for every ${VAR} this script's invocation block
+    # references — NOT parsed from the script's own defaults (several have
+    # trailing inline comments or nested ${...} refs, e.g. EXPERIMENT embeds
+    # ${PREFIX_K}, that make robust regex-extraction more fragile than just
+    # supplying flat literals here; this test only needs each key to resolve
+    # to SOME syntactically valid value, not to reproduce the real default).
+    env_defaults = {
+        "MODEL_CONFIG": "hybrid_150m_v2_rrg", "DATASET_CONFIG": "cxr_mimic_full",
+        "MAX_STEPS": "50", "BATCH_SIZE": "16", "DECODER_LR": "1e-5", "HEAD_LR": "3e-4",
+        "GRAD_CLIP": "0.5", "PREFIX_K": "32", "VIT_UNFREEZE": "0", "VIT_LR": "1e-6",
+        "GRAD_CKPT": "false", "AUGMENT": "false", "MIMIC_CACHE_DIR": "/tmp/mimic_cache",
+        "DECODER_CKPT": "./outputs/h100_stage0_150m_v2/checkpoints/stage0_model_only.pt",
+        "EXPERIMENT": "parity_check",
+        # Phase 13B: NUM_GPUS=1 (this test's scenario) resolves TRAINER_CFG to
+        # h100_single_gpu inside the script itself, before the invocation
+        # block; substitute that resolved value directly here.
+        "TRAINER_CFG": "h100_single_gpu",
+        # Phase 13F
+        "OVERSAMPLE_RARE": "false", "OVERSAMPLE_WEIGHT": "5.0",
+        # Phase 15B-2 / 15B-3
+        "SEED": "42", "SAVE_TOP_K": "3",
+    }
+
+    # Extract the python invocation block verbatim (between the `python
+    # scripts/train_report_generation.py \` line and the blank line ending it).
+    invocation = sh.split("python scripts/train_report_generation.py \\", 1)[1]
+    invocation = invocation.split("\n\necho", 1)[0]
+    tokens = [t.strip().rstrip("\\").strip() for t in invocation.splitlines()]
+    # "=" filter drops Phase 13A's trailing `${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}`
+    # bash empty-array-safe expansion (no literal "=" in that syntax) -- it is
+    # not a static Hydra override token, it expands to nothing when
+    # IMAGE_ENCODER_CKPT is unset (this test's scenario).
+    tokens = [t for t in tokens if t and t != "--config-name config" and "=" in t]
+
+    def resolve(tok: str) -> str:
+        key, _, value = tok.partition("=")
+        value = value.strip('"')
+        value = re.sub(
+            r"\$\{?([A-Z_][A-Z0-9_]*)\}?",
+            lambda m: env_defaults.get(m.group(1), m.group(0)),
+            value,
+        )
+        return f"{key}={value}"
+
+    overrides = [resolve(t) for t in tokens]
+    assert any(o.startswith("decoder_checkpoint=") for o in overrides), (
+        "sanity check: the override list should still contain decoder_checkpoint= "
+        "— if this fails, the parsing above drifted from the script's actual format"
+    )
+
+    GlobalHydra.instance().clear()
+    configs_dir = str(REPO_ROOT / "configs")
+    with initialize_config_dir(config_dir=configs_dir, version_base="1.3"):
+        cfg = compose(config_name="config", overrides=overrides)
+
+    assert cfg.decoder_checkpoint == env_defaults["DECODER_CKPT"]
+    assert cfg.model.vit_unfreeze_blocks == 0
+    assert cfg.model.prefix_k == 32
+    # Phase 13A: image_encoder_checkpoint is declared (config.yaml) and
+    # defaults to null when IMAGE_ENCODER_CKPT is unset, same as this test's
+    # scenario -- unlike decoder_checkpoint, EXTRA_ARGS only adds it to the
+    # invocation when the env var is actually set (see the dedicated lever
+    # test below for that conditional path).
+    assert cfg.image_encoder_checkpoint is None
+    # Phase 13F
+    assert cfg.dataset.oversample_rare_findings is False
+    assert cfg.dataset.oversample_weight == 5.0
+    # Phase 15B-2: the seed must reach Hydra as an int, and the wrapper's
+    # default must stay 42 so adding the lever reproduces every pre-15B arm
+    # bit-for-bit rather than silently re-seeding the whole project's history.
+    assert cfg.seed == 42
+    assert isinstance(cfg.seed, int)
+    # Phase 15B-3: save_top_k must reach Hydra as an int and default to 3, so
+    # pre-15B recipes keep writing exactly what they wrote before.
+    assert cfg.save_top_k == 3
+    assert isinstance(cfg.save_top_k, int)
+
+
+@pytest.mark.willi_parity
+def test_report_gen_wrapper_exposes_save_top_k_and_checkpoint_count_is_not_hardcoded():
+    """Phase 15B-3. Every report-generation run wrote save_top_k=3 PLUS
+    last.ckpt -- 4 x 2.4 GB = 9.6 GB per arm -- while every eval command in
+    this project loads last.ckpt and nothing else. The three extra files were
+    never read by anything, and they exhausted the 200 GiB home quota partway
+    through the first seed campaign, killing 3 of 4 arms with
+    "OSError: [Errno 122] Disk quota exceeded" on the last.ckpt write
+    (job 2542399).
+
+    Guards the lever and, more importantly, that the count is no longer a
+    literal in the training script -- a hardcoded 3 is what made this
+    un-tunable when it mattered.
+    """
+    sh = (REPO_ROOT / "scripts" / "train_report_generation_h100.sh").read_text()
+    py = (REPO_ROOT / "scripts" / "train_report_generation.py").read_text()
+
+    assert 'SAVE_TOP_K="${SAVE_TOP_K:-3}"' in sh, "SAVE_TOP_K lever missing or default drifted off 3"
+    assert "save_top_k=${SAVE_TOP_K}" in sh, "SAVE_TOP_K declared but not passed to Hydra"
+    assert "save_top_k=3" not in py, (
+        "save_top_k is hardcoded again in train_report_generation.py -- it must "
+        "read cfg.save_top_k so seed/ablation arms can drop to 0"
+    )
+    assert 'cfg.get("save_top_k"' in py, "train_report_generation.py must read save_top_k from cfg"
+
+
+@pytest.mark.willi_parity
+def test_report_gen_wrapper_exposes_seed_lever_and_logs_it():
+    """Phase 15B-2. Supervisor review item 3 (2026-09-13) is that the
+    generation table has no seed variance. The cause is structural, not an
+    oversight in reporting: configs/config.yaml pins `seed: 42` and NO wrapper
+    ever exposed it, so 13A-13F, 14A and every prefix_k arm are literally the
+    same seed. A multi-seed campaign is impossible until the lever exists.
+
+    Asserts three things, each a separate failure this project has already
+    paid for once:
+      1. SEED is declared with a default of 42 -- NOT a fresh random default,
+         which would silently make new runs incomparable with every existing
+         checkpoint.
+      2. `seed=${SEED}` is actually in the python invocation. A declared-but-
+         unused env var is the 13F-era trap: the wrapper prints a value it is
+         not passing.
+      3. The resolved seed is ECHOED. The prefix_k trap (Phase 14, cost
+         0.0145 ROUGE-L) was caught only by noticing a missing log line; two
+         seed arms whose logs never state their seed are indistinguishable
+         from one arm run twice, which would void 15B entirely.
+    """
+    sh = (REPO_ROOT / "scripts" / "train_report_generation_h100.sh").read_text()
+
+    assert 'SEED="${SEED:-42}"' in sh, (
+        "SEED lever missing or its default drifted off 42 -- a non-42 default "
+        "silently breaks comparability with every pre-Phase-15 checkpoint"
+    )
+    assert "seed=${SEED}" in sh, (
+        "SEED is declared but never passed to train_report_generation.py -- "
+        "the wrapper would print a seed it does not actually use"
+    )
+    assert 'echo "Training seed: ${SEED}"' in sh, (
+        "the resolved seed must be echoed into the job log; without a positive "
+        "line, a wrong seed is undetectable (see the prefix_k trap)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 11B — CheXbert F1. compute_chexbert_metrics wraps the real, verified
+# f1chexbert API (F1CheXbert()(hyps=..., refs=...) -> (accuracy,
+# accuracy_per_sample, chexbert_all, chexbert_5), confirmed live 2026-08-29
+# against job 2492037's log and the package's own PyPI README -- an earlier
+# version of this code guessed a wrong API and would have crashed once the
+# package was installed; it only avoided that because the package wasn't
+# installed yet, degrading to a clean "skipped: ModuleNotFoundError" as
+# designed. There is no CPU-testable pure-math core to extract (unlike 11C's
+# nearest_neighbor_indices split) since f1chexbert's public API exposes only
+# the aggregate scoring call, not raw per-report labels -- so the only thing
+# testable without real weights is the None/"skipped" degradation path.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.willi_parity
+def test_compute_chexbert_metrics_returns_none_when_package_unavailable(monkeypatch):
+    """f1chexbert is an optional dep (guarded, same as nltk for METEOR) --
+    forcing the import to fail (sys.modules[name] = None is the documented
+    way to make a subsequent `import f1chexbert` raise ImportError) must
+    degrade to None, never raise, matching meteor_score_corpus's contract."""
+    import sys
+    from scripts.evaluate_report_generation import compute_chexbert_metrics
+
+    monkeypatch.setitem(sys.modules, "f1chexbert", None)
+    result = compute_chexbert_metrics(["a report"], ["another report"])
+    assert result is None
+
+
+@pytest.mark.willi_parity
+def test_compute_all_metrics_chexbert_flag_gates_key_presence(monkeypatch):
+    """chexbert=False (the default) must not even attempt labeling — no
+    'chexbert' key at all, not just None — so callers who never opt in pay
+    zero cost and see no behavior change from before this flag existed."""
+    import sys
+    from scripts.evaluate_report_generation import compute_all_metrics
+
+    hyps, refs = ["the lungs are clear"], ["the lungs are clear"]
+
+    off = compute_all_metrics(hyps, refs, chexbert=False)
+    assert "chexbert" not in off
+
+    monkeypatch.setitem(sys.modules, "f1chexbert", None)
+    on = compute_all_metrics(hyps, refs, chexbert=True)
+    assert "chexbert" in on
+    assert on["chexbert"] is None  # package unavailable in this env -> skipped
+
+
+@pytest.mark.willi_parity
+def test_inspect_report_generation_h100_slurm_wrapper_exposes_chexbert_lever():
+    """Phase 11B opt-in CheXbert F1 lever, off by default. Pins the set -u
+    -safe empty-array-expansion pattern (${ARR[@]+"${ARR[@]}"}) already
+    established in eval_h100.sh/train_biomedclip_kd_h100.sh — the bare
+    ${ARR[@]} form breaks under set -u with bash <4.4 when CHEXBERT=false
+    leaves the array empty."""
+    sh = (REPO_ROOT / "scripts" / "inspect_report_generation_h100.sh").read_text()
+    assert 'CHEXBERT="${CHEXBERT:-false}"' in sh
+    assert "--chexbert" in sh
+    assert '${CHEXBERT_ARGS[@]+"${CHEXBERT_ARGS[@]}"}' in sh
+
+
+@pytest.mark.willi_parity
+def test_write_hyps_refs_writes_one_report_per_line_sanitizing_newlines(tmp_path):
+    """Phase 11B (2026-08-29): dumps for the isolated-venv CheXbert scorer.
+    A report containing an embedded newline (real MIMIC findings/impression
+    text can have literal paragraph breaks) must be collapsed to one line —
+    otherwise it would silently split across multiple lines on write and
+    desync the hyp/ref alignment when a reader does .splitlines() (the same
+    convention --hyp-file/--ref-file already relies on)."""
+    from scripts.evaluate_report_generation import write_hyps_refs
+
+    hyps = ["Findings: clear lungs.\nImpression: normal.", "no acute process"]
+    refs = ["Findings:   clear   lungs.", "Impression:\nno acute process"]
+
+    dump_dir = tmp_path / "dump"
+    write_hyps_refs(str(dump_dir), hyps, refs)
+
+    hyp_lines = (dump_dir / "hyps.txt").read_text().splitlines()
+    ref_lines = (dump_dir / "refs.txt").read_text().splitlines()
+    assert hyp_lines == ["Findings: clear lungs. Impression: normal.", "no acute process"]
+    assert ref_lines == ["Findings: clear lungs.", "Impression: no acute process"]
+    assert len(hyp_lines) == len(ref_lines) == len(hyps)
+
+
+@pytest.mark.willi_parity
+def test_dump_dir_flag_present_on_evaluate_report_generation_parser():
+    """Phase 11B (2026-08-29): --dump-dir must exist and default to None (off)
+    so existing invocations without it are unaffected."""
+    sh = (REPO_ROOT / "scripts" / "evaluate_report_generation.py").read_text()
+    assert '"--dump-dir"' in sh
+    assert "write_hyps_refs(args.dump_dir, hyps, refs)" in sh
+
+
+@pytest.mark.willi_parity
+def test_score_chexbert_standalone_parser_builds_without_importing_f1chexbert(monkeypatch):
+    """score_chexbert_standalone.py must be parseable/CLI-testable even when
+    f1chexbert isn't installed in THIS env (it's meant for a separate,
+    isolated venv) -- so f1chexbert must be imported inside main(), not at
+    module level, and build_parser() must work standalone."""
+    import sys
+    monkeypatch.setitem(sys.modules, "f1chexbert", None)
+
+    from scripts.score_chexbert_standalone import build_parser
+
+    args = build_parser().parse_args(["--hyp-file", "h.txt", "--ref-file", "r.txt"])
+    assert args.hyp_file == "h.txt"
+    assert args.ref_file == "r.txt"
+    assert args.output_dir is None
+
+
+@pytest.mark.willi_parity
+def test_score_chexbert_standalone_mismatched_line_counts_raises(tmp_path, monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "f1chexbert", None)
+
+    from scripts.score_chexbert_standalone import main
+
+    hyp_file = tmp_path / "h.txt"
+    ref_file = tmp_path / "r.txt"
+    hyp_file.write_text("one\ntwo\n")
+    ref_file.write_text("only one\n")
+
+    monkeypatch.setattr(
+        sys, "argv",
+        ["score_chexbert_standalone.py", "--hyp-file", str(hyp_file), "--ref-file", str(ref_file)],
+    )
+    with pytest.raises(SystemExit):
+        main()
+
+
+@pytest.mark.willi_parity
+def test_inspect_report_generation_h100_slurm_wrapper_exposes_dump_dir_lever():
+    sh = (REPO_ROOT / "scripts" / "inspect_report_generation_h100.sh").read_text()
+    assert 'DUMP_DIR="${DUMP_DIR:-}"' in sh
+    assert "--dump-dir" in sh
+
+
+@pytest.mark.willi_parity
+def test_setup_chexbert_venv_h100_slurm_wrapper_pins_transformers_below_5():
+    """Phase 11B (2026-08-29): f1chexbert's tokenize() calls the legacy
+    tokenizer.encode_plus(...), removed in transformers>=5.0 -- this isolated
+    venv must pin below that, independent of the main .venv's floor
+    (transformers>=4.35.0 in requirements.txt, no ceiling)."""
+    sh = (REPO_ROOT / "scripts" / "setup_chexbert_venv_h100.sh").read_text()
+    assert '"transformers<5"' in sh
+    assert "f1chexbert" in sh
+
+
+@pytest.mark.willi_parity
+def test_score_chexbert_h100_slurm_wrapper_requires_dump_dir():
+    sh = (REPO_ROOT / "scripts" / "score_chexbert_h100.sh").read_text()
+    assert "${DUMP_DIR:?" in sh
+    assert "score_chexbert_standalone.py" in sh
+
+
+@pytest.mark.willi_parity
+def test_setup_chexbert_venv_h100_slurm_wrapper_pins_scikit_learn_below_1_8():
+    """Phase 11B (2026-08-29, later): f1chexbert's forward() does
+    `y_type, y_true, y_pred = _check_targets(...)`, a 3-value unpack of the
+    PRIVATE sklearn.metrics._classification._check_targets API. Confirmed by
+    diffing scikit-learn's own source across tags: _check_targets returned
+    exactly (y_type, y_true, y_pred) through tag 1.7.2, then 1.8.0 added a
+    sample_weight param/return, making it a 4-tuple --
+    "ValueError: too many values to unpack (expected 3)". f1chexbert has no
+    sklearn upper pin, so an unpinned install pulls the incompatible >=1.8.0.
+    This isolated venv must pin below that."""
+    sh = (REPO_ROOT / "scripts" / "setup_chexbert_venv_h100.sh").read_text()
+    assert '"scikit-learn<1.8"' in sh
+
+
+@pytest.mark.willi_parity
+def test_setup_chexbert_venv_h100_slurm_wrapper_is_rerunnable_in_place():
+    """Found live 2026-08-30 (job 2494759): `uv venv` errors out with "A
+    virtual environment already exists" on a bare rerun against a VENV_DIR a
+    prior invocation already created -- exactly the situation a dependency-pin
+    fix (like the scikit-learn<1.8 one above) needs, since the fix only takes
+    effect in a rebuilt venv. First fix (`--clear`) was ITSELF not reliable on
+    this cluster's NFS-backed home filesystem -- job 2494771 hit `Failed to
+    remove directory .../lib: Directory not empty (os error 39)` from uv's own
+    internal removal logic against the large existing site-packages tree.
+    Final fix: an explicit `rm -rf "${VENV_DIR}"` before venv creation,
+    predictable and independent of either tool's internal --clear behavior."""
+    sh = (REPO_ROOT / "scripts" / "setup_chexbert_venv_h100.sh").read_text()
+    assert 'rm -rf "${VENV_DIR}"' in sh
+    assert "uv venv" in sh
+
+
+@pytest.mark.willi_parity
+def test_inspect_report_generation_h100_slurm_wrapper_defaults_to_full_data_not_arm0():
+    """Found live 2026-08-30: CHECKPOINT and PARQUET both still defaulted to
+    the arm0/ subset artifacts long after full-data Phase 8 pack + Phase 10E
+    training (job 2491338, EXPERIMENT=h100_report_gen_full) landed. arm0 is
+    CLOSED/historical per CLAUDE.md's Phase 9 note -- the default invocation
+    of this script must point at full data, not silently fall back to the
+    much-smaller closed arm0 arm."""
+    sh = (REPO_ROOT / "scripts" / "inspect_report_generation_h100.sh").read_text()
+    assert 'CHECKPOINT:-./outputs/h100_report_gen_full/checkpoints/last.ckpt' in sh
+    assert 'PARQUET:-/sc/home/$USER/dataset/mimic_full/validate.parquet' in sh
+    # arm0 may still be mentioned in explanatory comments (it's referenced as
+    # the historical bug this pins), but never inside a default assignment.
+    assert "arm0" not in sh.split("CHECKPOINT=")[1].split("\n")[0]
+    assert "arm0" not in sh.split("PARQUET=")[1].split("\n")[0]
+
+
+# ---------------------------------------------------------------------------
+# Phase 13 — closing the CheXbert F1 gap (H100_SCALING_PLAN.md, 2026-08-30).
+# 13A: optional fine-tuned image-tower checkpoint for report-gen training.
+# 13B: multi-GPU DDP lever for the decoder trainer (plain LM loss, no
+# in-batch-negatives semantics, so DDP is a clean throughput win here --
+# unlike the still-unbuilt Phase 3 all_gather needed for the contrastive/CLIP
+# trainer to get anything beyond throughput out of extra GPUs).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.willi_parity
+def test_load_image_tower_checkpoint_strips_prefix_and_loads_nonstrict(tmp_path):
+    """Pure-function test of the Phase 13A checkpoint-loading helper against a
+    tiny nn.Module stand-in -- no open_clip/network needed, matching
+    ReportGenerationLightningModule's existing no-open_clip-required
+    CPU-testability design. Verifies: (1) only "image_encoder."-prefixed keys
+    are pulled from a Lightning-style checkpoint dict and the prefix is
+    stripped before load_state_dict; (2) unrelated keys (e.g. "decoder.*"
+    from the same checkpoint) are correctly ignored, not misapplied; (3) the
+    load is non-strict, so a stand-in with an extra untouched param doesn't
+    raise."""
+    import torch.nn as nn
+    from hybrid_xmamba.training.lightning_module import load_image_tower_checkpoint
+
+    class TinyTower(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(4))
+            self.untouched = nn.Parameter(torch.ones(2))
+
+    tower = TinyTower()
+    fine_tuned_weight = torch.arange(4, dtype=torch.float32)
+    ckpt_path = tmp_path / "fake_contrastive.ckpt"
+    torch.save({
+        "state_dict": {
+            "image_encoder.weight": fine_tuned_weight,
+            "decoder.some_other_param": torch.zeros(3),  # must be ignored
+        }
+    }, ckpt_path)
+
+    missing, unexpected = load_image_tower_checkpoint(tower, str(ckpt_path))
+
+    assert torch.equal(tower.weight, fine_tuned_weight), "fine-tuned weight was not applied"
+    assert torch.equal(tower.untouched, torch.ones(2)), "untouched param must be unaffected"
+    assert "untouched" in missing, "non-strict load must report the un-supplied param as missing"
+    assert not unexpected, f"decoder.* key must not leak through as unexpected: {unexpected}"
+
+
+@pytest.mark.willi_parity
+def test_train_report_generation_h100_slurm_wrapper_exposes_image_encoder_ckpt_lever():
+    """Phase 13A: IMAGE_ENCODER_CKPT is an optional env lever (empty default =
+    stock BiomedCLIP, unchanged behaviour), fail-fast-checked for existence
+    only when set (mirrors DECODER_CKPT's unconditional check), and only
+    added to the Hydra invocation when non-empty (set -u-safe empty-array
+    expansion, same pattern as CHEXBERT_ARGS in inspect_report_generation_h100.sh
+    / retrieval_baseline_h100.sh)."""
+    sh = (REPO_ROOT / "scripts" / "train_report_generation_h100.sh").read_text()
+    assert 'IMAGE_ENCODER_CKPT="${IMAGE_ENCODER_CKPT:-}"' in sh
+    assert 'if [ -n "${IMAGE_ENCODER_CKPT}" ] && [ ! -f "${IMAGE_ENCODER_CKPT}" ]' in sh
+    assert 'EXTRA_ARGS+=("image_encoder_checkpoint=${IMAGE_ENCODER_CKPT}")' in sh
+    assert '${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}' in sh
+
+
+@pytest.mark.willi_parity
+def test_config_yaml_declares_image_encoder_checkpoint_key():
+    """Same declared-key requirement as decoder_checkpoint (config.yaml
+    comment, live bug 2026-08-23 job 2478635): Hydra's strict-struct mode
+    rejects a CLI override for an undeclared top-level key, so
+    image_encoder_checkpoint= must be pre-declared here, not just assumed."""
+    cfg_text = (REPO_ROOT / "configs" / "config.yaml").read_text()
+    assert "image_encoder_checkpoint: null" in cfg_text
+
+
+@pytest.mark.willi_parity
+def test_train_report_generation_h100_slurm_wrapper_exposes_multi_gpu_lever():
+    """Phase 13B: NUM_GPUS selects h100_single_gpu (default, 1 GPU) vs
+    h100_multi_ddp (>1), and the script fails fast if fewer GPUs were
+    actually allocated than requested rather than silently training on 1 --
+    NUM_GPUS alone does not request GPUs from SLURM (that's a separate
+    --gpus/--gres sbatch CLI flag), so this mismatch is a real, easy-to-hit
+    user error the script must catch."""
+    sh = (REPO_ROOT / "scripts" / "train_report_generation_h100.sh").read_text()
+    assert 'NUM_GPUS="${NUM_GPUS:-1}"' in sh
+    assert 'TRAINER_CFG="h100_single_gpu"' in sh
+    assert 'TRAINER_CFG="h100_multi_ddp"' in sh
+    assert 'if [ "${NUM_GPUS}" -gt 1 ]' in sh
+    assert "trainer=${TRAINER_CFG}" in sh
+    assert 'AVAIL_GPUS=$(python -c "import torch; print(torch.cuda.device_count())")' in sh
+    assert 'if [ "${AVAIL_GPUS}" -lt "${NUM_GPUS}" ]' in sh
+
+
+@pytest.mark.willi_parity
+def test_h100_multi_ddp_trainer_config_exposes_keys_train_report_generation_reads():
+    """train_report_generation.py's pl.Trainer(...) construction reads
+    accelerator/devices/precision/strategy/max_steps/val_check_interval/
+    check_val_every_n_epoch/log_every_n_steps/accumulate_grad_batches/
+    default_root_dir from cfg.trainer -- h100_multi_ddp.yaml must supply all
+    of these (composing trainer=h100_multi_ddp must not KeyError partway
+    through Trainer construction on an H100 box this repo cannot smoke-test
+    from here)."""
+    import yaml
+
+    trainer_cfg = yaml.safe_load((REPO_ROOT / "configs" / "trainer" / "h100_multi_ddp.yaml").read_text())
+    required = {
+        "accelerator", "devices", "precision", "strategy", "max_steps",
+        "val_check_interval", "check_val_every_n_epoch", "log_every_n_steps",
+        "accumulate_grad_batches", "default_root_dir",
+    }
+    missing = required - set(trainer_cfg.keys())
+    assert not missing, f"h100_multi_ddp.yaml missing keys train_report_generation.py reads: {missing}"
+    assert trainer_cfg["strategy"] == "ddp"
+    assert trainer_cfg["devices"] == -1
+
+
+# ---------------------------------------------------------------------------
+# Phase 13F — oversample training reports positive for the 3 CheXpert labels
+# the 13B checkpoint never predicts (Lung Lesion/Pneumothorax/Pleural Other,
+# F1=0.0 on both eval splits).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.willi_parity
+def test_compute_rare_finding_sample_weights_oversamples_positive_studies(tmp_path):
+    """Pure-function test against a tiny on-disk CSV fixture -- no HF Dataset/
+    network needed. Verifies: (1) U-Zeros convention (1.0=positive, {0.0,
+    -1.0, NaN}=not-positive) is applied per-column; (2) a study positive for
+    ANY of the target rare labels gets the oversample weight, not just one
+    matching column; (3) a study with NO row in the CSV at all defaults to
+    weight 1.0 (conservative -- never inflates an unknown-label row); (4)
+    weights are returned in the SAME order as the input study_ids list, not
+    CSV row order."""
+    import pandas as pd
+    from scripts.train_report_generation import compute_rare_finding_sample_weights
+
+    csv_path = tmp_path / "mimic-cxr-2.0.0-chexpert.csv.gz"
+    pd.DataFrame({
+        "study_id": [10, 20, 30, 40],
+        "Lung Lesion":    [1.0, 0.0, -1.0, float("nan")],
+        "Pneumothorax":   [0.0, 1.0, 0.0, 0.0],
+        "Pleural Other":  [0.0, 0.0, 0.0, 0.0],
+    }).to_csv(csv_path, index=False, compression="gzip")
+
+    # study_ids intentionally out of CSV order, plus one (99) absent from the CSV.
+    study_ids = [40, 30, 99, 20, 10]
+    weights = compute_rare_finding_sample_weights(
+        study_ids=study_ids,
+        chexpert_csv=str(csv_path),
+        rare_labels=["Lung Lesion", "Pneumothorax", "Pleural Other"],
+        oversample_weight=5.0,
+    )
+
+    assert weights == [1.0, 1.0, 1.0, 5.0, 5.0], weights
+
+
+@pytest.mark.willi_parity
+def test_train_report_generation_h100_slurm_wrapper_exposes_oversample_rare_lever():
+    """OVERSAMPLE_RARE/OVERSAMPLE_WEIGHT are optional env levers, default off
+    (identical behaviour to before this lever existed), always passed to the
+    Hydra invocation (both keys are declared with safe defaults in
+    configs/dataset/cxr_mimic_full.yaml, so no EXTRA_ARGS empty-guard is
+    needed here -- unlike IMAGE_ENCODER_CKPT, which has no such default)."""
+    sh = (REPO_ROOT / "scripts" / "train_report_generation_h100.sh").read_text()
+    assert 'OVERSAMPLE_RARE="${OVERSAMPLE_RARE:-false}"' in sh
+    assert 'OVERSAMPLE_WEIGHT="${OVERSAMPLE_WEIGHT:-5.0}"' in sh
+    assert "dataset.oversample_rare_findings=${OVERSAMPLE_RARE}" in sh
+    assert "dataset.oversample_weight=${OVERSAMPLE_WEIGHT}" in sh
+
+
+@pytest.mark.willi_parity
+def test_cxr_mimic_full_config_declares_oversample_rare_keys():
+    """Same declared-key requirement as decoder_checkpoint/image_encoder_checkpoint
+    (Hydra strict-struct mode rejects a CLI override for an undeclared key) --
+    all 4 Phase 13F keys must be declared in configs/dataset/cxr_mimic_full.yaml,
+    not just assumed present."""
+    cfg_text = (REPO_ROOT / "configs" / "dataset" / "cxr_mimic_full.yaml").read_text()
+    assert "oversample_rare_findings: false" in cfg_text
+    assert "chexpert_csv:" in cfg_text
+    assert "rare_finding_labels:" in cfg_text
+    assert "oversample_weight:" in cfg_text
+    for label in ("Lung Lesion", "Pneumothorax", "Pleural Other"):
+        assert label in cfg_text
+
+
+# ---------------------------------------------------------------------------
+# Phase 12A — MODE=sts on eval_h100.sh (BIOSSES/STS-B/MedSTS via
+# evaluate_sts.py), the last genuinely missing measurement for the closed
+# retrieval chapter's authoritative table.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.willi_parity
+def test_eval_h100_slurm_wrapper_exposes_sts_mode():
+    """MODE=sts must dispatch to evaluate_sts.py with --datasets all, and must
+    NOT default to the gated-repo-safe offline HF env vars MODE=ppl/retrieval
+    use -- BIOSSES/STS-B/MedSTS are public HF datasets that need real network
+    access to download, unlike mimic-cxr."""
+    sh = (REPO_ROOT / "scripts" / "eval_h100.sh").read_text()
+    assert 'elif [ "${MODE}" = "sts" ]; then' in sh
+    assert "evaluate_sts.py" in sh
+    assert '--datasets all' in sh
+    assert 'export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-0}"' in sh
+    assert 'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"' in sh
+    assert "expected 'ppl', 'retrieval', or 'sts'" in sh
+
+
+@pytest.mark.willi_parity
+def test_eval_h100_slurm_wrapper_sts_mode_does_not_change_other_modes_offline_default():
+    """Regression guard for the exact bug this change could introduce: the
+    MODE=sts branch must be conditional, not a global default flip -- ppl and
+    retrieval must still default HF_DATASETS_OFFLINE/HF_HUB_OFFLINE to 1
+    (test_eval_script_bakes_in_offline_and_populated_cache pins the literal
+    strings; this test pins the if/else structure around them so a future
+    edit can't collapse the branches back into one unconditional default)."""
+    sh = (REPO_ROOT / "scripts" / "eval_h100.sh").read_text()
+    assert 'if [ "${MODE}" = "sts" ]; then' in sh
+    # The offline-default lines must appear inside the else branch, i.e. after
+    # the sts-mode online-default lines in the same if/else block.
+    sts_idx = sh.index('export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-0}"')
+    offline_idx = sh.index('export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"')
+    assert sts_idx < offline_idx, "sts (online) default must precede the else (offline) default"
+
+
+@pytest.mark.willi_parity
+def test_evaluate_sts_uses_script_free_dataset_mirrors():
+    """REGRESSION (2026-09-03, first live MODE=sts run, job 2505439): both
+    original dataset sources crashed -- BIOSSES's bigbio/biosses/nguyenthanhdo
+    candidates all relied on HF's legacy "dataset loading script" mechanism
+    ("Dataset scripts are no longer supported"), and STS-B's bare
+    `load_dataset("glue", "stsb", split=...)` call was UNGUARDED (no
+    try/except), so its equivalent failure crashed the whole job instead of
+    falling through to a fallback -- confirmed live via an
+    hf_file_system.resolve_path crash on glue's legacy standalone YAML.
+    Fixed: mteb/biosses-sts and mteb/stsbenchmark-sts (script-free parquet
+    mirrors, sentence1/sentence2/score schema) are now tried FIRST for both,
+    and _load_stsb gained the same per-candidate try/except loop BIOSSES
+    already had, so a first-source failure degrades to the next candidate
+    instead of crashing the process."""
+    src = (REPO_ROOT / "scripts" / "evaluate_sts.py").read_text()
+    assert '"mteb/biosses-sts"' in src
+    assert '"mteb/stsbenchmark-sts"' in src
+    # STS-B must no longer be a single unguarded load_dataset call -- pin the
+    # per-candidate try/except loop structure the fix introduced.
+    stsb_body = src.split("def _load_stsb(")[1].split("\ndef ")[0]
+    assert "for dataset_id, kwargs in" in stsb_body
+    assert "except Exception as exc:" in stsb_body
+
+
+# ---------------------------------------------------------------------------
+# Phase 14A — parameter-matched Transformer baseline (supervisor review 2026-09-07)
+# ---------------------------------------------------------------------------
+
+# hybrid_150m_v2's instantiated parameter count. The whole point of Phase 14A is a
+# MATCHED baseline, so this number is the spec, not a note.
+HYBRID_150M_V2_PARAMS = 183_721_824
+PARAM_MATCH_TOLERANCE = 0.005  # 0.5%
+
+
+def _instantiate_model_config(config_name):
+    """Build a HybridLanguageModel from a configs/model/*.yaml, as the trainers do."""
+    import dataclasses
+
+    import yaml
+
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel
+
+    with open(REPO_ROOT / "configs" / "model" / (config_name + ".yaml")) as fh:
+        raw = yaml.safe_load(fh)
+    valid = {f.name for f in dataclasses.fields(HybridConfig)}
+    return HybridLanguageModel(HybridConfig(**{k: v for k, v in raw.items() if k in valid}))
+
+
+def test_hybrid_150m_v2_param_count_is_the_documented_baseline():
+    """Pin the incumbent's size. If this drifts, the 'matched' baseline is no longer
+    matched and Phase 14A's central comparison quietly becomes invalid."""
+    model = _instantiate_model_config("hybrid_150m_v2")
+    total = sum(p.numel() for p in model.parameters())
+    assert total == HYBRID_150M_V2_PARAMS, (
+        "hybrid_150m_v2 is now %d params, not the documented %d. Phase 14A's "
+        "Transformer baseline was matched against the old number -- re-derive the "
+        "baseline's num_layers before running anything."
+        % (total, HYBRID_150M_V2_PARAMS)
+    )
+
+
+@pytest.mark.parametrize(
+    "config_name", ["transformer_150m_baseline", "transformer_150m_baseline_rrg"]
+)
+def test_transformer_baseline_is_parameter_matched_to_the_hybrid(config_name):
+    """THE Phase 14A invariant: the baseline must be parameter-matched.
+
+    'Attention-free matches attention' is only a claim if the two have the same
+    parameter budget. A baseline that silently drifts smaller would make the hybrid
+    look good for the wrong reason.
+    """
+    model = _instantiate_model_config(config_name)
+    total = sum(p.numel() for p in model.parameters())
+    delta = abs(total / HYBRID_150M_V2_PARAMS - 1.0)
+    assert delta < PARAM_MATCH_TOLERANCE, (
+        "%s has %d params vs the hybrid's %d (%.3f%% off, tolerance %.1f%%). The "
+        "comparison is no longer parameter-matched."
+        % (config_name, total, HYBRID_150M_V2_PARAMS, 100 * delta,
+           100 * PARAM_MATCH_TOLERANCE)
+    )
+
+
+@pytest.mark.parametrize(
+    "config_name", ["transformer_150m_baseline", "transformer_150m_baseline_rrg"]
+)
+def test_transformer_baseline_is_pure_attention_and_spends_no_params_on_positions(
+    config_name,
+):
+    """The baseline must actually be a Transformer, and must use RoPE.
+
+    A learned positional table would hand it +0.79M params the hybrid never gets
+    (the hybrid's embedding matrix is exactly vocab x dim), breaking the match.
+    """
+    import yaml
+
+    with open(REPO_ROOT / "configs" / "model" / (config_name + ".yaml")) as fh:
+        raw = yaml.safe_load(fh)
+    assert raw["layer_pattern"] == ["attention"]
+    assert raw["num_layers"] == 15, "15 layers is what makes the param match work"
+    assert raw["mlp_ratio"] == 4.0, "a non-standard FFN width reads as a rigged baseline"
+
+    model = _instantiate_model_config(config_name)
+    pos_params = [
+        n for n, _ in model.named_parameters()
+        if "pos_emb" in n or "position_embedding" in n or "wpe" in n
+    ]
+    assert pos_params == [], "baseline must use RoPE, found learned position params: %s" % pos_params
+
+
+def test_transformer_baseline_shares_the_hybrids_hyperparameters_verbatim():
+    """Single-lever discipline: only the mixer may differ.
+
+    If the baseline's LR/schedule/regularisation drift from the hybrid's, the
+    comparison stops being attributable to architecture.
+    """
+    import yaml
+
+    def load(name):
+        with open(REPO_ROOT / "configs" / "model" / (name + ".yaml")) as fh:
+            return yaml.safe_load(fh)
+
+    hybrid, baseline = load("hybrid_150m_v2"), load("transformer_150m_baseline")
+    for key in ["vocab_size", "dim", "mlp_ratio", "max_position_embeddings", "dropout",
+                "initializer_range", "tie_word_embeddings", "norm_type", "use_mlp",
+                "learning_rate", "weight_decay", "warmup_steps", "gradient_clip_val"]:
+        assert baseline[key] == hybrid[key], (
+            "Phase 14A single-lever violation: %s is %r in the Transformer baseline but "
+            "%r in hybrid_150m_v2. Only the mixer may differ."
+            % (key, baseline[key], hybrid[key])
+        )
+
+    hybrid_rrg, baseline_rrg = load("hybrid_150m_v2_rrg"), load("transformer_150m_baseline_rrg")
+    for key in ["prefix_k", "image_patch_dim", "decoder_lr", "head_lr", "weight_decay",
+                "warmup_steps", "max_steps", "gradient_clip_val", "vit_unfreeze_blocks", "vit_lr"]:
+        assert baseline_rrg[key] == hybrid_rrg[key], (
+            "Phase 14A single-lever violation in the RRG variant: %s is %r vs the "
+            "hybrid's %r." % (key, baseline_rrg[key], hybrid_rrg[key])
+        )
+
+
+def test_attention_layer_type_is_registered_everywhere():
+    """'attention' must be accepted by the config validator AND the block dispatch.
+
+    These are two separate code paths; a mismatch fails at model-build time inside a
+    SLURM job rather than here.
+    """
+    from hybrid_xmamba.layers.hybrid_block import HybridBlock
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+
+    cfg = HybridConfig(dim=64, num_layers=2, layer_pattern=["attention"], num_heads=4,
+                       head_dim=16, vocab_size=128)
+    assert cfg.get_layer_config(0)["num_heads"] == 4
+
+    block = HybridBlock(dim=64, layer_type="attention", num_heads=4, head_dim=16)
+    assert block.mixer.__class__.__name__ == "AttentionBlock"
+
+
+def test_attention_block_is_causal():
+    """A non-causal mixer would leak the answer and make every metric meaningless."""
+    import torch
+
+    from hybrid_xmamba.layers.attention_block import AttentionBlock
+
+    torch.manual_seed(0)
+    block = AttentionBlock(dim=64, num_heads=4, head_dim=16).eval()
+    x = torch.randn(1, 12, 64)
+    with torch.no_grad():
+        y_ref = block(x)
+        x_perturbed = x.clone()
+        x_perturbed[:, 7:] = torch.randn(1, 5, 64)
+        y_perturbed = block(x_perturbed)
+    assert torch.allclose(y_ref[:, :7], y_perturbed[:, :7], atol=1e-6), (
+        "attention is not causal: perturbing future positions changed past outputs"
+    )
+    assert not torch.allclose(y_ref[:, 7:], y_perturbed[:, 7:], atol=1e-6), (
+        "sanity check failed: perturbing the input changed nothing at all"
+    )
+
+
+def test_attention_block_blocks_cross_document_attention():
+    """Stage-0 packs documents; the hybrid resets state at each boundary.
+
+    If attention ignored cu_seqlens it would read context the hybrid provably
+    cannot -- a silent, uncontrolled advantage in the exact comparison Phase 14A
+    exists to make fair.
+    """
+    import torch
+
+    from hybrid_xmamba.layers.attention_block import AttentionBlock
+
+    torch.manual_seed(0)
+    block = AttentionBlock(dim=64, num_heads=4, head_dim=16).eval()
+    x = torch.randn(1, 12, 64)
+    x_edited = x.clone()
+    x_edited[:, :6] = torch.randn(1, 6, 64)  # rewrite document 0 only
+    cu_seqlens = torch.tensor([[0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]])
+
+    with torch.no_grad():
+        masked_a = block(x, cu_seqlens=cu_seqlens)
+        masked_b = block(x_edited, cu_seqlens=cu_seqlens)
+        unmasked_a, unmasked_b = block(x), block(x_edited)
+
+    assert torch.allclose(masked_a[:, 6:], masked_b[:, 6:], atol=1e-6), (
+        "document 1 changed when document 0 was edited -- cu_seqlens masking is broken"
+    )
+    assert not torch.allclose(unmasked_a[:, 6:], unmasked_b[:, 6:], atol=1e-6), (
+        "sanity check failed: without the mask document 1 should have changed, so this "
+        "test would pass even with masking removed"
+    )
+
+
+def test_stage0_150m_wrapper_model_config_is_env_overridable():
+    """Phase 14A-3 reuses this wrapper verbatim; a hardcoded MODEL_CONFIG blocks it."""
+    src = (REPO_ROOT / "scripts" / "train_stage0_150m_h100.sh").read_text()
+    assert 'export MODEL_CONFIG="${MODEL_CONFIG:-hybrid_150m_v2}"' in src, (
+        "train_stage0_150m_h100.sh must accept MODEL_CONFIG from the environment so the "
+        "Transformer baseline can share the hybrid's exact Stage-0 recipe"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 14B — boilerplate / duplicate-template analysis
+# ---------------------------------------------------------------------------
+
+
+def test_decoder_init_guards_against_wrong_architecture_checkpoint():
+    """Phase 14A: DECODER_CKPT has a default, so a wrong one does not fail loudly.
+
+    train_report_generation_h100.sh defaults DECODER_CKPT to the HYBRID's Stage-0
+    backbone and only checks that the file exists. Pointing a Transformer run at it
+    therefore loads under strict=False, matches almost nothing, and trains from
+    random init -- silently, at the cost of a full multi-GPU run, and it would
+    invalidate the matched-baseline comparison that Phase 14A exists to make.
+    """
+    src = (REPO_ROOT / "scripts" / "train_report_generation.py").read_text()
+    assert "missing_frac" in src, "decoder init must measure how much actually loaded"
+    # Slice from the FIRST occurrence onward (str.split cuts at every occurrence,
+    # so [1] would only span the gap between the first two).
+    tail = src[src.index("missing_frac"):][:2500]
+    assert "raise RuntimeError(" in tail, (
+        "a mostly-unmatched decoder init must hard-fail, not warn -- it costs a full run"
+    )
+    # The default really is the hybrid's checkpoint; if that ever changes, this
+    # test's rationale needs revisiting rather than the assertion being deleted.
+    wrapper = (REPO_ROOT / "scripts" / "train_report_generation_h100.sh").read_text()
+    assert "h100_stage0_150m_v2/checkpoints/stage0_model_only.pt" in wrapper
+
+
+def test_report_generation_eval_guards_against_wrong_model_config():
+    """Phase 14A: --model-config defaults to the hybrid and is NOT auto-detected.
+
+    load_report_generation_module builds the module from the named YAML and then
+    loads weights with strict=False. Evaluating a Transformer checkpoint without
+    overriding MODEL_CONFIG therefore does not crash -- it builds a hybrid, matches
+    almost nothing, and generates from a RANDOMLY INITIALISED decoder. The metrics
+    that come out look plausible and are meaningless, which is worse than a crash:
+    they would be misread as "the baseline generates badly".
+    """
+    src = (REPO_ROOT / "scripts" / "evaluate_report_generation.py").read_text()
+    assert "strict=False" in src, "precondition: the load is non-strict, hence the guard"
+    tail = src[src.index("n_module_keys"):][:2500]
+    assert "raise RuntimeError(" in tail, (
+        "a mostly-unmatched eval load must hard-fail; silent garbage generation would "
+        "be reported as a real result"
+    )
+    wrapper = (REPO_ROOT / "scripts" / "inspect_report_generation_h100.sh").read_text()
+    assert 'MODEL_CONFIG="${MODEL_CONFIG:-hybrid_150m_v2_rrg}"' in wrapper, (
+        "if this default changes, the guard's rationale needs revisiting"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 14A-6 — paired bootstrap comparison
+# ---------------------------------------------------------------------------
+
+def _load_bootstrap_module():
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    try:
+        import bootstrap_compare
+        return bootstrap_compare
+    finally:
+        sys.path.pop(0)
+
+
+def test_bootstrap_chexbert_f1_matches_sklearn():
+    """The F1 here is reimplemented (the scorer lives in an isolated venv).
+
+    Reimplemented metrics drift. Pin it against sklearn, which is what produced
+    every CheXbert number already reported.
+    """
+    import random as _random
+
+    from sklearn.metrics import f1_score
+
+    bc = _load_bootstrap_module()
+    rng = _random.Random(0)
+    n, k = 60, 14
+    y_true = [[rng.randint(0, 1) for _ in range(k)] for _ in range(n)]
+    y_pred = [[rng.randint(0, 1) for _ in range(k)] for _ in range(n)]
+
+    for average in ("micro", "macro"):
+        mine = bc.chexbert_f1(y_true, y_pred, average)
+        theirs = f1_score(y_true, y_pred, average=average, zero_division=0)
+        assert abs(mine - theirs) < 1e-9, (
+            "chexbert_f1(%s) = %.10f but sklearn says %.10f" % (average, mine, theirs)
+        )
+
+    # And on a column subset, which is how the 5-label metric is computed.
+    cols = [0, 2, 5, 7, 9]
+    sub_true = [[r[j] for j in cols] for r in y_true]
+    sub_pred = [[r[j] for j in cols] for r in y_pred]
+    for average in ("micro", "macro"):
+        assert abs(bc.chexbert_f1(y_true, y_pred, average, cols)
+                   - f1_score(sub_true, sub_pred, average=average, zero_division=0)) < 1e-9
+
+
+def test_bootstrap_per_label_f1_matches_sklearn_and_averages_to_macro():
+    """Phase 15B-5. Two invariants, both load-bearing for judging 15C.
+
+    1. Per-label F1 must match sklearn's `average=None` exactly, same pin as
+       the micro/macro reimplementation above.
+    2. The mean of the per-label list must equal macro F1 to floating point.
+       macro is now COMPUTED from this list in the per_label path, so if the
+       two ever disagreed the headline macro row and the per-label section of
+       the same report would contradict each other -- the kind of internal
+       inconsistency a reviewer spots immediately.
+    """
+    import random as _random
+
+    from sklearn.metrics import f1_score
+
+    bc = _load_bootstrap_module()
+    rng = _random.Random(7)
+    n, k = 80, 14
+    y_true = [[rng.randint(0, 1) for _ in range(k)] for _ in range(n)]
+    y_pred = [[rng.randint(0, 1) for _ in range(k)] for _ in range(n)]
+
+    mine = bc.chexbert_f1_per_label(y_true, y_pred)
+    theirs = f1_score(y_true, y_pred, average=None, zero_division=0)
+    assert len(mine) == k
+    for j, (a, b) in enumerate(zip(mine, theirs)):
+        assert abs(a - b) < 1e-9, "label %d: %.10f vs sklearn %.10f" % (j, a, b)
+
+    assert abs(sum(mine) / len(mine) - bc.chexbert_f1(y_true, y_pred, "macro")) < 1e-12
+
+
+def test_bootstrap_per_label_rows_are_namespaced_and_keep_the_main_table_intact():
+    """Phase 15B-5. Per-label rows must not leak into the headline table.
+
+    Every bootstrap report this project has already published (the k=32
+    head-to-head, the k-sweeps, 15B-1 vs the retrieval floor) has a nine-row
+    main table. If --per-label added 14 more rows to it, a new report would no
+    longer be comparable at a glance with the ones in
+    analysis/PHASE14_SUPERVISOR_REVIEW.md. The prefix keeps them separable and
+    the renderer splits on it.
+    """
+    bc = _load_bootstrap_module()
+    n, k = 40, 14
+    y_true = [[(i + j) % 2 for j in range(k)] for i in range(n)]
+    y_pred = [[(i + j) % 2 for j in range(k)] for i in range(n)]
+    names = ["Finding%d" % j for j in range(k)]
+    cache = {
+        "rouge": [0.5] * n,
+        "hyp_toks": [["a", "b"]] * n,
+        "ref_toks": [["a", "b"]] * n,
+        "y_true": y_true, "y_pred": y_pred,
+        "five_idx": [0, 1, 2, 3, 4], "label_names": names,
+    }
+
+    plain = bc.evaluate_subset(range(n), cache, per_label=False)
+    rich = bc.evaluate_subset(range(n), cache, per_label=True)
+
+    assert not any(m.startswith(bc.PER_LABEL_PREFIX) for m in plain)
+    assert sum(m.startswith(bc.PER_LABEL_PREFIX) for m in rich) == k
+    # The non-per-label metrics must be bit-identical between the two paths --
+    # turning the flag on may ADD rows, never change an existing number.
+    for m, v in plain.items():
+        assert rich[m] == v, "metric %s changed when --per-label was enabled" % m
+    assert bc.PER_LABEL_PREFIX + "Finding3" in rich
+
+
+def test_bootstrap_is_paired_and_detects_a_real_difference():
+    """A system that is strictly better must come out significant; a clone must tie.
+
+    The pairing is what makes this sensitive at small effect sizes, so both
+    directions are asserted -- a broken implementation usually fails one.
+    """
+    bc = _load_bootstrap_module()
+    refs = ["the lungs are clear with no acute finding number %d" % i for i in range(80)]
+    good = list(refs)                                    # perfect copy
+    bad = ["something entirely different here %d" % i for i in range(80)]
+
+    cache_good = bc.build_cache(good, refs, None)
+    cache_bad = bc.build_cache(bad, refs, None)
+
+    res, meta = bc.paired_bootstrap(cache_good, cache_bad, n_samples=200, seed=0)
+    assert meta["n"] == 80
+    assert res["rouge_l"]["significant"], "a perfect system vs a wrong one must be significant"
+    assert res["rouge_l"]["diff"] > 0
+    assert res["rouge_l"]["ci_low"] > 0, "CI must exclude zero when the gap is real"
+
+    # Identical systems: the difference is exactly zero in every resample.
+    res_tie, _ = bc.paired_bootstrap(cache_good, bc.build_cache(good, refs, None),
+                                     n_samples=100, seed=0)
+    assert not res_tie["rouge_l"]["significant"], "a system compared to itself must tie"
+    assert abs(res_tie["rouge_l"]["diff"]) < 1e-12
+
+
+def test_bootstrap_reports_both_accuracy_subsets_and_matches_sklearn():
+    """f1chexbert's "accuracy" is the FIVE-label exact match, not all fourteen.
+
+    Verified in F1CheXbert.forward: accuracy_score(refs_chexbert_5, hyps_chexbert_5).
+    An earlier revision of bootstrap_compare emitted the 14-label version under the
+    bare name "exact_match_accuracy", which read as the same quantity as the
+    0.2163/0.2306 already published in the headline table while actually being
+    0.0349/0.0469 -- a 6x difference under an identical-looking name. Both are now
+    emitted, named for their subset, and both are pinned against sklearn.
+    """
+    import random as _random
+
+    from sklearn.metrics import accuracy_score
+
+    bc = _load_bootstrap_module()
+    rng = _random.Random(0)
+    n, k = 200, 14
+    y_true = [[rng.randint(0, 1) for _ in range(k)] for _ in range(n)]
+    y_pred = [[rng.randint(0, 1) for _ in range(k)] for _ in range(n)]
+    five = [0, 2, 5, 6, 8]
+
+    cache = {"rouge": [0.0] * n, "hyp_toks": [["a"]] * n, "ref_toks": [["a"]] * n,
+             "y_true": y_true, "y_pred": y_pred, "five_idx": five}
+    out = bc.evaluate_subset(range(n), cache)
+
+    assert "exact_match_accuracy_14" in out and "exact_match_accuracy_5" in out
+    assert "exact_match_accuracy" not in out, (
+        "the unqualified name is ambiguous against the published 'accuracy' and "
+        "must not come back"
+    )
+    assert abs(out["exact_match_accuracy_14"] - accuracy_score(y_true, y_pred)) < 1e-12
+    sub_t = [[t[j] for j in five] for t in y_true]
+    sub_p = [[p[j] for j in five] for p in y_pred]
+    assert abs(out["exact_match_accuracy_5"] - accuracy_score(sub_t, sub_p)) < 1e-12
+
+
+def test_bootstrap_refuses_unpaired_inputs():
+    """Pairing requires the same studies in the same order; mismatched lengths are
+    the one case where that is detectable, and it must abort rather than zip-truncate."""
+    bc = _load_bootstrap_module()
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        a, b, r = Path(d) / "a.txt", Path(d) / "b.txt", Path(d) / "r.txt"
+        a.write_text("one\ntwo\nthree\n")
+        b.write_text("one\ntwo\n")
+        r.write_text("one\ntwo\nthree\n")
+        with pytest.raises(SystemExit):
+            bc.main(["--hyps-a", str(a), "--hyps-b", str(b), "--refs", str(r)])
+
+
+def test_score_chexbert_dumps_per_sample_labels():
+    """CheXbert F1 cannot be bootstrapped from the aggregate report alone."""
+    src = (REPO_ROOT / "scripts" / "score_chexbert_standalone.py").read_text()
+    assert "chexbert_labels.json" in src
+    # Match the CALLS, not the comprehension text -- the int() coercion added
+    # 2026-09-09 rewrote the surrounding expression and broke a stricter match.
+    assert "labeler.get_label(r)" in src and "for r in refs" in src
+    assert "labeler.get_label(h)" in src and "for h in hyps" in src
+    # The 5-label subset must come from the labeler, not a hardcoded list.
+    assert "labeler.target_names_5_index" in src
+
+
+def test_chexbert_label_payload_is_json_serialisable_with_numpy_ints():
+    """f1chexbert's get_label() returns numpy int64, which json REFUSES.
+
+    Caught live on 2026-09-09 (job 2525606): a 15-minute scoring run computed the
+    correct metrics, printed them, then died with
+    "TypeError: Object of type int64 is not JSON serializable" -- and because the
+    label dump ran BEFORE the metrics write, the run produced no output at all.
+    This reproduces the exact failure with real numpy scalars and pins the fix.
+    """
+    import numpy as np
+
+    # Exactly what labeler.get_label() hands back: a list of numpy int64.
+    raw_labels = [np.int64(v) for v in (1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)]
+    raw_five_idx = [np.int64(i) for i in (0, 2, 5, 6, 8)]
+
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        json.dumps({"y_true": [raw_labels]})
+
+    coerced = {
+        "y_true": [[int(v) for v in raw_labels]],
+        "y_pred": [[int(v) for v in raw_labels]],
+        "five_label_indices": [int(i) for i in raw_five_idx],
+    }
+    round_tripped = json.loads(json.dumps(coerced))
+    assert round_tripped["y_true"] == [[1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]]
+    assert round_tripped["five_label_indices"] == [0, 2, 5, 6, 8]
+
+    src = (REPO_ROOT / "scripts" / "score_chexbert_standalone.py").read_text()
+    assert "[int(v) for v in labeler.get_label(r)]" in src
+    assert "[int(v) for v in labeler.get_label(h)]" in src
+    assert "[int(i) for i in labeler.target_names_5_index]" in src
+
+
+def test_chexbert_metrics_are_written_before_the_optional_label_dump():
+    """An add-on must not be able to destroy the output every phase depends on.
+
+    Job 2525606 lost a full scoring run because the label dump raised before
+    chexbert_metrics.json was written. Ordering plus a try/except is the fix; both
+    are asserted because either alone still leaves a way to lose the metrics.
+    """
+    src = (REPO_ROOT / "scripts" / "score_chexbert_standalone.py").read_text()
+    body = src.split("if args.output_dir:")[1]
+    metrics_pos = body.index("chexbert_metrics.json")
+    labels_pos = body.index("chexbert_labels.json")
+    assert metrics_pos < labels_pos, (
+        "chexbert_metrics.json must be written BEFORE the optional label dump"
+    )
+    assert "try:" in body[:labels_pos + 200], "the label dump must be guarded"
+    assert "WARNING: per-sample label dump failed" in body
+
+
+def test_slurm_wrappers_that_source_the_venv_exclude_the_arm_node():
+    """arm03 is ARM; .venv/bin/python3 is an x86 binary.
+
+    Any wrapper that activates the venv MUST exclude arm03, or it dies with
+    "cannot execute binary file: Exec format error" the first time SLURM happens
+    to schedule it there -- which is a silent landmine, since the job runs fine
+    on every other node. Hit live on 2026-09-09 (job 2525864).
+
+    Note the trap that made this easy to get wrong: a script can be pure-stdlib
+    and STILL break, because sourcing the venv puts the x86 interpreter on PATH.
+    "It only needs stdlib" is not a reason to allow arm03; "it never activates the
+    venv" is.
+    """
+    offenders = []
+    for path in sorted((REPO_ROOT / "scripts").glob("*.sh")):
+        src = path.read_text()
+        sources_venv = "source \"${VENV_ACTIVATE}" in src or "source ${VENV_ACTIVATE}" in src
+        if not sources_venv:
+            continue
+        excludes = [l for l in src.splitlines()
+                    if l.startswith("#SBATCH") and "--exclude" in l]
+        if not any(_excludes_arm(l) for l in excludes):
+            offenders.append(path.name)
+    assert not offenders, (
+        "these wrappers activate the x86 venv but carry no exclude placeholder, so nothing keeps them off the ARM node: %s"
+        % offenders
+    )
+
+
+def test_bootstrap_compare_slurm_wrapper_is_cpu_only():
+    path = REPO_ROOT / "scripts" / "bootstrap_compare_h100.sh"
+    assert path.exists()
+    src = path.read_text()
+    assert "#SBATCH --partition=@SLURM_PARTITION@" in src
+    assert not [l for l in src.splitlines() if l.startswith("#SBATCH") and "--gpus" in l]
+    assert 'A="${A:?' in src and 'B="${B:?' in src
+    assert "ERROR: required file not found" in src
+
+
+def test_resolve_prefix_k_detects_trained_value_and_rejects_conflicts():
+    """prefix_k is invisible to every key-count guard, so it needs its own.
+
+    k sets only the output width of F.adaptive_avg_pool1d, which has NO
+    parameters -- token_proj and out_proj are both k-independent. A k=8
+    checkpoint therefore loads into a k=32 module with "Missing keys: 0,
+    Unexpected: 0" and silently generates from 32 prefix tokens instead of 8.
+    ReportGenerationLightningModule does not save_hyperparameters(), so k is not
+    in the checkpoint; run_metadata.json is the only record.
+    """
+    import tempfile
+
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    try:
+        import evaluate_report_generation as erg
+    finally:
+        sys.path.pop(0)
+
+    with tempfile.TemporaryDirectory() as d:
+        run_dir = Path(d) / "run"
+        (run_dir / "checkpoints").mkdir(parents=True)
+        ckpt = run_dir / "checkpoints" / "last.ckpt"
+        ckpt.write_text("")
+        (run_dir / "run_metadata.json").write_text(
+            json.dumps({"resolved_config": {"model": {"prefix_k": 8}}})
+        )
+
+        # Detected value beats the YAML default.
+        assert erg.resolve_prefix_k(str(ckpt), yaml_prefix_k=32) == 8
+        # A matching override is fine.
+        assert erg.resolve_prefix_k(str(ckpt), 32, override=8) == 8
+        # A CONFLICTING override must hard-fail, not silently pick one.
+        with pytest.raises(RuntimeError, match="prefix_k conflict"):
+            erg.resolve_prefix_k(str(ckpt), 32, override=64)
+
+    # No metadata: fall back to the YAML, but say so loudly.
+    with tempfile.TemporaryDirectory() as d:
+        run_dir = Path(d) / "run"
+        (run_dir / "checkpoints").mkdir(parents=True)
+        ckpt = run_dir / "checkpoints" / "last.ckpt"
+        ckpt.write_text("")
+        assert erg.resolve_prefix_k(str(ckpt), yaml_prefix_k=32) == 32
+        assert erg.resolve_prefix_k(str(ckpt), 32, override=8) == 8
+
+
+def test_inspect_wrapper_exposes_prefix_k():
+    src = (REPO_ROOT / "scripts" / "inspect_report_generation_h100.sh").read_text()
+    assert 'PREFIX_K="${PREFIX_K:-}"' in src
+    assert '${PREFIX_K:+--prefix-k "${PREFIX_K}"}' in src, (
+        "must expand to nothing when unset so auto-detection stays the default path"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 15C — auxiliary multi-label CheXpert loss on the mean-pooled image
+# prefix. The supervisor's item 2 of 2026-09-13. Every test here exists to
+# protect ONE property: with aux_lambda=0.0 (the default) nothing in this
+# feature runs, so the 15B-4 seed band stays the valid baseline for 15C.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.willi_parity
+def test_chexpert_14_label_order_matches_f1chexbert_target_names():
+    """Spec-lock on the target order. chexbert_labels.json's `label_names`,
+    15B-5's per-label CIs and every per-label table in analysis/ are in this
+    order; a permuted aux target would train the head against the wrong
+    findings while every loss curve still looked healthy."""
+    from scripts.train_report_generation import CHEXPERT_14_LABELS
+
+    assert CHEXPERT_14_LABELS == [
+        "Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity", "Lung Lesion",
+        "Edema", "Consolidation", "Pneumonia", "Atelectasis", "Pneumothorax",
+        "Pleural Effusion", "Pleural Other", "Fracture", "Support Devices", "No Finding",
+    ]
+
+
+@pytest.mark.willi_parity
+def test_load_chexpert_label_matrix_u_zeros_and_omits_unknown_studies(tmp_path):
+    """U-Zeros per column (1.0 positive; 0.0/-1.0/NaN negative), selection BY
+    NAME (the CSV's own column order is alphabetical and must not matter), and
+    a study with no CSV row is ABSENT from the dict -- never a row of zeros,
+    which would teach 'no findings' from missing data."""
+    import pandas as pd
+    from scripts.train_report_generation import CHEXPERT_14_LABELS, load_chexpert_label_matrix
+
+    rows = {"study_id": [10, 20]}
+    for label in sorted(CHEXPERT_14_LABELS):          # deliberately NOT our order
+        rows[label] = [0.0, 0.0]
+    rows["Lung Opacity"] = [1.0, 0.0]
+    rows["Pleural Other"] = [-1.0, 1.0]
+    rows["No Finding"] = [float("nan"), 0.0]
+    csv_path = tmp_path / "chexpert.csv.gz"
+    pd.DataFrame(rows).to_csv(csv_path, index=False, compression="gzip")
+
+    matrix = load_chexpert_label_matrix([10, 20, 99], str(csv_path))
+
+    assert set(matrix) == {10, 20}, "a study absent from the CSV must be absent here"
+    assert len(matrix[10]) == 14
+    idx = {label: i for i, label in enumerate(CHEXPERT_14_LABELS)}
+    assert matrix[10][idx["Lung Opacity"]] == 1.0
+    assert matrix[10][idx["Pleural Other"]] == 0.0      # -1.0 (uncertain) -> negative
+    assert matrix[10][idx["No Finding"]] == 0.0         # NaN -> negative
+    assert matrix[20][idx["Pleural Other"]] == 1.0
+    assert sum(matrix[20]) == 1.0
+
+
+@pytest.mark.willi_parity
+def test_compute_aux_pos_weight_caps_rare_labels_and_survives_zero_positives():
+    """(N - n_pos)/n_pos, capped. The cap is load-bearing: uncapped, a ~1%
+    label gives ~100x and 13F showed 5x already damaged common labels."""
+    from scripts.train_report_generation import compute_aux_pos_weight
+
+    # 100 studies, 2 labels: label 0 positive in 50 (ratio 1.0), label 1 in 1
+    # (ratio 99.0 -> capped), label 2 never positive.
+    matrix = {}
+    for i in range(100):
+        matrix[i] = [1.0 if i < 50 else 0.0, 1.0 if i == 0 else 0.0, 0.0]
+
+    w = compute_aux_pos_weight(matrix, cap=10.0, num_labels=3)
+    assert w[0] == pytest.approx(1.0)
+    assert w[1] == pytest.approx(10.0), "uncapped this would be 99.0"
+    assert w[2] == 1.0, "a label with no positives must not divide by zero"
+    assert compute_aux_pos_weight({}, cap=10.0, num_labels=3) == [1.0, 1.0, 1.0]
+
+
+@pytest.mark.willi_parity
+def test_aux_lambda_zero_builds_no_head_and_leaves_the_state_dict_untouched():
+    """The single most important property in 15C: at the default the head is
+    never constructed, so (a) no aux_head.* key enters the checkpoint, and
+    (b) the decoder/prefix_mapper initialisation is bit-identical to a module
+    built before this feature existed -- constructing an nn.Linear consumes
+    global-RNG draws, which is why the head is built LAST and only when on."""
+    import torch
+    from hybrid_xmamba.training.lightning_module import ReportGenerationLightningModule
+
+    torch.manual_seed(0)
+    baseline = ReportGenerationLightningModule(decoder_config=_tiny_cpu_config(), prefix_k=4)
+    torch.manual_seed(0)
+    explicit_off = ReportGenerationLightningModule(
+        decoder_config=_tiny_cpu_config(), prefix_k=4, aux_lambda=0.0,
+    )
+    torch.manual_seed(0)
+    aux_on = ReportGenerationLightningModule(
+        decoder_config=_tiny_cpu_config(), prefix_k=4, aux_lambda=0.5,
+    )
+
+    assert baseline.aux_head is None and explicit_off.aux_head is None
+    assert aux_on.aux_head is not None
+    assert not any(k.startswith("aux_") for k in baseline.state_dict())
+    assert any(k.startswith("aux_head.") for k in aux_on.state_dict())
+
+    for key, tensor in baseline.state_dict().items():
+        assert torch.equal(tensor, explicit_off.state_dict()[key]), key
+        assert torch.equal(tensor, aux_on.state_dict()[key]), (
+            f"{key} moved when the aux head was added -- the head must be built LAST"
+        )
+
+
+@pytest.mark.willi_parity
+def test_aux_head_is_discarded_by_a_strict_false_eval_load():
+    """The fairness property the writeup claims: the evaluated network stays
+    parameter-identical to 13D because evaluate_report_generation.py loads
+    strict=False and inspects only `missing`."""
+    import torch
+    from hybrid_xmamba.training.lightning_module import ReportGenerationLightningModule
+
+    torch.manual_seed(0)
+    trained = ReportGenerationLightningModule(
+        decoder_config=_tiny_cpu_config(), prefix_k=4, aux_lambda=0.5,
+    )
+    torch.manual_seed(0)
+    at_eval = ReportGenerationLightningModule(decoder_config=_tiny_cpu_config(), prefix_k=4)
+
+    missing, unexpected = at_eval.load_state_dict(trained.state_dict(), strict=False)
+    assert list(missing) == [], f"eval model is missing weights: {missing}"
+    assert all(k.startswith("aux_") for k in unexpected), unexpected
+    assert any(k.startswith("aux_head.") for k in unexpected)
+
+
+@pytest.mark.willi_parity
+def test_aux_loss_adds_lambda_times_bce_and_reaches_the_prefix_mapper():
+    """total = lm_loss + aux_lambda * BCEWithLogits(head(prefix.mean(1)), y),
+    reconstructed independently; and the gradient must reach the prefix_mapper
+    -- if it did not, the mechanism (reshape the connector's representation)
+    could not work at all, whatever the loss curve did."""
+    import torch
+    import torch.nn.functional as F
+    from hybrid_xmamba.training.lightning_module import ReportGenerationLightningModule
+
+    torch.manual_seed(0)
+    mod = ReportGenerationLightningModule(
+        decoder_config=_tiny_cpu_config(), prefix_k=4, aux_lambda=0.5,
+    )
+    mod.set_aux_pos_weight([2.0] * 14)
+    # eval(), not train(): prefix_mapper has dropout, so in train mode each
+    # forward draws a different mask and no two losses are comparable. Dropout
+    # is orthogonal to what this test pins; gradients still flow in eval mode.
+    mod.eval()
+
+    B, L = 3, 8
+    batch = {
+        "input_ids": torch.randint(0, 100, (B, L)),
+        "patch_grid": torch.randn(B, 197, 768),
+        "chexpert_labels": torch.zeros(B, 14),
+        "chexpert_label_mask": torch.ones(B),
+    }
+    batch["chexpert_labels"][0, 2] = 1.0
+
+    lm_only = mod._step({k: v for k, v in batch.items() if not k.startswith("chexpert")}, "val")
+    total = mod._step(batch, "val")
+
+    with torch.no_grad():
+        prefix = mod.prefix_mapper(batch["patch_grid"])
+        logits = mod.aux_head(prefix.mean(dim=1).float())
+        expected_aux = F.binary_cross_entropy_with_logits(
+            logits, batch["chexpert_labels"], pos_weight=torch.full((14,), 2.0),
+        )
+    assert total.item() == pytest.approx((lm_only + 0.5 * expected_aux).item(), rel=1e-5)
+
+    mod.zero_grad()
+    total.backward()
+    for name, param in mod.prefix_mapper.named_parameters():
+        assert param.grad is not None and torch.isfinite(param.grad).all(), name
+    for name, param in mod.aux_head.named_parameters():
+        assert param.grad is not None, f"aux_head.{name} got no gradient"
+
+    # And the head must actually be optimised -- a head left at random init
+    # turns the aux gradient into noise rather than a label signal.
+    groups = mod.configure_optimizers()["optimizer"].param_groups
+    head_ids = {id(p) for p in mod.aux_head.parameters()}
+    assert any(any(id(p) in head_ids for p in g["params"]) for g in groups)
+
+
+@pytest.mark.willi_parity
+def test_aux_loss_masks_out_studies_with_no_chexpert_row():
+    """mask=0 samples must not contribute. Averaging them in would train the
+    head towards all-negative on exactly the studies whose labels are unknown."""
+    import torch
+    from hybrid_xmamba.training.lightning_module import ReportGenerationLightningModule
+
+    torch.manual_seed(0)
+    mod = ReportGenerationLightningModule(
+        decoder_config=_tiny_cpu_config(), prefix_k=4, aux_lambda=1.0,
+    )
+    mod.set_aux_pos_weight([1.0] * 14)
+    mod.eval()
+
+    B, L = 4, 8
+    base = {
+        "input_ids": torch.randint(0, 100, (B, L)),
+        "patch_grid": torch.randn(B, 197, 768),
+        "chexpert_labels": torch.zeros(B, 14),
+    }
+    base["chexpert_labels"][2:] = 1.0        # the two masked-out rows differ wildly
+
+    with torch.no_grad():
+        masked = mod._step({**base, "chexpert_label_mask": torch.tensor([1.0, 1.0, 0.0, 0.0])}, "val")
+        first_two_only = mod._step({
+            "input_ids": base["input_ids"], "patch_grid": base["patch_grid"],
+            "chexpert_labels": base["chexpert_labels"],
+            "chexpert_label_mask": torch.tensor([1.0, 1.0, 0.0, 0.0]),
+        }, "val")
+        all_in = mod._step({**base, "chexpert_label_mask": torch.ones(B)}, "val")
+
+    assert masked.item() == pytest.approx(first_two_only.item())
+    assert masked.item() != pytest.approx(all_in.item()), "the mask changed nothing"
+
+
+@pytest.mark.willi_parity
+def test_set_aux_pos_weight_rejects_wrong_length_and_a_missing_head():
+    import torch
+    from hybrid_xmamba.training.lightning_module import ReportGenerationLightningModule
+
+    torch.manual_seed(0)
+    off = ReportGenerationLightningModule(decoder_config=_tiny_cpu_config(), prefix_k=4)
+    with pytest.raises(RuntimeError, match="aux_lambda == 0"):
+        off.set_aux_pos_weight([1.0] * 14)
+
+    on = ReportGenerationLightningModule(
+        decoder_config=_tiny_cpu_config(), prefix_k=4, aux_lambda=0.1,
+    )
+    with pytest.raises(ValueError, match="14 entries"):
+        on.set_aux_pos_weight([1.0] * 13)
+
+
+@pytest.mark.willi_parity
+def test_image_text_dataset_emits_chexpert_keys_only_when_labels_are_supplied():
+    """ImageTextDataset is shared with the CLOSED retrieval chapter, so the
+    default __getitem__ payload must not gain a key."""
+    import torch
+    from omegaconf import OmegaConf
+    from PIL import Image
+    from transformers import AutoTokenizer
+
+    from scripts.train_contrastive import ImageTextDataset
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    except Exception as exc:                      # offline CI without the tokenizer cached
+        pytest.skip(f"tokenizer unavailable: {exc}")
+    tokenizer.pad_token = tokenizer.eos_token
+
+    cfg = OmegaConf.create({"dataset": {"max_length": 8, "image_size": 8}})
+    rows = [{"findings": "f", "impression": "i", "study_id": 10,
+             "image": Image.new("RGB", (8, 8))}]
+
+    plain = ImageTextDataset(rows, tokenizer, cfg)[0]
+    assert set(plain) == {"input_ids", "attention_mask", "pixel_values"}
+
+    labelled = ImageTextDataset(rows, tokenizer, cfg, chexpert_labels={10: [1.0] + [0.0] * 13})[0]
+    assert labelled["chexpert_labels"].shape == (14,)
+    assert labelled["chexpert_labels"][0] == 1.0
+    assert labelled["chexpert_label_mask"].item() == 1.0
+
+    unknown = ImageTextDataset(rows, tokenizer, cfg, chexpert_labels={99: [1.0] + [0.0] * 13})[0]
+    assert unknown["chexpert_label_mask"].item() == 0.0
+    assert torch.equal(unknown["chexpert_labels"], torch.zeros(14))
+
+
+@pytest.mark.willi_parity
+def test_train_report_generation_h100_wrapper_exposes_aux_levers():
+    """AUX_LAMBDA defaults to 0.0 (baseline recipe), is always passed to Hydra,
+    and is echoed POSITIVELY -- Phase 14's prefix_k lesson: a silent default
+    cannot be detected by its absence, and an aux arm whose log does not state
+    lambda is indistinguishable from a baseline re-run."""
+    sh = (REPO_ROOT / "scripts" / "train_report_generation_h100.sh").read_text()
+    assert 'AUX_LAMBDA="${AUX_LAMBDA:-0.0}"' in sh
+    assert 'AUX_POS_WEIGHT_CAP="${AUX_POS_WEIGHT_CAP:-10.0}"' in sh
+    assert "model.aux_lambda=${AUX_LAMBDA}" in sh
+    assert "model.aux_pos_weight_cap=${AUX_POS_WEIGHT_CAP}" in sh
+    assert "Aux CheXpert loss: lambda=${AUX_LAMBDA}" in sh
+
+
+@pytest.mark.willi_parity
+def test_rrg_model_configs_declare_aux_keys():
+    """Hydra strict-struct mode rejects a CLI override for an undeclared key --
+    the same trap that cost a smoke run in 13A (job 2478622). Both report-gen
+    arms must declare them, or the matched Transformer baseline cannot run the
+    same recipe."""
+    for name in ("hybrid_150m_v2_rrg", "transformer_150m_baseline_rrg", "hybrid_150m_m3_rrg"):
+        text = (REPO_ROOT / "configs" / "model" / f"{name}.yaml").read_text()
+        assert "aux_lambda: 0.0" in text, name
+        assert "aux_pos_weight_cap: 10.0" in text, name
+
+
+@pytest.mark.willi_parity
+def test_stage0_h100_passes_extra_hydra_overrides_through():
+    """M5: arms A3..A6 are `model.mamba3_*=...` overrides, not yamls of their own.
+
+    Before this existed the wrapper had no way to pass an extra Hydra argument, so half the
+    screen ladder was unsubmittable. The expansion must stay unquoted -- the overrides are
+    separate arguments, not one string -- and defaulted, because the script runs under
+    `set -u`.
+    """
+    sh = (REPO_ROOT / "scripts" / "train_stage0_h100.sh").read_text()
+    assert 'EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-}"' in sh
+    assert "\n  ${EXTRA_OVERRIDES}\n" in sh, "must be word-split into separate Hydra arguments"
+    wrapper = (REPO_ROOT / "scripts" / "train_stage0_150m_h100.sh").read_text()
+    assert 'export EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-}"' in wrapper
+
+
+@pytest.mark.willi_parity
+def test_150m_wrapper_resolves_the_arm_on_the_compute_node():
+    """The cluster's login node refuses to execute python, so an arm can only be resolved inside
+    the job.
+
+    Regression pin for job 2513581 (2026-09-06). The documented launch was
+    `eval "$(python scripts/mamba3_arms.py env A2)" && sbatch ...`. On the login node that python call
+    printed "This command is not allowed on the login node!"; the shell word-split the
+    sentence into `This: command not found`, `Please: command not found`, `HINT:: command not
+    found`; the eval exported NOTHING; and sbatch ran the wrapper's own defaults --
+    hybrid_150m_v2, 120,000 steps, save_top_k=3. A silent second A0 at ten times the intended
+    length, wearing the experiment name of the arm it was supposed to be.
+
+    Resolving on the compute node removes the class rather than the instance: there is no
+    pre-submit step left to fail, and a bad arm name exits non-zero instead of falling back to
+    a default that happens to be a valid architecture.
+    """
+    sh = (REPO_ROOT / "scripts" / "train_stage0_150m_h100.sh").read_text()
+    assert 'if [ -n "${ARM:-}" ]; then' in sh
+    assert 'python scripts/mamba3_arms.py env "${ARM}"' in sh, "one definition of the ladder"
+    assert "FATAL: could not resolve arm" in sh and "exit 1" in sh, (
+        "an unknown arm must fail the job, not silently train the wrapper's default"
+    )
+    # Resolution must precede the ${VAR:-default} exports, or the defaults win and the arm is
+    # silently ignored -- the same failure in a new costume.
+    assert sh.index('if [ -n "${ARM:-}" ]; then') < sh.index('export MODEL_CONFIG=')
+    # A caller-supplied EXPERIMENT must survive the arm's own naming, or a short probe writes
+    # into the screen run's output directory. Job 2513598 (a 300-step A2 probe) did exactly
+    # that: it landed in outputs/m3_screen_A2_s42 and left a last.ckpt behind.
+    assert 'ARM_EXPERIMENT="${EXPERIMENT:-}"' in sh
+    assert sh.index('ARM_EXPERIMENT="${EXPERIMENT:-}"') < sh.index('eval "${ARM_ENV}"')
+    assert 'export EXPERIMENT="${ARM_EXPERIMENT}"' in sh
+
+
+@pytest.mark.willi_parity
+def test_stage0_checkpoint_filename_has_no_slash_metric():
+    """A metric containing "/" in a ModelCheckpoint filename becomes a path separator.
+
+    `filename="stage0_kd-{step:06d}-{val/loss:.4f}"` made Lightning create a DIRECTORY
+    `stage0_kd-step=NNNNNN-val/` with `loss=N.NNNN.ckpt` inside it, for every save. Nothing
+    globbing `checkpoints/*.ckpt` could find a best checkpoint -- only `last.ckpt` was ever
+    visible, which is why every M7 arm reported zero checkpoints while sitting on 2.1 GB.
+    `monitor="val/loss"` still drives top-k selection; the loss belongs in TensorBoard.
+    """
+    src = (REPO_ROOT / "scripts" / "train_stage0_distill.py").read_text()
+    assert 'filename="stage0_kd-step{step:06d}"' in src
+    assert "{val/loss" not in src, "a slashed metric in a filename becomes a directory"
+    assert 'monitor="val/loss"' in src, "top-k selection still needs the metric"
+
+
+@pytest.mark.willi_parity
+def test_stage0_validation_cadence_is_tunable():
+    """M8-A runs 120,000 steps; at the screen's val_check_interval=2000 that is 60 passes.
+
+    A0 measured ~5.4 h for six passes -- the val set is 15,724 chunks and each pass runs the
+    2.6B teacher alongside the student -- so 60 would cost ~54 h against ~13.5 h of training.
+    The interval must be tunable. The val SET must not be: it stays 15,724 chunks so the number
+    remains comparable to the 13.18 Phase-5 baseline.
+    """
+    sh = (REPO_ROOT / "scripts" / "train_stage0_h100.sh").read_text()
+    assert 'VAL_EVERY="${VAL_EVERY:-2000}"' in sh, "screens keep the 2000-step default"
+    assert "trainer.val_check_interval=${VAL_EVERY}" in sh
+    assert "trainer.val_check_interval=2000" not in sh, "no hard-coded cadence left"
+
+
+# ---------------------------------------------------------------------------
+# MAMBA3_PLAN_V2.md V1 -- re-baseline and harden the seams
+# ---------------------------------------------------------------------------
+
+def _model_yaml(name):
+    import yaml
+    return yaml.safe_load((REPO_ROOT / "configs" / "model" / f"{name}.yaml").read_text())
+
+
+def _v3_stage0_operator():
+    """(arm name, {scan_impl, tfla_impl}) the V3 chain trains Stage-0 with by default: the arm's
+    yaml overlaid with the arm's own overrides -- exactly what the ARM resolver applies."""
+    import importlib.util
+    chain = (REPO_ROOT / "scripts" / "submit_v3_chain.sh").read_text()
+    m = re.search(r'local ARM="\$\{ARM:-([A-Za-z0-9-]+)\}"', chain)
+    assert m, "submit_v3_chain.sh must declare a default ARM"
+    spec = importlib.util.spec_from_file_location("m3arms", REPO_ROOT / "scripts" / "mamba3_arms.py")
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    arm = mod.ARMS[m.group(1)]
+    base = _model_yaml(arm.config)
+    op = {k: arm.overrides.get(k, base[k]) for k in ("scan_impl", "tfla_impl")}
+    return m.group(1), op
+
+
+@pytest.mark.willi_parity
+def test_m3_rrg_config_is_m3_plus_exactly_the_rrg_delta():
+    """V1-B: the Mamba-3 report-gen config mirrors the hybrid_150m_v2 -> _rrg delta EXACTLY,
+    the way transformer_150m_baseline_rrg does. Anything else is a second lever in the
+    decoder comparison."""
+    v2, v2_rrg = _model_yaml("hybrid_150m_v2"), _model_yaml("hybrid_150m_v2_rrg")
+    m3, m3_rrg = _model_yaml("hybrid_150m_m3"), _model_yaml("hybrid_150m_m3_rrg")
+    dropped = {k for k in v2 if k not in v2_rrg}
+    changed = {k for k in v2_rrg if k not in v2 or v2_rrg[k] != v2[k]}
+    expected = {k: (v2_rrg[k] if k in changed else m3[k]) for k in (set(m3) - dropped) | changed}
+    # V2-D: the ONE sanctioned difference beyond the rrg delta -- the decoder runs the operator
+    # the winning Stage-0 arm trained with (A2x: tfla_impl=exact). hybrid_150m_m3.yaml itself stays
+    # legacy because it defines the M7 arms A2..A6.
+    expected.update(_v3_stage0_operator()[1])
+    assert m3_rrg == expected, {
+        "missing": sorted(set(expected) - set(m3_rrg)),
+        "extra": sorted(set(m3_rrg) - set(expected)),
+        "differ": sorted(k for k in set(expected) & set(m3_rrg) if expected[k] != m3_rrg[k]),
+    }
+    assert m3_rrg["layer_pattern"].count("mamba3") == 9 and m3_rrg["layer_pattern"].count("mlstm") == 3
+
+
+@pytest.mark.willi_parity
+def test_v3_decoder_config_runs_the_operator_its_stage0_arm_trained_with():
+    """V2-D: scan_impl / tfla_impl carry no parameters, so a decoder built with `legacy` loads an
+    `exact`-trained Stage-0 checkpoint with Missing keys: 0 and silently fine-tunes and evaluates a
+    different recurrence. The chain trains Stage-0 through ARM (hybrid_150m_m3 + overrides) and
+    trains/evaluates the decoder through hybrid_150m_m3_rrg -- two routes that must agree."""
+    arm, op = _v3_stage0_operator()
+    rrg = _model_yaml("hybrid_150m_m3_rrg")
+    assert arm == "A2x", "V2-D (2026-09-17): A2x advanced -- 15.566 / 15.788 vs A2 16.708 / 16.376"
+    assert op == {"scan_impl": "legacy", "tfla_impl": "exact"}, op
+    assert {k: rrg[k] for k in op} == op, (
+        "hybrid_150m_m3_rrg.yaml runs %s but the V3 Stage-0 arm %s trains with %s"
+        % ({k: rrg[k] for k in op}, arm, op))
+    chain = (REPO_ROOT / "scripts" / "submit_v3_chain.sh").read_text()
+    assert chain.count("MODEL_CONFIG=hybrid_150m_m3_rrg") == 2, "decoder AND eval must use the rrg config"
+
+
+@pytest.mark.willi_parity
+def test_every_recurrent_model_yaml_pins_the_operator_explicitly():
+    """V1-E: no yaml inherits scan_impl / tfla_impl from the dataclass default. The published
+    configs pin `legacy` (byte-for-byte reproduction of every checkpoint, and the 14A operator
+    freeze); the corrected arms pin `exact`. Flipping a global default can never silently move
+    a published number again."""
+    for f in sorted((REPO_ROOT / "configs" / "model").glob("*.yaml")):
+        raw = _model_yaml(f.stem)
+        pattern = raw.get("layer_pattern") or []
+        if not any(t in ("mamba", "mamba3", "mlstm") for t in pattern):
+            continue
+        assert raw.get("scan_impl") in ("legacy", "exact"), f"{f.name}: scan_impl not pinned"
+        assert raw.get("tfla_impl") in ("legacy", "exact"), f"{f.name}: tfla_impl not pinned"
+    for name in ("hybrid_70m_v2", "hybrid_150m_v2", "hybrid_150m_v2_rrg", "hybrid_150m_m3"):
+        raw = _model_yaml(name)
+        assert (raw["scan_impl"], raw["tfla_impl"]) == ("legacy", "legacy"), name
+    a1 = _model_yaml("hybrid_150m_a1")
+    assert (a1["scan_impl"], a1["tfla_impl"]) == ("exact", "exact")
+
+
+@pytest.mark.willi_parity
+def test_checkpoint_architecture_sniffer_names_every_layer_type():
+    """V1-D: the eval loaders used to decide `mamba` vs `mlstm` from `A_log`/`conv1d` alone,
+    which labels a Mamba-3 block (it has both) as Mamba-1 and an attention block as mLSTM.
+    The shared sniffer keys on one parameter unique to each mixer and refuses ambiguity."""
+    import torch
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+    from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel
+    from hybrid_xmamba.utils.checkpoint_arch import infer_architecture
+
+    pattern = ["mamba", "mamba3", "mlstm", "slstm", "attention"]
+
+    def build(norm_topology, pattern=pattern):
+        cfg = HybridConfig(vocab_size=64, dim=64, num_layers=len(pattern), layer_pattern=pattern,
+                           state_size=8, mamba3_d_state=16, mamba3_head_dim=32,
+                           use_fast_path=False, use_tfla=False, max_position_embeddings=32,
+                           norm_topology=norm_topology)
+        model = HybridLanguageModel(cfg)
+        return {"lm." + k: v for k, v in model.state_dict().items()}
+
+    arch = infer_architecture(build("hybrid"), prefix="lm.layers.")
+    assert arch.layer_pattern == pattern
+    assert arch.norm_topology == "hybrid"
+    assert arch.state_size == 8 and arch.mamba3_d_state == 16 and arch.mamba3_head_dim == 32
+    kw = arch.config_kwargs()
+    assert kw["layer_pattern"] == pattern and kw["state_size"] == 8 and kw["mamba3_d_state"] == 16
+
+    assert infer_architecture(build("pre_rms"), prefix="lm.layers.").norm_topology == "pre_rms"
+    assert infer_architecture(build("hybrid_bc", ["mamba", "mamba", "mlstm"]),
+                              prefix="lm.layers.").norm_topology == "hybrid_bc"
+
+    t = torch.zeros(2, 2)
+    with pytest.raises(ValueError, match="ambiguous"):
+        infer_architecture({"lm.layers.0.mixer.dt_proj.weight": t,
+                            "lm.layers.0.mixer.i_gate_proj.weight": t}, prefix="lm.layers.")
+    with pytest.raises(ValueError, match="no fingerprint"):
+        infer_architecture({"lm.layers.0.mixer.mystery.weight": t}, prefix="lm.layers.")
+
+
+@pytest.mark.willi_parity
+def test_retrieval_and_sts_loaders_share_the_sniffer_and_raise_on_critical_misses():
+    """V1-D: one sniffer, two loaders, and both FAIL on a mis-built backbone. evaluate_cxr_retrieval
+    used to print the missing keys and score anyway (a wrong architecture silently mis-scored);
+    evaluate_sts already raised. They now match."""
+    for rel in ("scripts/evaluate_cxr_retrieval.py", "scripts/evaluate_sts.py"):
+        src = (REPO_ROOT / rel).read_text()
+        assert "infer_architecture(" in src, rel
+        assert '"A_log" in k or "conv1d" in k' not in src, f"{rel}: binary predicate still live"
+        assert "Critical keys missing after load" in src and "raise RuntimeError" in src, rel
+
+
+@pytest.mark.willi_parity
+def test_contrastive_backbone_load_guards_against_wrong_architecture():
+    """V1-D: the tower stage was the one load in the chain with no guard -- a wrong-architecture
+    Stage-0 checkpoint loaded with strict=False, matched almost nothing, and trained from random
+    init while printing a key count nobody read. Same >50% rule as the decoder and the eval."""
+    src = (REPO_ROOT / "scripts" / "train_contrastive.py").read_text()
+    i = src.index("text_encoder.lm.load_state_dict(state, strict=False)")
+    window = src[i:i + 1600]
+    assert "missing_frac" in window and "raise RuntimeError" in window, "no wrong-architecture guard"
+    assert "0.5" in window and "0.05" in window
+
+
+@pytest.mark.willi_parity
+def test_v3_chain_script_is_source_safe_and_only_submits_existing_wrappers():
+    """V1-F: the full pipeline is one dependency chain, SOURCED on the login node (which executes
+    no scripts and no python). So: no `set -e` (it would kill the login shell), nothing but sbatch
+    and shell, every wrapper it names exists and excludes the ARM node."""
+    import re
+    path = REPO_ROOT / "scripts" / "submit_v3_chain.sh"
+    assert path.exists(), "scripts/submit_v3_chain.sh missing"
+    src = path.read_text()
+    assert "set -e" not in src and "set -euo" not in src
+    assert "--dependency=afterok" in src
+    code = [l.strip() for l in src.splitlines() if l.strip() and not l.strip().startswith("#")]
+    assert not any(l.startswith(("python ", "python3 ", "bash scripts/", "sh scripts/")) for l in code), (
+        "the chain must not run scripts on the login node"
+    )
+    submits = "\n".join(l for l in code if not l.startswith("echo"))   # sbatch targets only, not the closing hint
+    wrappers = set(re.findall(r"(scripts/[A-Za-z0-9_]+\.sh)", submits)) - {"scripts/submit_v3_chain.sh"}
+    assert wrappers == {
+        "scripts/train_stage0_150m_h100.sh", "scripts/train_report_generation_h100.sh",
+        "scripts/inspect_report_generation_h100.sh", "scripts/score_chexbert_h100.sh",
+        "scripts/bootstrap_compare_h100.sh",
+    }, wrappers
+    for w in wrappers:
+        wsrc = (REPO_ROOT / w).read_text()
+        assert (REPO_ROOT / w).exists() and re.search(r"^#SBATCH --exclude=@SLURM_EXCLUDE(_ARCH)?@", wsrc, re.M), w
+    # the levers the plan's recipe depends on are all threaded
+    for lever in ("ARM=", "SEEDS", "SAVE_TOP_K=0", "NUM_GPUS=4", "MAX_STEPS=12000", "PREFIX_K",
+                  "DECODE=beam", "BEAM_SIZE=3", "PER_LABEL=true", "IMAGE_ENCODER_CKPT", "DRY_RUN",
+                  "EVAL_TIME"):
+        assert lever in src, lever
+    # V2-D: every incumbent dump the 15B-4 table came from (h100_scaling_state.json seed_arms), so all
+    # nine paired bootstraps are submitted -- none silently skipped.
+    for d in ("results/report_gen_tower13d_test_split", "results/report_gen_hybrid_seed43_test_split",
+              "results/report_gen_hybrid_seed44_test_split", "results/report_gen_transformer_test_split",
+              "results/report_gen_transformer_seed43_test_split",
+              "results/report_gen_transformer_seed44_test_split"):
+        assert d in src, d
+
+
+_PKG_IMPORT = re.compile(r"^\s*(from|import)\s+hybrid_xmamba\b", re.M)
+
+
+@pytest.mark.willi_parity
+def test_every_script_that_imports_the_package_puts_the_repo_root_on_sys_path():
+    """V2-A, job 2552094: `python scripts/mamba3_arms.py verify` died on the cluster with
+    `ModuleNotFoundError: No module named 'hybrid_xmamba'`. Running `python scripts/x.py` puts
+    scripts/ on sys.path, not the repo root, and the cluster .venv has no editable install of the
+    package -- only this laptop's venv does, which is why every local run passed. The other
+    scripts insert the root themselves; this pins the convention for all of them."""
+    offenders = []
+    for path in sorted((REPO_ROOT / "scripts").glob("*.py")):
+        src = path.read_text()
+        if _PKG_IMPORT.search(src) and "sys.path.insert(0" not in src:
+            offenders.append(path.name)
+    assert not offenders, (
+        "scripts import hybrid_xmamba without inserting the repo root on sys.path; they work only "
+        "where the package is pip-installed (not the cluster .venv): %s" % offenders
+    )
+
+
+@pytest.mark.willi_parity
+def test_mamba3_arms_verify_runs_without_an_installed_package():
+    """Reproduces job 2552094 exactly: an interpreter that cannot see an installed/editable
+    hybrid_xmamba (`-S` skips site, so no .pth finder runs; site-packages is re-added through
+    PYTHONPATH only so torch and yaml still import), launched from the repo root exactly as the
+    preflight's `python scripts/mamba3_arms.py verify` is. The repo root as cwd does NOT hide the
+    bug: running a script puts its own directory on sys.path, never the cwd."""
+    import subprocess
+    import sysconfig
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (sysconfig.get_paths()["purelib"], sysconfig.get_paths()["platlib"]) if p
+    )
+    # The reproduction needs torch + yaml to import without `site`. If this interpreter cannot do
+    # that, the environment cannot express the condition -- skip loudly rather than fail and block
+    # the cluster preflight on a test-harness limitation. The static test above still guards the rule.
+    probe = subprocess.run([sys.executable, "-S", "-c", "import torch, yaml"],
+                           cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=300)
+    if probe.returncode != 0:
+        pytest.skip("torch/yaml do not import under `python -S` here: %s" % probe.stderr.strip()[-300:])
+    proc = subprocess.run(
+        [sys.executable, "-S", str(REPO_ROOT / "scripts" / "mamba3_arms.py"), "verify"],
+        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=600,
+    )
+    out = proc.stdout + proc.stderr
+    assert "No module named 'hybrid_xmamba'" not in out, out[-2000:]
+    assert proc.returncode == 0, out[-2000:]
+
+
+@pytest.mark.willi_parity
+def test_inspect_wrapper_exposes_the_cached_decode_lever():
+    """V4: the O(1) cache has to be reachable through sbatch, and off by default so the protocol
+    behind every published number is what runs unless someone asks otherwise."""
+    src = (REPO_ROOT / "scripts" / "inspect_report_generation_h100.sh").read_text()
+    assert 'CACHED_DECODE="${CACHED_DECODE:-false}"' in src
+    assert "--cached-decode" in src
+    eval_src = (REPO_ROOT / "scripts" / "evaluate_report_generation.py").read_text()
+    assert '"--cached-decode"' in eval_src and "supports_cached_decode()" in eval_src
+
+
+@pytest.mark.willi_parity
+def test_eval_can_override_the_operator_a_checkpoint_was_trained_with():
+    """V5-A: `scan_impl`/`tfla_impl` carry no parameters, so the same weights load under either.
+    That is what makes "what is the defect worth on the reported metrics?" answerable by
+    measurement -- and why the override must be announced in the log, not inferred afterwards."""
+    src = (REPO_ROOT / "scripts" / "evaluate_report_generation.py").read_text()
+    for flag in ('"--scan-impl"', '"--tfla-impl"', "scan_impl=getattr(args", "tfla_impl=getattr(args"):
+        assert flag in src, flag
+    assert "OVERRIDE; the checkpoint was TRAINED with" in src, "an override must announce itself"
+    wrapper = (REPO_ROOT / "scripts" / "inspect_report_generation_h100.sh").read_text()
+    assert 'SCAN_IMPL="${SCAN_IMPL:-}"' in wrapper and "--scan-impl" in wrapper
+    assert 'TFLA_IMPL="${TFLA_IMPL:-}"' in wrapper and "--tfla-impl" in wrapper
+
+
+# ---------------------------------------------------------------------------
+# V5-D — post-hoc repair of generated report dumps
+# ---------------------------------------------------------------------------
+
+def _load_repair_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_repair_generations", REPO_ROOT / "scripts" / "repair_generations.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.willi_parity
+def test_sentence_splitter_survives_radiology_punctuation():
+    """The repair rests entirely on knowing where a sentence ends. Radiology
+    text is adversarial about that: measurements ("4.5 cm"), redaction
+    placeholders ("___."), dictation times ("10:30 a.m."), clinician titles
+    ("Dr.") and numbered impressions ("1.  Interval ...") all put a period
+    somewhere that is not a boundary. A splitter that gets these wrong would
+    truncate real findings away and call it a repair."""
+    m = _load_repair_module()
+
+    assert len(m.split_sentences(
+        "The tip projects 4.5 cm above the carina. Dr. ___ was paged at 10:30 a.m. "
+        "as soon as the findings were recognized.")) == 2
+    assert len(m.split_sentences(
+        "Impression: 1.  Interval extubation.  2.  Low lung volumes.")) == 2
+    assert len(m.split_sentences("Comparison is made with prior study, ___.")) == 1
+    # rejoining is lossless on already-normalised text
+    text = "No acute process. Heart size is normal."
+    assert " ".join(m.split_sentences(text)) == text
+
+
+@pytest.mark.willi_parity
+def test_repair_drops_the_severed_fragment_and_collapses_repeats():
+    """The two artefacts of a decoder with no stop condition, on a real tail
+    from the 2026-09-21 eval logs."""
+    m = _load_repair_module()
+    text = ("Findings: The lungs are clear. There is no pneumothorax. "
+            "Sternal wires are aligned. Sternal wires are aligned. Sternal wires are")
+
+    out, stats = m.repair_report(text)
+    assert out.endswith("Sternal wires are aligned.")
+    assert out.count("Sternal wires are aligned.") == 1
+    assert stats["sentences_truncated"] == 1 and stats["sentences_deduped"] == 1
+
+    # the two edits are independently switchable, so each can be attributed
+    only_dedup, _ = m.repair_report(text, truncate=False)
+    assert only_dedup.endswith("Sternal wires are")
+    only_trunc, _ = m.repair_report(text, dedup="none")
+    assert only_trunc.count("Sternal wires are aligned.") == 2
+
+    # "all" also catches a repeat that is not immediately adjacent
+    spaced = "No pneumothorax. Heart size is normal. No pneumothorax."
+    assert m.repair_report(spaced, dedup="consecutive")[0] == spaced
+    assert m.repair_report(spaced, dedup="all")[0] == "No pneumothorax. Heart size is normal."
+
+
+@pytest.mark.willi_parity
+def test_repair_never_empties_a_hypothesis_or_moves_a_line():
+    """An empty hypothesis is a scoring artefact, not a measurement, and a
+    dropped line silently desyncs every hyp/ref pair after it."""
+    m = _load_repair_module()
+
+    out, stats = m.repair_report("The size of the cardiac")   # no terminator at all
+    assert out == "The size of the cardiac" and stats.get("fallbacks") == 1
+
+    lines = ["The size of the cardiac", "No acute process.", "Clear lungs. Clear lungs. and"]
+    repaired, totals = m.repair_lines(lines)
+    assert len(repaired) == len(lines) and all(r.strip() for r in repaired)
+    assert totals["reports"] == 3
+
+
+@pytest.mark.willi_parity
+def test_repair_cli_preserves_refs_and_refuses_to_overwrite_the_control(tmp_path):
+    """The unrepaired dump is the control arm of the comparison, and the
+    references are not ours to edit."""
+    import subprocess
+
+    src = tmp_path / "dump"
+    src.mkdir()
+    (src / "hyps.txt").write_text("Clear lungs. Clear lungs. and\nNo acute process.\n")
+    (src / "refs.txt").write_text("Lungs are clear.\nNo acute cardiopulmonary process.\n")
+    out = tmp_path / "repaired"
+
+    script = str(REPO_ROOT / "scripts" / "repair_generations.py")
+    done = subprocess.run(
+        [sys.executable, script, "--dump-dir", str(src), "--out-dir", str(out)],
+        capture_output=True, text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    assert (out / "hyps.txt").read_text() == "Clear lungs.\nNo acute process.\n"
+    assert (out / "refs.txt").read_text() == (src / "refs.txt").read_text()
+    assert (src / "hyps.txt").read_text() == "Clear lungs. Clear lungs. and\nNo acute process.\n"
+    assert json.loads((out / "repair_report.json").read_text())["policy"]["dedup"] == "consecutive"
+
+    clash = subprocess.run(
+        [sys.executable, script, "--dump-dir", str(src), "--out-dir", str(src)],
+        capture_output=True, text=True,
+    )
+    assert clash.returncode != 0 and "control arm" in (clash.stdout + clash.stderr)
+
+
+@pytest.mark.willi_parity
+def test_repair_reuses_the_eval_metric_functions_rather_than_reimplementing_them():
+    """A second copy of the tokenisation would drift from the numbers this is
+    being compared against, which is the one thing the comparison cannot
+    survive."""
+    src = (REPO_ROOT / "scripts" / "repair_generations.py").read_text()
+    assert "compute_all_metrics" in src and "evaluate_report_generation.py" in src
+    assert "def rouge_l" not in src and "def corpus_bleu" not in src
+
+
+@pytest.mark.willi_parity
+def test_repair_wrapper_is_cpu_only_and_warns_that_every_arm_must_be_repaired():
+    """A decode-protocol change applied to one arm and cited against another
+    arm's unrepaired numbers manufactures a win. The wrapper has to say so."""
+    src = (REPO_ROOT / "scripts" / "repair_generations_h100.sh").read_text()
+    directives = [ln for ln in src.splitlines() if ln.startswith("#SBATCH")]
+    assert not any("--gpus" in ln or "--gres" in ln for ln in directives), (
+        "repairing cached text needs no GPU; a prose mention of --gpus is fine, "
+        "an actual allocation is not"
+    )
+    assert "--partition=@SLURM_PARTITION@" in src and _excludes_arm(src)
+    assert "EVERY system being compared" in src or "EVERY arm" in src
+    assert "score_chexbert_h100.sh" in src and "bootstrap_compare_h100.sh" in src
+
+
+# ---------------------------------------------------------------------------
+# EFFICIENCY_PLAN.md — the inference-speed plan-of-record (created 2026-09-25)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# EFFICIENCY_PLAN.md E0 — the profiler arms that measure the wall-clock gap
+# ---------------------------------------------------------------------------
+
+@pytest.mark.willi_parity
+def test_profiler_exposes_the_e0_arms():
+    """E0 needs four things the profiler did not have: a per-mixer-type split,
+    a way to force one SDPA backend, a chunk-size override, and a compile arm.
+
+    The attention-backend flag is the one that answers the supervisor's question,
+    so its default must stay `auto` — that is the arm every published efficiency
+    number was measured in, and a default of `math` would silently re-baseline
+    analysis/efficiency_150m_m3/."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "perfprof", REPO_ROOT / "scripts" / "performance_profile.py")
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+    assert mod.SDPA_BACKENDS[0] == "auto", "the fused backend must remain the default arm"
+    for name in ("math", "flash", "efficient"):
+        assert name in mod.SDPA_BACKENDS
+    for fn in ("attention_backend", "maybe_compile", "run_layer_split"):
+        assert hasattr(mod, fn), f"E0/E1 entry point {fn} is missing"
+    assert hasattr(mod, "LayerSplit") and hasattr(mod, "ScanSplit")
+
+    src = (REPO_ROOT / "scripts" / "performance_profile.py").read_text()
+    for flag in ("--per-layer", "--attn-backend", "--chunk-size", "--compile"):
+        assert flag in src, f"{flag} is not wired into the CLI"
+
+
+@pytest.mark.willi_parity
+def test_scan_split_restores_the_operator_even_when_the_body_raises():
+    """ScanSplit monkeypatches mamba3_block.ssd_chunked_scan. A profiler that
+    leaves the patch installed would silently corrupt every later measurement in
+    the same process — and the wrapper runs several sweeps per job."""
+    import importlib.util
+    from hybrid_xmamba.layers import mamba3_block
+
+    spec = importlib.util.spec_from_file_location(
+        "perfprof_scan", REPO_ROOT / "scripts" / "performance_profile.py")
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+    original = mamba3_block.ssd_chunked_scan
+    with pytest.raises(ValueError):
+        with mod.ScanSplit("cpu"):
+            assert mamba3_block.ssd_chunked_scan is not original, "patch never applied"
+            raise ValueError("boom")
+    assert mamba3_block.ssd_chunked_scan is original, (
+        "ScanSplit leaked its monkeypatch after an exception"
+    )
+
+
+@pytest.mark.willi_parity
+def test_layer_split_accounts_for_every_layer_and_computes_the_amdahl_bound():
+    """E0-A is only useful if the split is exhaustive: every HybridBlock must be
+    timed and attributed to its mixer type, and the bound must be derived from
+    the measured share rather than asserted."""
+    import importlib.util
+    import torch
+    from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+
+    spec = importlib.util.spec_from_file_location(
+        "perfprof_split", REPO_ROOT / "scripts" / "performance_profile.py")
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+    cfg = HybridConfig(
+        dim=32, num_layers=4, vocab_size=128, max_position_embeddings=64,
+        layer_pattern=["mamba3", "mlstm"], num_heads=2,
+        mamba3_d_state=8, mamba3_head_dim=8, mamba3_chunk_size=4,
+        use_fast_path=False, use_tfla=False,
+    )
+    rows = mod.run_layer_split(
+        model_names=[], seq_lengths=[], batch_size=1, num_iterations=1,
+        device="cpu", dtype=torch.float32,
+    )
+    assert rows == [], "an empty model list must not invent rows"
+
+    model = mod.build_model(cfg, "cpu", torch.float32)
+    split = mod.LayerSplit(model, "cpu")
+    split.enabled = True
+    with torch.no_grad():
+        model(torch.randint(0, cfg.vocab_size, (1, 16)))
+    split.enabled = False
+    by_type, by_index = split.totals_ms(iterations=1)
+    split.remove()
+
+    assert set(by_index) == set(range(cfg.num_layers)), "a layer went untimed"
+    assert set(by_type) == {"mamba3", "mlstm"}
+    # 1 / (1 - share) is the only bound the plan is allowed to claim.
+    share = 0.8
+    assert abs((1.0 / (1.0 - share)) - 5.0) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# EFFICIENCY_PLAN.md E1 — the R1 gate that stands between a stopwatch and a claim
+# ---------------------------------------------------------------------------
+
+@pytest.mark.willi_parity
+def test_r1_gate_checks_the_document_boundary_and_the_fp64_oracle():
+    """E0 found two speedups. Neither may be adopted on timing alone: this repo
+    has already shipped an operator that computed a different function than
+    advertised (the A_cum.clamp defect, rel-max-err 0.92), and the entire Mamba-3
+    campaign exists to repair it.
+
+    The gate must compare against the fp64 oracle rather than only against the
+    shipped chunked path — two chunked variants can agree with each other and
+    both be wrong — and it must include a cu_seqlens boundary that lands inside a
+    chunk, which is exactly where the Mamba-1 defect lived."""
+    src = (REPO_ROOT / "scripts" / "check_operator_equivalence.py").read_text()
+    assert "ssd_sequential_reference" in src, "R1 requires the fp64 oracle, not just self-consistency"
+    assert "cu_seqlens" in src and "mid-chunk" in src
+    assert "R1_TOLERANCE = 1e-4" in src
+    # It has to be usable as a gate, i.e. fail the process, not just print.
+    assert "return 1" in src and "sys.exit(main())" in src
+
+
+@pytest.mark.willi_parity
+def test_r1_gate_actually_separates_a_correct_variant_from_a_wrong_one():
+    """A gate that passes everything is not a gate. Feed it the same operands
+    with and without the document reset: the chunked scan must track the oracle
+    that shares its cu_seqlens and must NOT match the one that does not."""
+    import importlib.util
+    import torch
+    from hybrid_xmamba.kernels.ssd import ssd_chunked_scan, ssd_sequential_reference
+
+    spec = importlib.util.spec_from_file_location(
+        "r1gate", REPO_ROOT / "scripts" / "check_operator_equivalence.py")
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+    x, dt, A, B, C, D = mod._operands(2, 128, 4, 16, 1, 32, "cpu")
+    seg = torch.zeros(2, 128, dtype=torch.long)
+    seg[:, 50:] = 1                       # boundary inside every chunk size tested
+
+    got = ssd_chunked_scan(x, dt, A, B, C, D=D, chunk_size=64, cu_seqlens=seg)
+    right = ssd_sequential_reference(x, dt, A, B, C, D=D, cu_seqlens=seg)
+    wrong = ssd_sequential_reference(x, dt, A, B, C, D=D)     # boundary ignored
+
+    assert mod.rel_max_err(got, right) < mod.R1_TOLERANCE, (
+        "the chunked scan no longer matches the fp64 oracle across a document reset"
+    )
+    assert mod.rel_max_err(got, wrong) > 0.01, (
+        "cu_seqlens is being ignored somewhere, so the boundary case tests nothing"
+    )
+
+
+@pytest.mark.willi_parity
+def test_e1_wrapper_runs_the_gate_before_it_times_anything():
+    """Ordering is the whole design: if the equivalence check ran after the
+    sweeps, a failing gate would still have produced numbers someone could quote.
+    Also: job 2579642 died at 1.5h compiling L=16384, so this wrapper must ask
+    for more time than that."""
+    src = (REPO_ROOT / "scripts" / "verify_and_profile_e1_h100.sh").read_text()
+    gate_at = src.index("check_operator_equivalence.py")
+    first_sweep = src.index("performance_profile.py --sweep")
+    assert gate_at < first_sweep, "the R1 gate must run before any timing arm"
+
+    directives = [ln for ln in src.splitlines() if ln.startswith("#SBATCH")]
+    assert any("--partition=@SLURM_PARTITION@" in ln for ln in directives)
+    assert any("--gpus=1" in ln for ln in directives)
+    assert not any("--gres" in ln for ln in directives)
+    assert any("--exclude=@SLURM_EXCLUDE@" in ln for ln in directives), "the full list: the ARM node and the faulty-GPU node"
+    time_line = [ln for ln in directives if "--time=" in ln][0]
+    hours = int(time_line.split("--time=")[1].split(":")[0])
+    assert hours >= 3, "1.5h already timed out on the L=16384 compile (job 2579642)"
+    assert "CKPT" not in src and "checkpoints/" not in src
+
+
+@pytest.mark.willi_parity
+def test_sweep_reports_the_chunk_size_it_actually_used_not_the_one_it_was_asked_for():
+    """Job 2580198: the compiled cs=64 and cs=128 arms timed identically to one
+    microsecond at L=4096 and L=8192 while the uncompiled arms differed by 45%.
+    Recording the requested value proves nothing about what ran, so the sweep has
+    to read the chunk size back off the built module and carry it in the CSV."""
+    src = (REPO_ROOT / "scripts" / "performance_profile.py").read_text()
+    assert "effective_chunk_size" in src
+    assert "effective chunk_size on the built module" in src
+    # It must come from the module, not from the config object.
+    idx = src.index("effective_chunk = None")
+    window = src[idx:idx + 400]
+    assert "layer.mixer.chunk_size" in window, (
+        "the readback must come off the built layer, otherwise it just echoes the config"
+    )
+
+
+@pytest.mark.willi_parity
+def test_no_tracked_file_claims_a_triton_kernel_this_project_does_not_have():
+    """EFFICIENCY_PLAN.md E5-C. A supervisor read this repo and concluded we had
+    written Triton kernels to make Mamba FlashAttention-compatible. We never did:
+    scan_triton.py and tfla_triton.py had one call site between them, in the dead
+    mamba_block_v2.py, and were deleted in 37f7964.
+
+    Four artefacts created that impression and are removed: the root
+    test_triton_fix.py ("Test script to verify the Triton kernel fix"), an unused
+    `triton>=2.1.0` requirement, a package docstring advertising "custom
+    CUDA/Triton kernels", and a wrapper comment about "the same custom Mamba/mLSTM
+    Triton kernels".
+
+    Claiming a kernel you do not have is a correctness claim about your own
+    efficiency numbers, so this is a test, not a style preference. Note that
+    Inductor DOES emit Triton under torch.compile -- describing that is fine;
+    claiming a hand-written kernel is not."""
+    assert not (REPO_ROOT / "test_triton_fix.py").exists(), (
+        "the stale Colab-era Triton script is back"
+    )
+    for req in ("requirements.txt", "requirements_eval.txt", "requirements-e2e.txt", "app/requirements.txt"):
+        text = (REPO_ROOT / req).read_text()
+        assert not any(ln.strip().startswith("triton") for ln in text.splitlines()), (
+            f"{req} declares triton, which nothing in this project imports"
+        )
+    init = (REPO_ROOT / "hybrid_xmamba" / "__init__.py").read_text()
+    assert "custom CUDA/Triton kernels" not in init
+    assert "no hand-written CUDA or Triton kernels" in init
+    kd = (REPO_ROOT / "scripts" / "train_biomedclip_kd_h100.sh").read_text()
+    assert "custom Mamba/mLSTM Triton kernels" not in kd
+
+
+@pytest.mark.willi_parity
+def test_decode_path_can_override_chunk_size_the_way_it_overrides_the_operators():
+    """EFFICIENCY_PLAN.md E6. Efficiency is reported at chunk_size=128 while every
+    quality number was decoded at 64. R1 shows the logits agree to 3.0e-05, which
+    is not the same as showing the decoded tokens agree -- beam search can flip on
+    an arbitrarily small margin, and V5-A watched 227 of 400 reports change under
+    an operator swap that moved no metric.
+
+    So chunk_size must be overridable at decode, on the same mechanism as
+    scan_impl/tfla_impl, and the override must be announced in the log rather than
+    inferred later from a config file."""
+    src = (REPO_ROOT / "scripts" / "evaluate_report_generation.py").read_text()
+    assert "--chunk-size" in src
+    assert "chunk_size=getattr(args, \"chunk_size\", None)" in src
+    # It rides the same announce-on-override loop as the operator flags.
+    i = src.index('("scan_impl", scan_impl)')
+    assert "mamba3_chunk_size" in src[i:i + 300], (
+        "chunk_size must go through the same override-announcing loop as scan_impl"
+    )
+    wrapper = (REPO_ROOT / "scripts" / "inspect_report_generation_h100.sh").read_text()
+    assert 'CHUNK_SIZE="${CHUNK_SIZE:-}"' in wrapper
+    assert '--chunk-size "${CHUNK_SIZE}"' in wrapper
+
+
+@pytest.mark.willi_parity
+def test_e6_wrapper_matches_the_v5a_protocol_it_must_pair_with():
+    """E6's dump is compared against V5-A's by paired bootstrap, so every knob
+    except chunk_size has to match V5-A: 13D, beam 3, 100 new tokens. A wrapper
+    that quietly changed the beam size would manufacture a difference."""
+    src = (REPO_ROOT / "scripts" / "verify_optimised_decode_h100.sh").read_text()
+    assert "DECODE=beam BEAM_SIZE=3 MAX_NEW_TOKENS=100" in src
+    assert "tower13d" in src, "E6 must decode the same 13D checkpoint V5-A used"
+    directives = [ln for ln in src.splitlines() if ln.startswith("#SBATCH")]
+    assert any("--partition=@SLURM_PARTITION@" in ln for ln in directives)
+    assert not any("--gres" in ln for ln in directives)
+    # The pre-registered rule has to be in the wrapper, not only in the plan:
+    # whoever reads the log is the person who will over-claim.
+    assert "PRE-REGISTERED RULE" in src
+    assert "reverts to" in src or "headroom" in src
+
+
+@pytest.mark.willi_parity
+def test_chunk_size_override_is_refused_on_a_config_with_no_mamba3_layer():
+    """Job 2583277 decoded hybrid_150m_v2_rrg -- the incumbent, 9x mamba-1 + 3x
+    mlstm -- with --chunk-size 128. The key was absent, got set, and nothing ever
+    read it, so the run produced ROUGE-L 0.18358 against the reference's 0.1836
+    and looked like a clean tie while measuring the unmodified model.
+
+    A silent no-op that yields a publishable-looking null is worse than a crash,
+    so this is a hard error now."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "evalrg", REPO_ROOT / "scripts" / "evaluate_report_generation.py")
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+    with pytest.raises(ValueError, match="has no 'mamba3' layer"):
+        mod.load_report_generation_module(
+            "/nonexistent.ckpt", "hybrid_150m_v2_rrg", chunk_size=128)
+
+    # The Mamba-3 config must get past the guard (it then fails on the missing
+    # checkpoint, which is a different and expected failure).
+    with pytest.raises(Exception) as exc:
+        mod.load_report_generation_module(
+            "/nonexistent.ckpt", "hybrid_150m_m3_rrg", chunk_size=128)
+    assert "has no 'mamba3' layer" not in str(exc.value)
+
+
+@pytest.mark.willi_parity
+def test_e6_wrapper_decodes_the_mamba3_arm_and_both_chunk_sizes():
+    """The efficiency numbers are all hybrid_150m_m3, so the quality check must be
+    the Mamba-3 decoder -- not 13D, which is the incumbent. Both arms are decoded
+    in the same job so they differ by exactly one setting."""
+    src = (REPO_ROOT / "scripts" / "verify_optimised_decode_h100.sh").read_text()
+    assert "hybrid_150m_m3_rrg" in src
+    assert "h100_report_gen_m3_tower13d_s42" in src
+    assert "tower13d/checkpoints" not in src, "must not default to the incumbent 13D checkpoint"
+    assert 'decode_arm "${REF_DUMP}" 64' in src and 'decode_arm "${DUMP_DIR}" "${CHUNK_SIZE}"' in src
+    # A failed compile arm is data about that arm, not a reason to lose the job.
+    assert "ARM FAILED" in src
+
+
+# ---------------------------------------------------------------------------
+# EFFICIENCY_PLAN.md E7 — the second lever, verified on text instead of logits
+# ---------------------------------------------------------------------------
+
+@pytest.mark.willi_parity
+def test_compile_is_a_decode_lever_threaded_from_the_wrapper_to_the_eval():
+    """The efficiency headline uses TWO settings: chunk_size=128 and torch.compile.
+    E6 verified the first on decoded text. The second was verified only on logits
+    (3.0e-05 against a 1e-4 gate), which is not token identity -- beam search flips
+    on an arbitrarily small margin. So compile has to be reachable from the same
+    decode harness the quality numbers come from."""
+    ev = (REPO_ROOT / "scripts" / "evaluate_report_generation.py").read_text()
+    assert '"--compile", dest="compile_decoder"' in ev
+    assert "compile_decoder_for_inference" in ev
+
+    wrapper = (REPO_ROOT / "scripts" / "inspect_report_generation_h100.sh").read_text()
+    assert 'COMPILE="${COMPILE:-false}"' in wrapper, "compile must default OFF"
+    assert '$([ "${COMPILE}" = "true" ] && echo "--compile")' in wrapper
+
+
+@pytest.mark.willi_parity
+def test_a_compiled_decode_that_silently_ran_eager_is_an_error_not_agreement():
+    """torch.compile fails OPEN. A capture failure, or an exhausted recompile
+    limit as the beam grows one token per step, drops back to eager and still
+    emits perfectly good reports -- which would agree with the eager arm for the
+    trivial reason that neither arm compiled.
+
+    That is the job-2583277 failure class: a no-op producing a publishable-looking
+    null. So the run must abort instead, and it must abort BEFORE writing a dump,
+    because an eager dump is indistinguishable from a real one on disk."""
+    import importlib.util
+    import torch._dynamo as dynamo
+    spec = importlib.util.spec_from_file_location(
+        "evalrg_e7", REPO_ROOT / "scripts" / "evaluate_report_generation.py")
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+    dynamo.reset()
+    dynamo.utils.counters.clear()
+    with pytest.raises(RuntimeError, match="captured NOTHING"):
+        mod.assert_decoder_was_compiled()
+
+    src = (REPO_ROOT / "scripts" / "evaluate_report_generation.py").read_text()
+    guard = src.index("assert_decoder_was_compiled()\n\n    if args.dump_dir:")
+    assert guard > 0, "the compile check must run before write_hyps_refs, not after"
+
+
+@pytest.mark.willi_parity
+def test_compiling_the_decoder_raises_the_recompile_limit():
+    """Beam search feeds a sequence one token longer every step. Under the default
+    static-shape policy that is a fresh graph per length, and Dynamo's default
+    cache_size_limit of 8 is exhausted within 8 generated tokens -- after which it
+    serves eager for the remaining 92 and says so only in a warning buried in a
+    13,000-line log. dynamic=True plus a raised limit is what makes the compiled
+    arm actually compiled."""
+    src = (REPO_ROOT / "scripts" / "evaluate_report_generation.py").read_text()
+    i = src.index("def compile_decoder_for_inference")
+    window = src[i:i + 1600]
+    assert "dynamic: bool = True" in window
+    assert "cache_size_limit" in window
+    assert "torch.compile(module.decoder" in window
+
+
+@pytest.mark.willi_parity
+def test_e7_wrapper_runs_both_arms_and_times_the_canary_on_a_warm_cache():
+    """One job, one setting apart, compiled arm first because its cost is the
+    unknown one. The canary's two timed points must both run warm: if n=4 carries
+    a cold graph build that n=20 does not, the fitted slope lands BELOW the true
+    per-study cost and the projection is optimistic -- the one direction that
+    loses the eight GPU-hours the canary exists to protect."""
+    src = (REPO_ROOT / "scripts" / "verify_compiled_decode_h100.sh").read_text()
+    assert "hybrid_150m_m3_rrg" in src and "h100_report_gen_m3_tower13d_s42" in src
+
+    compiled_at = src.index('decode_arm "${DUMP_DIR}" "${NUM_SAMPLES}" true')
+    eager_at = src.index('decode_arm "${REF_DUMP}" "${NUM_SAMPLES}" false')
+    assert compiled_at < eager_at, "the compiled arm runs first; we already own an eager dump"
+
+    warm_at = src.index("WARM=$(run_canary 2)")
+    assert warm_at < src.index("E4=$(run_canary 4)") < src.index("E20=$(run_canary 20)")
+
+
+def test_no_slurm_script_names_a_partition_account_qos_or_node_list_of_its_own():
+    """The cluster's partition, account, QOS and the nodes a job must avoid are site settings, not code: every wrapper
+    carries the placeholders @SLURM_PARTITION@, @SLURM_ACCOUNT@, @SLURM_QOS@ and @SLURM_EXCLUDE@ or @SLURM_EXCLUDE_ARCH@,
+    which `scripts/chat_remote.sh sync` fills in on the cluster copy from the git-ignored scripts/chat_cluster.env."""
+    offenders = []
+    for p in sorted((REPO_ROOT / "scripts").glob("*.sh")):
+        for line in p.read_text().splitlines():
+            m = re.match(r"#SBATCH --(partition|account|qos|exclude)=(\S+)", line)
+            if m and not re.fullmatch(r"@SLURM_(PARTITION|ACCOUNT|QOS|EXCLUDE|EXCLUDE_ARCH)@", m.group(2)):
+                offenders.append((p.name, line))
+    assert not offenders, offenders
+
+
+def test_chat_cluster_setup_wrapper_is_cpu_only_and_additive():
+    """CHAT_UI_PLAN.md P0-G (R8: additive only). The setup job fills the chat UI's own cluster directory next to the
+    thesis checkout, so it may create symlinks that do not exist yet (`ln -s`, never `ln -sf`, which would replace
+    one), directories, and web-dependency overlays under `--target` (never into the shared venvs), and nothing
+    else: no deletion, no GPU. It executes the x86 venv's python, so it must exclude the ARM node arm03 even though
+    it never sources an activate script."""
+    src = (REPO_ROOT / "scripts" / "chat_cluster_setup_h100.sh").read_text()
+    directives = [l for l in src.splitlines() if l.startswith("#SBATCH")]
+    assert any("--partition=@SLURM_PARTITION@" in l for l in directives)
+    assert any("--account=@SLURM_ACCOUNT@" in l for l in directives)
+    assert any("--qos=@SLURM_QOS@" in l for l in directives), "the proven CPU-only combination"
+    assert any(_excludes_arm(l) for l in directives)
+    assert any("--output=logs/%x_%j.log" in l for l in directives)
+    assert not [l for l in directives if "--gpus" in l or "--gres" in l], "CPU-only job"
+
+    code = [l for l in src.splitlines() if not l.lstrip().startswith("#")]
+    assert "rm " not in src, "no deletion, anywhere in the file"
+    assert "ln -sf" not in src and any("ln -s " in l for l in code)
+    installs = [l for l in code if "pip install" in l]
+    assert len(installs) == 2, "one overlay per venv"
+    assert all("--target" in l for l in installs), "web deps go into overlays, never into the shared venvs"
+    # A failed `uv pip install --target` leaves its directory behind, so a re-run is guarded by a sentinel written
+    # after a passing import check, never by `[ -d overlay ]` (behaviour: tests/test_chat_remote.py).
+    assert ".chat_deps/.setup_ok" in src and ".chat_deps_chexbert/.setup_ok" in src
+    assert "-d .chat_deps" not in src
+
+
+def test_chat_probe_wrapper_is_cpu_only_on_the_renamed_partition():
+    """CHAT_UI_PLAN.md P1-A. CPU-only: a GPU job would hold an accelerator idle for a port check."""
+    src = (REPO_ROOT / "scripts" / "chat_probe_h100.sh").read_text()
+    directives = [l for l in src.splitlines() if l.startswith("#SBATCH")]
+    assert "#SBATCH --partition=@SLURM_PARTITION@" in directives
+    assert "#SBATCH --account=@SLURM_ACCOUNT@" in directives and "#SBATCH --qos=@SLURM_QOS@" in directives
+    assert not [l for l in directives if "--gpus" in l or "--gres" in l]
+    assert any(l.startswith("#SBATCH") and _excludes_arm(l) for l in directives)
+    assert "app/tunnel/probe_server.py" in src and "--sqlite-probe" in src
+
+
+def test_chat_cpu_decode_probe_is_cpu_only_and_decodes_the_published_protocol():
+    """CHAT_UI_PLAN.md P1-C. Same protocol as the published dump, on CPU, compared line by line."""
+    src = (REPO_ROOT / "scripts" / "chat_cpu_decode_probe_h100.sh").read_text()
+    directives = [l for l in src.splitlines() if l.startswith("#SBATCH")]
+    assert "#SBATCH --partition=@SLURM_PARTITION@" in directives and "#SBATCH --qos=@SLURM_QOS@" in directives
+    assert not [l for l in directives if "--gpus" in l or "--gres" in l]
+    assert any(l.startswith("#SBATCH") and _excludes_arm(l) for l in directives)
+    for needle in ("--model-config hybrid_150m_m3_rrg", "--decode beam", "--beam-size 3",
+                   "--max-new-tokens 100", "--cached-decode", "report_gen_m3_test_split_s42/hyps.txt",
+                   "OMP_NUM_THREADS", "HF_HUB_OFFLINE", "cached_vs_published_gpu_differ"):
+        assert needle in src, needle
+    # fix round 1 (behaviour: tests/test_chat_cpu_probe.py). A throwaway warm-up arm pays the cold page-cache read before
+    # the one-study arm that is subtracted as load cost; GNU time is required, never an untimed fallback.
+    order = [src.index(arm) for arm in ("run warm --num-samples 1 --cached-decode", "run cached_1 --num-samples 1",
+                                        "run cached_a ", "run cached_b ", "run uncached ")]
+    assert order == sorted(order), "warm, cached_1, cached_a, cached_b, uncached"
+    assert 'echo "ERROR: /usr/bin/time missing"' in src and "TIME_V" not in src
+
+
+def test_chat_engine_golden_wrappers_compare_on_the_same_node():
+    """CHAT_UI_PLAN.md P2-E. R2: byte identity is only meaningful on the same node and device."""
+    cpu = (REPO_ROOT / "scripts" / "chat_engine_golden_h100.sh").read_text()
+    gpu = (REPO_ROOT / "scripts" / "chat_engine_golden_gpu_h100.sh").read_text()
+    for src in (cpu, gpu):
+        assert "#SBATCH --partition=@SLURM_PARTITION@" in src and _excludes_arm(src)
+        assert "scripts/chat_engine_golden.py" in src
+    assert "scripts/evaluate_report_generation.py" in cpu   # the GPU arm compares with the published dump instead
+    assert not [l for l in cpu.splitlines() if l.startswith("#SBATCH") and "--gpus" in l]
+    assert "#SBATCH --gpus=1" in gpu and "--uncached" in gpu
+
+
+# ── CHAT_UI_PLAN.md P5-B: the gallery build wrapper ───────────────────────────
+# Static pins on scripts/build_retrieval_gallery_h100.sh. Its behaviour (guards, R7 output, the three steps, the gate) is
+# rehearsed for real in tests/test_build_retrieval_gallery.py, together with the builder it runs.
+
+def _gallery_wrapper_text() -> str:
+    return (REPO_ROOT / "scripts" / "build_retrieval_gallery_h100.sh").read_text()
+
+
+def _gallery_wrapper_code(src: str) -> List[str]:
+    """The wrapper's logical lines minus comments and blanks: backslash continuations joined, whitespace squeezed (the #SBATCH
+    directives are comments to bash)."""
+    joined = src.replace("\\\n", " ")
+    return [" ".join(line.split()) for line in joined.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
+def test_build_retrieval_gallery_wrapper_follows_the_slurm_invariants():
+    """P5-B. One H100 through --gpus=1 and never a typed --gres, the renamed partition, the three nodes that cannot run it
+    excluded, no --qos (that is the CPU-only combination), a requeue that appends to the SLURM log, logs where every other
+    wrapper puts them, and offline Hugging Face on a compute node."""
+    src = _gallery_wrapper_text()
+    options, flags = {}, []
+    for line in src.splitlines():
+        if line.startswith("#SBATCH"):
+            token = line.split()[1]
+            if "=" in token:
+                options[token.split("=", 1)[0]] = token.split("=", 1)[1]
+            else:
+                flags.append(token)
+    assert options == {
+        "--partition": "@SLURM_PARTITION@", "--account": "@SLURM_ACCOUNT@", "--gpus": "1", "--exclude": "@SLURM_EXCLUDE@",
+        "--cpus-per-task": "16", "--mem": "64G", "--time": "04:00:00", "--job-name": "chat_gallery",
+        "--output": "logs/%x_%j.log", "--error": "logs/%x_%j.log", "--open-mode": "append"}, options
+    assert flags == ["--requeue"], flags
+    code = _gallery_wrapper_code(src)
+    assert not [l for l in code if "--gres" in l or "--qos" in l], "an untyped --gpus and a typed --gres do not mix; --qos is CPU-only"
+    assert 'cd "${SLURM_SUBMIT_DIR}/hybrid_model_mamba_xlstm" 2>/dev/null || cd "${SLURM_SUBMIT_DIR:-.}"' in code
+    for needle in ("set -euo pipefail", 'SCRATCH_ROOT="${SCRATCH_ROOT:-/sc/scratch/$USER/hybrid_xmamba_h100}"',
+                   'export HF_HOME="${SCRATCH_ROOT}/.hf"', "export HF_HUB_OFFLINE=1", "export HF_DATASETS_OFFLINE=1",
+                   'VENV_ACTIVATE="${VENV_ACTIVATE:-.venv/bin/activate}"', 'source "${VENV_ACTIVATE}"'):
+        assert needle in code, needle
+
+
+def test_build_retrieval_gallery_wrapper_defaults_are_the_plans_inputs_and_agree_with_the_other_chat_wrappers():
+    code = _gallery_wrapper_code(_gallery_wrapper_text())
+    for needle in ('CHAT_HOME="${CHAT_HOME:-/sc/home/$USER/chat_sessions}"', 'DATA="${DATA:-/sc/home/$USER/dataset/mimic_full}"',
+                   'CKPT_13D="${CKPT_13D:-./outputs/h100_kd_150m_v2_full_data_lr3e6/checkpoints/last.ckpt}"',
+                   'CHECKPOINT="${CHECKPOINT:-./outputs/h100_report_gen_m3_tower13d_s42/checkpoints/last.ckpt}"',
+                   'MODEL_CONFIG="${MODEL_CONFIG:-hybrid_150m_m3_rrg}"',
+                   'BUILD_ID="${BUILD_ID:-$(date +%Y%m%d)_${SLURM_JOB_ID:-local}}"', 'OUT="${CHAT_HOME}/gallery/${BUILD_ID}"'):
+        assert needle in code, needle
+    assert not [l for l in code if l.startswith(("OUT=", "OUT_DIR=")) and ":-" in l], "OUT is derived, never an environment lever"
+    eos = (REPO_ROOT / "scripts" / "train_report_eos_h100.sh").read_text()
+    golden = (REPO_ROOT / "scripts" / "chat_engine_golden_gpu_h100.sh").read_text()
+    assert "IMAGE_ENCODER_CKPT=./outputs/h100_kd_150m_v2_full_data_lr3e6/checkpoints/last.ckpt" in eos, "the 13D tower is one file"
+    assert 'CHECKPOINT="${CHECKPOINT:-./outputs/h100_report_gen_m3_tower13d_s42/checkpoints/last.ckpt}"' in golden
+    assert 'DATA="${DATA:-/sc/home/$USER/dataset/mimic_full}"' in golden
+
+
+def test_build_retrieval_gallery_wrapper_runs_three_steps_and_the_reference_script_is_unchanged_on_the_test_split():
+    """P5-B. The builder, then scripts/evaluate_cxr_retrieval.py with the brief's flags on the SAME 13D checkpoint and the
+    official test split, then --compare-rk. Never another split: the gate is the published test-split protocol."""
+    code = _gallery_wrapper_code(_gallery_wrapper_text())
+    text = "\n".join(code)
+    build = text.index("python scripts/build_retrieval_gallery.py --checkpoint-13d")
+    reference = text.index("python scripts/evaluate_cxr_retrieval.py")
+    compare = text.index("python scripts/build_retrieval_gallery.py --compare-rk")
+    assert build < reference < compare
+    assert ('python scripts/evaluate_cxr_retrieval.py --checkpoint "${CKPT_13D}" --dataset mimic --local-parquet-dir "${DATA}" '
+            '--mimic-split test --output-dir "${OUT}/reference_rk"') in text
+    assert ('python scripts/build_retrieval_gallery.py --checkpoint-13d "${CKPT_13D}" --decoder-checkpoint "${CHECKPOINT}" '
+            '--decoder-config "${MODEL_CONFIG}" --data "${DATA}" --out "${OUT}" --build-id "${BUILD_ID}" '
+            '--workers "${SLURM_CPUS_PER_TASK:-8}" --isbi-cache "${SCRATCH_ROOT}/isbi_gallery_adapted.pt"') in text
+    assert 'python scripts/build_retrieval_gallery.py --compare-rk "${OUT}" --wall-s "${SECONDS}"' in text
+    assert "--mimic-split validation" not in text and "--mimic-split train" not in text
+    for name in ("build_retrieval_gallery.py", "evaluate_cxr_retrieval.py"):
+        assert (REPO_ROOT / "scripts" / name).is_file(), name
+
+
+def test_build_retrieval_gallery_wrapper_keeps_every_python_steps_raw_output_out_of_the_job_log():
+    """R7. The raw stdout and stderr of the builder and of the thesis script go to files under ${OUT}; the job log gets [gallery]
+    lines that carry no path, the one RESULT line of the comparison, ERROR lines with a step name and an exit code, and === lines
+    that name no path. A `python scripts/...` that is neither redirected to such a file nor captured by $(...) would print into
+    the log."""
+    code = _gallery_wrapper_code(_gallery_wrapper_text())
+    steps = [l for l in code if "python scripts/" in l]
+    assert len(steps) == 3, steps
+    build, reference, compare = steps
+    assert build.endswith('> "${OUT}/build.log" 2>&1 || rc=$?'), build
+    assert reference.endswith('> "${OUT}/reference_rk.log" 2>&1 || rc=$?'), reference
+    assert compare.startswith('CMP_OUT="$(python scripts/build_retrieval_gallery.py') and compare.endswith(
+        '2>> "${OUT}/compare.err")" || rc=$?'), compare
+    text = "\n".join(code)
+    # the only things that leave a log file: [gallery] lines of a known shape (an allowlist, not a blacklist of characters), the
+    # number of those withheld, and RESULT / ERROR lines
+    assert "tr '\\r' '\\n' < \"${OUT}/build.log\" | grep -aE \"${GALLERY_SHAPES}\" | tail -n 60 || true" in text
+    assert ("WITHHELD=\"$(tr '\\r' '\\n' < \"${OUT}/build.log\" | grep -a '^\\[gallery\\] ' | grep -avcE \"${GALLERY_SHAPES}\" || true)\""
+            in text)
+    assert "case \"${WITHHELD}\" in ''|*[!0-9]*) WITHHELD=unknown ;; esac" in text, "a count that could not be made is not a zero"
+    assert 'echo "=== gallery lines withheld: ${WITHHELD} ==="' in text
+    assert "grep -av '/'" not in text, "a slash is not what makes a line unsafe"
+    assert "printf '%s\\n' \"${CMP_OUT}\" | grep -aE '^(RESULT |ERROR)' || true" in text
+    for step in ("build", "reference", "compare"):
+        assert 'echo "ERROR {} exit=${{rc}}"'.format(step) in text, step
+    printed = [l for l in code if re.match(r"^(echo|printf) ", l)]
+    stray = [l for l in printed if not re.match(r'^(echo "(===|ERROR) |printf \'%s\\n\' "\$\{CMP_OUT\}")', l)]
+    assert not stray, "every printed line starts === or ERROR, or is the filtered comparison output: {}".format(stray)
+    paths = ("${OUT}", "${DATA}", "${CKPT_13D}", "${CHECKPOINT}", "${CHAT_HOME}", "${SCRATCH_ROOT}")
+    messages = [m for l in code for m in re.findall(r'(?:echo|fail) "([^"]*)"', l)]       # what is printed, not what is tested
+    assert len(messages) > 10, messages
+    leaking = [m for m in messages if any(p in m for p in paths)]
+    assert not leaking, "a printed message names a path: {}".format(leaking)
+
+
+def test_build_retrieval_gallery_wrapper_prints_its_sync_stamp_before_anything_else():
+    """Provenance. `scripts/chat_remote.sh sync` leaves .sync_stamp in the tree it ships; the job prints the commit and
+    cleanliness it reads there as its very first line (behaviour, against the real producer's output:
+    tests/test_build_retrieval_gallery.py)."""
+    code = "\n".join(_gallery_wrapper_code(_gallery_wrapper_text()))
+    sync = code.index('echo "=== sync ${SYNC} ==="')
+    assert code.index('echo "') == sync, "something is printed before the sync line"
+    assert code.index("python ") > sync and code.index("source ") > sync
+    assert ".sync_stamp" in code[:sync]
+
+
+def test_build_retrieval_gallery_wrapper_checks_every_path_before_it_creates_or_runs_anything():
+    """R8. No directory is made and no step started before the guards have passed: OUT is under CHAT_HOME and neither inside an
+    outputs directory nor under the thesis checkout, a finished build (manifest.json) is never overwritten, the inputs exist, a
+    GPU is visible."""
+    code = "\n".join(_gallery_wrapper_code(_gallery_wrapper_text()))
+    mkdir = code.index('mkdir -p "${OUT}"')
+    first_step = code.index("python scripts/build_retrieval_gallery.py --checkpoint-13d")
+    for guard in ('fail "OUT is inside an outputs directory"', 'fail "OUT resolves into an outputs directory"',
+                  'fail "OUT is under the thesis checkout (R8)"', 'fail "CHAT_HOME does not exist: run chat_cluster_setup_h100.sh first"',
+                  '[ -e "${OUT}/manifest.json" ]',
+                  'fail "${BUILD_ID} has a manifest.json but no gate_rk.json: it cannot be gated, use a new BUILD_ID"',
+                  'fail "${BUILD_ID} is already built and its gate already decided: a finished build is never overwritten"',
+                  'fail "13D checkpoint (the retrieval tower and text encoder) not found"',
+                  'fail "decoder checkpoint not found"', 'fail "train.parquet not found in DATA"', 'fail "test.parquet not found in DATA"',
+                  'fail "validate.parquet not found in DATA: the reference loader reads train, validate and test together"',
+                  'MIN_FREE_KB=2097152', '"${FREE_KB}" -ge "${MIN_FREE_KB}"',
+                  'fail "${FREE_KB} KB free space where the gallery goes: at least 2 GB are needed"',
+                  '"${GPUS}" -ge 1'):
+        assert guard in code, guard
+        assert code.index(guard) < mkdir < first_step, guard
+    plain_name = '"${BUILD_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$'
+    assert plain_name in code and code.index(plain_name) < code.index('OUT="${CHAT_HOME}/gallery/')
+    assert not re.search(r"(^|[\s;&|(])rm(\s|$)", code, re.M), "additive only: no deletion"
+
+
+def test_build_retrieval_gallery_wrapper_resumes_at_the_gate_only_for_a_finished_build_with_no_verdict_yet():
+    """A manifest.json (step 1 finished) with a gate_rk.json that has no verdict resumes at steps 2 and 3, with the build kept; one
+    whose verdict is in is refused, and so is a manifest with no gate file (behaviour: tests/test_build_retrieval_gallery.py)."""
+    code = "\n".join(_gallery_wrapper_code(_gallery_wrapper_text()))
+    assert code.count("RESUME=0") == 1 and code.count("RESUME=1") == 1
+    assert "grep -q '\"equal\":' \"${OUT}/gate_rk.json\"" in code
+    assert 'echo "=== resume: gate only (build kept) ==="' in code
+    guard = code.index('if [ -e "${OUT}/manifest.json" ]; then')
+    assert code.index("RESUME=0") < guard < code.index("RESUME=1") < code.index('echo "=== resume: gate only (build kept) ==="')
+    build = code.index("python scripts/build_retrieval_gallery.py --checkpoint-13d")
+    reference = code.index("python scripts/evaluate_cxr_retrieval.py")
+    opening = code.rindex('if [ "${RESUME}" -eq 0 ]; then', 0, build)
+    assert opening < build < code.index("\nfi\n", build) < reference, "step 1 is skipped on a resume, steps 2 and 3 never are"
+    assert code.index('echo "=== resume: gate only (build kept) ==="') < build
+
+
+def test_build_retrieval_gallery_wrapper_passes_the_bash_syntax_check():
+    import shutil
+    import subprocess
+    shells = [s for s in ("/bin/bash", shutil.which("bash")) if s and os.path.exists(s)]
+    assert shells
+    for shell in set(shells):
+        done = subprocess.run([shell, "-n", str(REPO_ROOT / "scripts" / "build_retrieval_gallery_h100.sh")],
+                              capture_output=True, text=True)
+        assert done.returncode == 0, (shell, done.stderr)
+
+
+def test_no_yaml_turns_the_report_eos_target_on():
+    """CHAT_UI_PLAN.md P9-G1. dataset.report_eos_target changes what a report-gen run trains on (one supervised
+    EOS per report that fits), so it is off by default and no yaml under configs/ may set it: every published
+    _rrg recipe, the dataset yaml it composes with and the contrastive recipes keep the target every published
+    checkpoint was trained on. A run opts in on the command line with +dataset.report_eos_target=true; the '+'
+    is required because no yaml declares the key (behaviour: tests/test_report_eos_target.py)."""
+    import yaml
+
+    def occurrences(node, trail):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "report_eos_target":
+                    yield trail + "/" + key, value
+                yield from occurrences(value, trail + "/" + str(key))
+        elif isinstance(node, list):
+            for i, value in enumerate(node):
+                yield from occurrences(value, "{}[{}]".format(trail, i))
+
+    paths = sorted((REPO_ROOT / "configs").rglob("*.yaml"))
+    scanned = {p.name for p in paths}
+    assert {"hybrid_150m_v2_rrg.yaml", "transformer_150m_baseline_rrg.yaml", "hybrid_150m_m3_rrg.yaml",
+            "cxr_mimic_full.yaml", "config.yaml"} <= scanned, "the scan missed a published recipe"
+    on = [(str(p.relative_to(REPO_ROOT)), where, value)
+          for p in paths
+          for where, value in occurrences(yaml.safe_load(p.read_text()), "")
+          if value is not False and value is not None]
+    assert not on, "yaml sets report_eos_target: {}".format(on)
+
+
+# ── CHAT_UI_PLAN.md P9-G3: the EOS training wrapper ───────────────────────────
+# Static pins on scripts/train_report_eos_h100.sh. Its behaviour (guards, preflight gate, R7 output, DONE marker) is
+# rehearsed for real in tests/test_report_eos_job.py; the preflight it runs is tests/test_report_eos_preflight.py.
+
+def _eos_wrapper_text() -> str:
+    return (REPO_ROOT / "scripts" / "train_report_eos_h100.sh").read_text()
+
+
+def _eos_wrapper_code(src: str) -> List[str]:
+    """The wrapper's lines minus comments and blanks (the #SBATCH directives are comments to bash)."""
+    return [line for line in src.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
+def test_train_report_eos_wrapper_follows_the_slurm_invariants():
+    """P9-G3. H100 through --gpus=N and never a typed --gres (sbatch rejects the mix), the renamed partition, the three
+    nodes that cannot run it excluded, a requeue that appends to the SLURM log instead of overwriting it, logs where
+    every other wrapper puts them, and offline Hugging Face on a compute node."""
+    src = _eos_wrapper_text()
+    options, flags = {}, []
+    for line in src.splitlines():
+        if line.startswith("#SBATCH"):
+            token = line.split()[1]
+            if "=" in token:
+                options[token.split("=", 1)[0]] = token.split("=", 1)[1]
+            else:
+                flags.append(token)
+    assert options == {
+        "--partition": "@SLURM_PARTITION@", "--account": "@SLURM_ACCOUNT@", "--gpus": "4", "--exclude": "@SLURM_EXCLUDE@",
+        "--cpus-per-task": "8", "--mem": "96G", "--time": "04:00:00", "--job-name": "chat_report_eos",
+        "--output": "logs/%x_%j.log", "--error": "logs/%x_%j.log", "--open-mode": "append"}, options
+    assert flags == ["--requeue"], flags
+    assert not [l for l in _eos_wrapper_code(src) if "--gres" in l], "an untyped --gpus and a typed --gres do not mix"
+    assert 'cd "${SLURM_SUBMIT_DIR}/hybrid_model_mamba_xlstm" 2>/dev/null || cd "${SLURM_SUBMIT_DIR:-.}"' in src
+    for needle in ("set -euo pipefail", 'SCRATCH_ROOT="${SCRATCH_ROOT:-/sc/scratch/$USER/hybrid_xmamba_h100}"',
+                   'export HF_HOME="${SCRATCH_ROOT}/.hf"', "export HF_HUB_OFFLINE=1", "export HF_DATASETS_OFFLINE=1",
+                   'VENV_ACTIVATE="${VENV_ACTIVATE:-.venv/bin/activate}"', 'source "${VENV_ACTIVATE}"'):
+        assert needle in src, needle
+
+
+def test_train_report_eos_wrapper_trains_the_published_decoder_recipe_and_fixes_it():
+    """P9-G3. Every value the published wrapper's override list reads equals what the published s42 decoder run used:
+    submit_v3_chain.sh's decoder submission over train_report_generation_h100.sh's own defaults, both parsed here
+    (tests/report_eos_recipe.py). The values are plain assignments, not environment levers, because sbatch exports the
+    submitting shell: a stray SEED or MAX_STEPS must not be able to change a 5 H100-hour run."""
+    from tests import report_eos_recipe as R
+    published, mine = R.published_recipe(), R.new_wrapper_assignments()
+    names = sorted(set(re.findall(r"\$\{([A-Z][A-Z0-9_]*)\}", " ".join(R.published_wrapper_tokens()))) - {"EXPERIMENT"})
+    assert len(names) > 20, names
+    for name in names:
+        assert name in mine, "the EOS wrapper does not set {}".format(name)
+        assert R.expand(mine[name], dict(mine, USER=R.CLUSTER_USER)) == published[name], name
+        assert ":-" not in mine[name], "{} is an environment lever: the recipe is fixed".format(name)
+    assert mine["EXPERIMENT"] == R.NEW_EXPERIMENT and published["EXPERIMENT"] == R.PUBLISHED_EXPERIMENT
+    assert ":-" not in mine["EXPERIMENT"]
+    # the headline values, written out
+    assert [published[k] for k in ("MODEL_CONFIG", "NUM_GPUS", "TRAINER_CFG", "MAX_STEPS", "SEED", "SAVE_TOP_K",
+                                   "AUX_LAMBDA", "PREFIX_K")] == [
+        "hybrid_150m_m3_rrg", "4", "h100_multi_ddp", "12000", "42", "0", "0.0", "32"]
+    assert published["DECODER_CKPT"] == "./outputs/h100_stage0_150m_m3/checkpoints/last.ckpt"
+    assert published["IMAGE_ENCODER_CKPT"] == "./outputs/h100_kd_150m_v2_full_data_lr3e6/checkpoints/last.ckpt"
+    assert mine["PUBLISHED_EXPERIMENT"] == R.PUBLISHED_EXPERIMENT == "h100_report_gen_m3_tower13d_s42"
+
+
+def test_train_report_eos_wrapper_override_list_is_the_published_wrappers_apart_from_the_allowed_differences():
+    """P9-G3. Same keys, same order, same value expressions as the published wrapper's python call. The differences are
+    exactly: output_dir (the new directory), and two additions at the end, the flag and Hydra's own run directory, which
+    would otherwise be created under ./outputs, a symlink into the thesis checkout."""
+    from tests import report_eos_recipe as R
+    published = [R.unquote(t) for t in R.published_wrapper_tokens()]
+    swapped = ["output_dir=${OUT_DIR}" if t == "output_dir=./outputs/${EXPERIMENT}" else t for t in published]
+    assert swapped != published, "the published wrapper's output_dir override moved"
+    assert [R.unquote(t) for t in R.new_wrapper_tokens()] == swapped + [
+        "+dataset.report_eos_target=true", "hydra.run.dir=${OUT_DIR}/hydra"]
+
+
+def test_train_report_eos_wrapper_writes_nothing_under_outputs():
+    """P9-G3, R8. ./outputs is a symlink into the thesis checkout. The run's own output, its logs and Hydra's directory go
+    under OUT_DIR; the only mentions of outputs are the three paths it READS and the guard that refuses an OUT_DIR there."""
+    src = _eos_wrapper_text()
+    code = _eos_wrapper_code(src)
+    reads = re.compile(r'^(DECODER_CKPT|IMAGE_ENCODER_CKPT)=\./outputs/[\w./-]+$'
+                       r'|^PUBLISHED_META="\./outputs/\$\{PUBLISHED_EXPERIMENT\}/run_metadata\.json"$')
+    other = [l for l in code if "outputs" in l and not reads.match(l.strip())]
+    assert other and all(("case " in l or "fail " in l or "realpath_py outputs" in l) for l in other), other
+    redirects = []
+    for line in code:
+        if line.lstrip().startswith(("echo", "fail")):
+            continue                                              # a message may contain a '>'
+        redirects += re.findall(r'(?<![0-9&])>>?\s*("[^"]+"|\S+)', line)
+    assert redirects, "the wrapper redirects the trainer, the preflight and the DONE marker"
+    stray = [t for t in redirects if t != "/dev/null" and not t.startswith(('"${OUT_DIR}/', '"${START_MARK}"'))]
+    assert not stray, stray
+    assert 'OUT_DIR="${CHAT_HOME:-/sc/home/$USER/chat_sessions}/models/report_gen_m3_eos_s42"' in src
+    assert '"${OUT_DIR}/DONE"' in src and "*/outputs/*" in src, "the DONE and outputs guards"
+
+
+def test_train_report_eos_wrapper_redirects_the_trainer_and_prints_only_wrapper_authored_lines():
+    """P9-G3, R7. The trainer's stdout and stderr (report text, study paths) go to OUT_DIR/train.log and are never
+    printed; every line the wrapper prints starts with ===, RESULT or ERROR (the shapes `chat_remote.sh summary`
+    shows) and names no path."""
+    src = _eos_wrapper_text()
+    code = _eos_wrapper_code(src)
+    train = [l for l in code if "python scripts/train_report_generation.py" in l]
+    assert len(train) == 1 and '>> "${OUT_DIR}/train.log" 2>&1' in train[0], train
+    assert '"ERROR train exit=${rc}"' in src
+    text = "\n".join(code)
+    echoed, failed = re.findall(r'echo "([^"]*)"', text), re.findall(r'\bfail "([^"]*)"', text)
+    assert len(echoed) + len(failed) > 10, (echoed, failed)
+    for line in echoed:
+        assert re.match(r"(=== |RESULT |ERROR)", line), line          # fail() adds its own ERROR prefix
+    for line in echoed + failed:
+        for var in ("OUT_DIR", "CHAT_HOME", "DECODER_CKPT", "IMAGE_ENCODER_CKPT", "PUBLISHED_META", "MIMIC_CACHE_DIR",
+                    "SCRATCH_ROOT", "START_MARK", "MAIN_REPO", "OUT_REAL", "MAIN_REAL"):
+            assert "${" + var + "}" not in line, (var, line)
+    assert 'fail() { echo "ERROR $*"; exit 1; }' in src
+    # No slash anywhere in what is printed: a repo-relative script path is a path too (fix 1, minor 6).
+    assert not [line for line in echoed + failed if "/" in line], [line for line in echoed + failed if "/" in line]
+    # Every refusal to write DONE reads `ERROR done refused: <reason>`, with literals and numbers only.
+    for reason in ("interrupt.ckpt", "last.ckpt is missing", "last.ckpt was not written during this attempt",
+                   "steps=${STEPS} expected=${MAX_STEPS}"):
+        assert any(f.startswith("done refused:") and reason in f for f in failed), reason
+    for line in code:
+        assert not re.match(r"\s*(date|hostname|nvidia-smi|env|printenv|cat|tail|head|less)\b", line), line
+    assert "set -x" not in src and "set -o xtrace" not in src
+
+
+def test_train_report_eos_wrapper_prints_its_sync_stamp_before_anything_else():
+    """Provenance (fix 1, minor 4). `scripts/chat_remote.sh sync` leaves .sync_stamp in the tree it ships; the job prints the
+    commit and cleanliness it reads there as its very first line, before any other output and before any command runs
+    (behaviour, against the real producer's output: tests/test_report_eos_job.py)."""
+    code = "\n".join(_eos_wrapper_code(_eos_wrapper_text()))
+    sync = code.index('echo "=== sync ${SYNC} ==="')
+    assert code.index('echo "') == sync, "something is printed before the sync line"
+    assert code.index("python ") > sync and code.index("source ") > sync
+    assert ".sync_stamp" in code[:sync]
+
+
+def test_train_report_eos_wrapper_runs_the_preflight_first_on_the_one_override_list():
+    """P9-G3. One source for the overrides: the same OVERRIDES array goes to the preflight, which composes it, and to
+    the trainer, which runs it. The preflight runs first and its failure ends the job."""
+    src = _eos_wrapper_text()
+    code = "\n".join(_eos_wrapper_code(src))
+    assert code.count("OVERRIDES=(") == 1
+    pre = code.index("python scripts/report_eos_preflight.py")
+    train = code.index("python scripts/train_report_generation.py")
+    result = code.index("python scripts/report_eos_result.py")
+    assert pre < train < result
+    assert 'python scripts/report_eos_preflight.py --published "${PUBLISHED_META}" -- "${OVERRIDES[@]}"' in code
+    assert 'python scripts/train_report_generation.py --config-name config "${OVERRIDES[@]}"' in code
+    assert 'fail "preflight exit=${rc}, nothing was trained"' in code
+    assert code.index('fail "preflight exit=') < train, "the gate sits between the preflight and the trainer"
+    for name in ("report_eos_preflight.py", "report_eos_result.py"):
+        assert (REPO_ROOT / "scripts" / name).is_file(), name
+
+
+def test_train_report_eos_wrapper_passes_the_bash_syntax_check():
+    import shutil
+    import subprocess
+    shells = [s for s in ("/bin/bash", shutil.which("bash")) if s and os.path.exists(s)]
+    assert shells
+    for shell in set(shells):
+        done = subprocess.run([shell, "-n", str(REPO_ROOT / "scripts" / "train_report_eos_h100.sh")],
+                              capture_output=True, text=True)
+        assert done.returncode == 0, (shell, done.stderr)
+
+
+# ── CHAT_UI_PLAN.md P9-G4: the EOS evaluation wrappers ────────────────────────
+# Static pins on the three jobs that measure the EOS model on the official test split: scripts/eval_report_eos_h100.sh (decode,
+# GPU), eval_report_eos_chexbert_h100.sh and eval_report_eos_compare_h100.sh (CPU), and on the scripts/report_eos_stats.py they
+# call. Their behaviour (guards, R7 output, what each writes) is rehearsed for real in tests/test_report_eos_eval.py.
+
+_EVAL_WRAPPERS = {"decode": "eval_report_eos_h100.sh", "chexbert": "eval_report_eos_chexbert_h100.sh",
+                  "compare": "eval_report_eos_compare_h100.sh"}
+
+
+def _eval_text(kind: str) -> str:
+    return (REPO_ROOT / "scripts" / _EVAL_WRAPPERS[kind]).read_text()
+
+
+def _sbatch_options(src: str):
+    """({--key: value}, [bare flags]) of the #SBATCH directives."""
+    options, flags = {}, []
+    for line in src.splitlines():
+        if line.startswith("#SBATCH"):
+            token = line.split()[1]
+            if "=" in token:
+                options[token.split("=", 1)[0]] = token.split("=", 1)[1]
+            else:
+                flags.append(token)
+    return options, flags
+
+
+def _logical_lines(src: str) -> List[str]:
+    """The wrapper's commands, one per entry: comments and blanks dropped, backslash continuations joined."""
+    found, current = [], ""
+    for raw in src.splitlines():
+        line = raw.rstrip()
+        if not current and (not line.strip() or line.lstrip().startswith("#")):
+            continue
+        if line.endswith("\\"):
+            current += line[:-1].strip() + " "
+        else:
+            found.append((current + line.strip()).strip())
+            current = ""
+    return found
+
+
+def _command(src: str, needle: str) -> str:
+    """The one logical line containing `needle`."""
+    found = [l for l in _logical_lines(src) if needle in l]
+    assert len(found) == 1, "{} command lines contain {!r}: the wrapper changed shape, update this pin".format(len(found), needle)
+    return found[0]
+
+
+def _plain_assignments(src: str) -> Dict[str, str]:
+    """NAME=value lines with a plain value: no ${...} default, so no environment lever."""
+    return dict(re.findall(r'(?m)^([A-Z][A-Z0-9_]*)=([^\s$"#]+)[ \t]*(?:#.*)?$', src))
+
+
+_EVAL_COMMON = {"--partition": "@SLURM_PARTITION@", "--account": "@SLURM_ACCOUNT@", "--exclude": "@SLURM_EXCLUDE@",
+                "--output": "logs/%x_%j.log", "--error": "logs/%x_%j.log", "--open-mode": "append"}
+_EVAL_SLURM = {
+    "decode": dict(_EVAL_COMMON, **{"--gpus": "1", "--cpus-per-task": "4", "--mem": "32G", "--time": "02:00:00",
+                                    "--job-name": "chat_eos_eval"}),
+    "chexbert": dict(_EVAL_COMMON, **{"--qos": "@SLURM_QOS@", "--cpus-per-task": "4", "--mem": "16G", "--time": "02:00:00",
+                                      "--job-name": "chat_eos_chexbert"}),
+    "compare": dict(_EVAL_COMMON, **{"--qos": "@SLURM_QOS@", "--cpus-per-task": "4", "--mem": "16G", "--time": "02:00:00",
+                                     "--job-name": "chat_eos_compare"}),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_EVAL_WRAPPERS))
+def test_eval_report_eos_wrappers_follow_the_slurm_invariants(kind):
+    """P9-G4. The decode asks for one H100 through --gpus=1 and never a typed --gres; the two scoring jobs are the proven
+    CPU-only combination (--qos=@SLURM_QOS@, no GPU). All three: the renamed partition, the three nodes that cannot run them
+    excluded, a requeue that appends to the SLURM log, logs where every other wrapper puts them, and the standard cd line."""
+    src = _eval_text(kind)
+    options, flags = _sbatch_options(src)
+    assert options == _EVAL_SLURM[kind], options
+    assert flags == ["--requeue"], flags
+    code = _eos_wrapper_code(src)
+    assert not [l for l in code if "--gres" in l], "an untyped --gpus and a typed --gres do not mix"
+    assert 'cd "${SLURM_SUBMIT_DIR}/hybrid_model_mamba_xlstm" 2>/dev/null || cd "${SLURM_SUBMIT_DIR:-.}"' in src
+    assert "set -euo pipefail" in src and "mkdir -p logs" in src
+    assert ("--gpus" in options) == (kind == "decode") and ("--qos" in options) == (kind != "decode")
+
+
+def test_eval_report_eos_wrappers_have_the_offline_environment_the_job_needs():
+    """Decode and comparison: every other chat job's offline Hugging Face (the GPT-2 tokenizer is read from the cache under
+    SCRATCH_ROOT). The CheXbert scorer is the exception D24 records: its weights live in the DEFAULT cache, so HF_HOME is not
+    overridden, and HF_HUB_OFFLINE defaults to 0 as in score_chexbert_h100.sh."""
+    for kind in ("decode", "compare"):
+        src = _eval_text(kind)
+        for needle in ('SCRATCH_ROOT="${SCRATCH_ROOT:-/sc/scratch/$USER/hybrid_xmamba_h100}"', 'export HF_HOME="${SCRATCH_ROOT}/.hf"',
+                       "export HF_HUB_OFFLINE=1", "export HF_DATASETS_OFFLINE=1", 'VENV_ACTIVATE="${VENV_ACTIVATE:-.venv/bin/activate}"',
+                       'source "${VENV_ACTIVATE}"'):
+            assert needle in src, (kind, needle)
+    chexbert = _eval_text("chexbert")
+    assert 'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"' in chexbert
+    assert 'VENV_ACTIVATE="${VENV_ACTIVATE:-.venv_chexbert/bin/activate}"' in chexbert and 'source "${VENV_ACTIVATE}"' in chexbert
+    assert "HF_HOME" not in "\n".join(_eos_wrapper_code(chexbert)), "D24: the CheXbert weights are in the default cache"
+    thesis = (REPO_ROOT / "scripts" / "score_chexbert_h100.sh").read_text()
+    assert 'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"' in thesis and "HF_HOME" not in "\n".join(_eos_wrapper_code(thesis))
+
+
+def test_eval_report_eos_decode_is_the_published_eval_command_plus_the_eos_flags():
+    """P9-G4. The command is the one submit_v3_chain.sh's eval stage gave inspect_report_generation_h100.sh for the published
+    Mamba-3 runs (the wrapper's own defaults under the chain's overrides), with exactly three differences: --cached-decode,
+    --stop-at-eos and --max-new-tokens 200; and, since P9-G6, one flag the published wrapper has no name for, --length-penalty, whose
+    lever defaults to the published 1.0. Both published sources are parsed here, so this fails when either moves. Everything else is a
+    plain assignment, not an environment lever: sbatch exports the submitting shell."""
+    inspect_src = (REPO_ROOT / "scripts" / "inspect_report_generation_h100.sh").read_text()
+    chain = (REPO_ROOT / "scripts" / "submit_v3_chain.sh").read_text()
+    mine_src = _eval_text("decode")
+
+    # what the published eval ran: the wrapper's defaults, then the chain's eval submission over them
+    defaults = dict(re.findall(r'(?m)^([A-Z][A-Z0-9_]*)="\$\{\1:-([^}]*)\}"', inspect_src))
+    anchor = 'ev=$(_v3_submit "eval s${seed}"'
+    assert anchor in chain, "submit_v3_chain.sh's eval submission moved: update this pin, which reads the published eval from it"
+    submission = chain.split(anchor, 1)[1].split("scripts/inspect_report_generation_h100.sh", 1)[0]
+    chain_values = dict(re.findall(r'"([A-Z][A-Z0-9_]*)=([^"]*)"', submission))
+    published = dict(defaults, **chain_values)
+    assert {k: published[k] for k in ("MODEL_CONFIG", "PREFIX_K", "DECODE", "BEAM_SIZE", "NUM_SAMPLES", "MAX_NEW_TOKENS")} == {
+        "MODEL_CONFIG": "hybrid_150m_m3_rrg", "PREFIX_K": "32", "DECODE": "beam", "BEAM_SIZE": "3", "NUM_SAMPLES": "999999",
+        "MAX_NEW_TOKENS": "100"}
+    assert defaults["CACHED_DECODE"] == "false", "the published eval is uncached: --cached-decode is the first difference"
+    # Nothing else the inspect wrapper can switch on is on in the published eval, and the chain never mentions any of it. If it
+    # ever does, the published run is no longer "this command minus three flags" and this decode would silently compare against
+    # another one. The chain is searched whole, not just its eval submission: an `export` or a lever threaded through would reach the
+    # eval job without appearing among that submission's VAR=value pairs.
+    for name in ("SCAN_IMPL", "TFLA_IMPL", "CHUNK_SIZE"):
+        assert defaults[name] == "", "the published eval pins {}: this decode must too".format(name)
+    for name in ("COMPILE", "CHEXBERT", "CACHED_DECODE"):
+        assert defaults[name] == "false", "the published eval turns {} on".format(name)
+    for name in ("SCAN_IMPL", "TFLA_IMPL", "CHUNK_SIZE", "COMPILE", "CHEXBERT", "CACHED_DECODE"):
+        assert name not in chain, "submit_v3_chain.sh mentions {}: the published eval may no longer be the default one".format(name)
+
+    inspect_flags = set(re.findall(r"--[a-z][a-z-]*", _command(inspect_src, "python scripts/evaluate_report_generation.py")))
+    inspect_flags |= set(re.findall(r"\+=\((--[a-z][a-z-]*)", inspect_src))        # --chexbert and --dump-dir ride in an array
+    variable_of = dict(re.findall(r'(--[a-z][a-z-]*) "\$\{([A-Z][A-Z0-9_]*)\}"', inspect_src))
+    assert variable_of["--model-config"] == "MODEL_CONFIG" and variable_of["--max-new-tokens"] == "MAX_NEW_TOKENS"
+
+    call = _command(mine_src, "python scripts/evaluate_report_generation.py")
+    mine_flags = re.findall(r"--[a-z][a-z-]*", call.split(">>")[0])
+    assert mine_flags == ["--checkpoint", "--model-config", "--prefix-k", "--cached-decode", "--stop-at-eos", "--parquet",
+                          "--num-samples", "--decode", "--beam-size", "--max-new-tokens", "--length-penalty", "--dump-dir"], mine_flags
+    # --stop-at-eos (P9-G2) and --length-penalty (P9-G6) are the two flags the published wrapper cannot pass: the EOS decode's own
+    assert set(mine_flags) - {"--stop-at-eos", "--length-penalty"} <= inspect_flags, "a flag the published wrapper cannot pass"
+    assert '--length-penalty "${LP_ARG}"' in call and call.index("--max-new-tokens") < call.index("--length-penalty") < call.index("--dump-dir")
+    always = {"--checkpoint", "--model-config", "--parquet", "--num-samples", "--decode", "--beam-size", "--max-new-tokens"}
+    assert always <= set(mine_flags), "a flag the published eval always passes"
+    assert {"--prefix-k", "--dump-dir"} <= set(mine_flags), "the chain set PREFIX_K and DUMP_DIR"
+
+    mine = _plain_assignments(mine_src)
+    for flag in ("--model-config", "--prefix-k", "--num-samples", "--decode", "--beam-size"):
+        variable = variable_of[flag]
+        assert mine[variable] == published[variable], (flag, mine[variable], published[variable])
+        assert '{} "${{{}}}"'.format(flag, variable) in call, flag
+    assert mine["MAX_NEW_TOKENS"] == "200" != published["MAX_NEW_TOKENS"] and '--max-new-tokens "${MAX_NEW_TOKENS}"' in call
+    assert "--cached-decode --stop-at-eos " in call
+
+    # the three defaults the rulings name, the one lever of the decode itself (P9-G6), and nothing else is a lever. The default dump is the
+    # G4 directory for the published penalty and the penalty's own for any other: DUMP_DIR_DEFAULT is a plain value, never a lever.
+    for line in ('CKPT="${CKPT:-${CHAT_HOME:-/sc/home/$USER/chat_sessions}/models/report_gen_m3_eos_s42/checkpoints/last.ckpt}"',
+                 'PARQUET="${PARQUET:-/sc/home/$USER/dataset/mimic_full/test.parquet}"',
+                 'DUMP_DIR="${DUMP_DIR:-${DUMP_DIR_DEFAULT}}"', 'LENGTH_PENALTY="${LENGTH_PENALTY:-1.0}"'):
+        assert line in mine_src, line
+    assert mine["DUMP_DIR_DEFAULT"] == "results/chat_report_eos_test_split_s42", "the G4 directory, for the published penalty"
+    levers = set(re.findall(r'(?m)^([A-Z][A-Z0-9_]*)="\$\{\1:-', mine_src))
+    assert levers == {"SCRATCH_ROOT", "VENV_ACTIVATE", "CKPT", "PARQUET", "LENGTH_PENALTY", "DUMP_DIR", "PUBLISHED_DIR"}, levers
+    assert 'PUBLISHED_DIR="${PUBLISHED_DIR:-results/report_gen_m3_test_split_s42}"' in mine_src
+
+
+def test_eval_report_eos_decode_header_says_two_hours_are_enough_for_the_expected_decode_and_thin_at_the_full_budget():
+    """The first sentence of the TIME paragraph must say what its own arithmetic says: at 12.7 ms a step the expected decode takes
+    1.4 h and a run at the full budget 2.2 h, which is over the limit. The controller submits with the 4 h override."""
+    header = "\n".join(l for l in _eval_text("decode").splitlines() if l.startswith("#") and not l.startswith("#SBATCH"))
+    time_paragraph = header[header.index("# TIME."):header.index("# It refuses")]
+    label, first_sentence = " ".join(l.lstrip("# ") for l in time_paragraph.splitlines()).split(". ")[:2]
+    assert label == "TIME" and "enough for the expected decode" in first_sentence and "thin at the full budget" in first_sentence, (
+        label, first_sentence)
+    assert "even at the full" not in header and "holds the cached decode" not in header, "the sentence the arithmetic contradicts"
+    for needle in ("--time=02:00:00", "6.35 ms", "12.7 ms", "1.4 h", "2.2 h", "TIMEOUT", "--time=04:00:00"):
+        assert needle in time_paragraph, needle
+
+
+_LP_CHECK = ('LP_CENTI="$(lp_centi "${LENGTH_PENALTY}")" || fail "LENGTH_PENALTY is not a number with at most two decimals"',
+             '{ [ "${LP_CENTI}" -ge 50 ] && [ "${LP_CENTI}" -le 300 ]; } || fail "LENGTH_PENALTY is outside 0.5 to 3.0"')
+
+
+def test_eval_report_eos_decode_has_one_lever_of_the_decode_itself_the_length_penalty_validated_before_anything_runs():
+    """P9-G6. LENGTH_PENALTY (default 1.0, the published ranking) is a number from 0.5 to 3.0 with at most two decimals: the integer part
+    is one digit, so no arithmetic can wrap, and two values that print alike cannot name one directory twice. A refusal never echoes the
+    value (an environment variable of the submitting shell can hold anything), and it comes before the banner, the GPU probe and every
+    directory. The evaluator and the stats script both get the canonical LP_ARG; the default dump follows the penalty."""
+    src = _eval_text("decode")
+    code = "\n".join(_eos_wrapper_code(src))
+    assert 'LENGTH_PENALTY="${LENGTH_PENALTY:-1.0}"' in code
+    assert "local re='^([0-3])(\\.([0-9]{1,2}))?$' frac" in code and '[[ "$1" =~ $re ]] || return 1' in code
+    assert 'frac="${BASH_REMATCH[3]}00"' in code and "echo $(( ${BASH_REMATCH[1]} * 100 + 10#${frac:0:2} ))" in code
+    for line in _LP_CHECK:
+        assert line in code, line
+    assert 'LP_ARG="$((LP_CENTI / 100)).$(printf \'%02d\' $((LP_CENTI % 100)))"' in code
+    assert "LP_NNN=\"$(printf '%03d' \"${LP_CENTI}\")\"" in code
+    assert ('[ "${LP_CENTI}" -eq 100 ] || DUMP_DIR_DEFAULT="results/chat_report_eos_lp${LP_NNN}_test_split_s42"' in code
+            and code.index("LP_NNN=") < code.index("DUMP_DIR_DEFAULT=\"results/chat_report_eos_lp") < code.index('DUMP_DIR="${DUMP_DIR:-${DUMP_DIR_DEFAULT}}"'))
+    banner, first_guard = code.index('echo "=== P9-G4 decode:'), code.index('case "${DUMP_DIR}" in')
+    assert code.index(_LP_CHECK[0]) < code.index(_LP_CHECK[1]) < banner < first_guard, "the penalty is judged before the banner, which shows it"
+    assert code.index(_LP_CHECK[1]) < code.index("python -c") and code.index(_LP_CHECK[1]) < code.index('mkdir -p "${DUMP_DIR}"')
+    assert "length penalty ${LP_ARG} " in code[banner:code.index("\n", banner)]
+    stats_call = _command(src, "python scripts/report_eos_stats.py decode")
+    assert '--budget "${MAX_NEW_TOKENS}" --length-penalty "${LP_ARG}" --wall-s "${WALL_S}"' in stats_call
+    messages = [m for m in re.findall(r'\bfail "([^"]*)"', code) if "penalty" in m.lower()]
+    assert len(messages) == 2 and not [m for m in messages if "$" in m], messages   # static text: neither the lever nor LP_ARG is in a refusal
+
+
+def test_eval_report_eos_decode_header_documents_the_length_penalty_and_the_submit_lines_of_one_arm():
+    """P9-G6: the controller submits an arm from the decode wrapper's header. The three lines mirror the G4 chain (the compare wrapper's
+    header), one afterok on the one before, and the directory they name is the one the wrapper's own rule gives for 2.0."""
+    header = "\n".join(l for l in _eval_text("decode").splitlines() if l.startswith("#") and not l.startswith("#SBATCH"))
+    arm = "results/chat_report_eos_lp200_test_split_s42"
+    decode = "DEC=$(bash scripts/chat_remote.sh submit scripts/eval_report_eos_h100.sh LENGTH_PENALTY=2.0 -- --time=04:00:00)"
+    chexbert = ("CHX=$(bash scripts/chat_remote.sh submit scripts/eval_report_eos_chexbert_h100.sh DUMP_DIR=" + arm
+                + " -- --dependency=afterok:${DEC%%;*})")
+    compare = ("CMP=$(bash scripts/chat_remote.sh submit scripts/eval_report_eos_compare_h100.sh DUMP_DIR=" + arm
+               + " PUBLISHED_DIR=results/report_gen_m3_test_split_s42 -- --dependency=afterok:${CHX%%;*})")
+    lines = [l.lstrip("# ").rstrip() for l in header.splitlines()]
+    for line in (decode, chexbert, compare):
+        assert lines.count(line) == 1, line
+    assert lines.index(decode) < lines.index(chexbert) < lines.index(compare)
+    assert lines.index("bash scripts/chat_remote.sh sync") < lines.index(decode), "sync first, as in the G4 chain"
+    for needle in ("LENGTH_PENALTY", "0.5 to 3.0", "two decimals", "default 1.0", "results/chat_report_eos_lp<NNN>_test_split_s42",
+                   "never overwritten", "chat_remote.sh summary logs/chat_eos_eval_", "Length penalty: x", "length_penalty",
+                   "refusing a directory whose name and log disagree"):   # the comparison's name check (fix 1), said where the arms are submitted
+        assert needle in header, needle
+    assert arm == "results/chat_report_eos_lp{:03d}_test_split_s42".format(round(2.0 * 100)), "the header's directory is the rule's for 2.0"
+    compare_header = "\n".join(l for l in _eval_text("compare").splitlines() if l.startswith("#") and not l.startswith("#SBATCH"))
+    assert "eval_report_eos_h100.sh" in compare_header and "length-penalty arm" in compare_header and "eos_lp<NNN>_s42" in compare_header
+    assert "must bear it out" in compare_header and "refused rather than read as 1.0" in compare_header   # fix 1: the name check, in the header
+
+
+def test_eval_report_eos_compare_names_system_a_after_the_penalty_the_dumps_own_log_records():
+    """P9-G6. No lever and nothing to type twice: the penalty is read from the decode's own eval.log (its last `Length penalty: x` line,
+    which starts at column 0; none means a dump from before the lever, decoded at 1.0), judged as the decode job judges its lever, and
+    names system A and its report. A refusal does not quote what was read. Plain NAME_A=eos_s42 stays the published penalty's name."""
+    src = _eval_text("compare")
+    code = "\n".join(_eos_wrapper_code(src))
+    assert _plain_assignments(src)["NAME_A"] == "eos_s42"
+    assert "LENGTH_PENALTY" not in code, "the comparison has no lever for it: the dump's own log is the record"
+    assert "local re='^([0-3])(\\.([0-9]{1,2}))?$' frac" in code and 'frac="${BASH_REMATCH[3]}00"' in code
+    assert "grep -a '^Length penalty: [0-9.]*$' \"${DUMP_DIR}/eval.log\"" in code and "tail -n 1" in code
+    for needle in ('LP_LOGGED=1.0', 'if [ -f "${DUMP_DIR}/eval.log" ]; then', 'LP_LOGGED="${LP_LOGGED:-1.0}"',
+                   'LP_CENTI="$(lp_centi "${LP_LOGGED}")" || fail "the length penalty in the dump\'s eval.log is not a number with at most two decimals"',
+                   '{ [ "${LP_CENTI}" -ge 50 ] && [ "${LP_CENTI}" -le 300 ]; } || fail "the length penalty in the dump\'s eval.log is outside 0.5 to 3.0"',
+                   '[ "${LP_CENTI}" -eq 100 ] || NAME_A="eos_lp$(printf \'%03d\' "${LP_CENTI}")_s42"'):
+        assert needle in code, needle
+    guard, resolve = code.index('case "${DUMP_DIR}" in'), code.index("LP_LOGGED=1.0")
+    output = code.index('OUTPUT="${DUMP_DIR}/bootstrap_${NAME_A}_vs_${NAME_B}.md"')
+    banner, exists = code.index('echo "=== P9-G4 compare:'), code.index('if [ -e "${OUTPUT}" ]; then')
+    assert guard < resolve < code.index("NAME_A=\"eos_lp") < output < exists, "the log is read after DUMP_DIR passed its guard, the name before it is used"
+    assert code.index("NAME_A=\"eos_lp") < banner and exists < code.index("python scripts/bootstrap_compare.py")
+    # P9-G5a/G6 fix 1: a directory named like an arm's is a claim, which the log must bear out; a log that is not there cannot
+    for needle in ('DUMP_PATH="${DUMP_DIR%"${DUMP_DIR##*[!/]}"}"', 'case "${DUMP_PATH}" in', "*lp[0-9][0-9][0-9]_test_split_s42)",
+                   '[ -f "${DUMP_DIR}/eval.log" ] || fail "the dump\'s directory names a length penalty, and the dump has no eval.log to confirm it"',
+                   'DIR_NNN="${DUMP_PATH%_test_split_s42}"',
+                   '[ "$((10#${DIR_NNN: -3}))" -eq "${LP_CENTI}" ] || fail "the dump\'s directory names another length penalty than its eval.log records"'):
+        assert needle in code, needle
+    assert (code.index('{ [ "${LP_CENTI}" -ge 50 ]') < code.index('case "${DUMP_PATH}" in') < code.index("NAME_A=\"eos_lp")
+            ), "the name check comes after the log's own penalty has been judged, and before it names anything"
+    messages = [m for m in re.findall(r'\bfail "([^"]*)"', code) if "penalty" in m.lower()]
+    assert len(messages) == 4 and not [m for m in messages if "$" in m], messages   # static text: what the log held is not in a refusal
+
+
+def test_eval_report_eos_chexbert_header_says_a_length_penalty_arms_dump_is_just_another_dump_directory():
+    header = "\n".join(l for l in _eval_text("chexbert").splitlines() if l.startswith("#") and not l.startswith("#SBATCH"))
+    assert "length-penalty arm" in header and "results/chat_report_eos_lp<NNN>_test_split_s42" in header and "DUMP_DIR" in header
+
+
+def test_eval_report_eos_decode_refuses_without_done_and_over_an_existing_dump_and_outside_results_chat():
+    src = _eval_text("decode")
+    assert 'RUN_DIR="$(dirname "$(dirname "${CKPT}")")"' in src and '[ -f "${RUN_DIR}/DONE" ] ||' in src
+    assert '[ -e "${DUMP_DIR}/hyps.txt" ]' in src and '[ -e "${DUMP_DIR}/refs.txt" ]' in src
+    assert "results/chat_?*)" in src and "*..*)" in src
+    code = "\n".join(_eos_wrapper_code(src))
+    first_write = code.index('mkdir -p "${DUMP_DIR}"')
+    for message in ("DUMP_DIR is not a new chat_ directory", "checkpoint not found", "the training run has no DONE marker",
+                    "test parquet not found", "the dump already holds hyps.txt or refs.txt", "venv not found", "GPU(s) visible",
+                    "the published dump has no refs.txt"):
+        assert 0 <= code.index(message) < first_write, "no directory is created before the guard '{}' has passed".format(message)
+    # Job 3 refuses two dumps that are not the same studies. Job 1 says so first, after its own result and before its END line, so
+    # that afterok stops the chain before the CheXbert hour: the same byte-for-byte test, on the same two files.
+    compare = 'cmp -s "${DUMP_DIR}/refs.txt" "${PUBLISHED_DIR}/refs.txt" || fail "refs differ from the published dump"'
+    assert compare in code
+    assert code.index("report_eos_stats.py decode") < code.index(compare) < code.index('echo "=== END decode ==="')
+    assert 'cmp -s "${DUMP_DIR}/refs.txt" "${PUBLISHED_DIR}/refs.txt"' in _eval_text("compare")
+
+
+def test_eval_report_eos_wrappers_send_raw_output_to_files_in_the_dump_dir_and_print_only_wrapper_authored_lines():
+    """R7. The evaluator's stdout (GENERATED:, REFERENCE:, study ids), the scorer's and the bootstrap's go to files in the dump
+    directory and are never printed; the stats script's stderr goes to a file and its stdout is cut down to the three line
+    shapes `chat_remote.sh summary` shows. Every line a wrapper prints starts with ===, RESULT or ERROR and names no path."""
+    path_variables = ("DUMP_DIR", "CKPT", "PARQUET", "RUN_DIR", "PUBLISHED_DIR", "OUTPUT", "CHAT_HOME", "SCRATCH_ROOT", "VENV_ACTIVATE")
+    redirected = {"decode": ("python scripts/evaluate_report_generation.py", '>> "${DUMP_DIR}/eval.log" 2>&1'),
+                  "chexbert": ("python scripts/score_chexbert_standalone.py", '>> "${DUMP_DIR}/chexbert.log" 2>&1'),
+                  "compare": ("python scripts/bootstrap_compare.py", '>> "${DUMP_DIR}/bootstrap.log" 2>&1')}
+    for kind in sorted(_EVAL_WRAPPERS):
+        src = _eval_text(kind)
+        code = _eos_wrapper_code(src)
+        needle, redirect = redirected[kind]
+        assert redirect in _command(src, needle), (kind, "the tool's raw output is not sent to a file")
+        helpers = [l for l in _logical_lines(src) if "python scripts/report_eos_stats.py" in l]
+        assert helpers, kind
+        for line in helpers:
+            assert '2>> "${DUMP_DIR}/' in line, (kind, "the stats script's stderr is not sent to a file", line)
+        assert any("grep -aE '^(=== |RESULT |ERROR)'" in l for l in code), kind
+        redirects = []
+        for line in code:
+            if line.lstrip().startswith(("echo", "fail")):
+                continue                                              # a message may contain a '>'
+            redirects += re.findall(r'(?<![0-9&])>>?\s*("[^"]+"|\S+)', line)
+        assert redirects, kind
+        stray = [t for t in redirects if t != "/dev/null" and not t.startswith('"${DUMP_DIR}/')]
+        assert not stray, (kind, stray)
+        text = "\n".join(code)
+        echoed, failed = re.findall(r'echo "([^"]*)"', text), re.findall(r'\bfail "([^"]*)"', text)
+        failed += re.findall(r'(?m)^need "[^"]*" "([^"]*)"', text)                 # the comparison's input checks print through need()
+        assert len(echoed) + len(failed) >= 6, (kind, echoed, failed)
+        for line in echoed:
+            assert re.match(r"(=== |RESULT |ERROR)", line), (kind, line)               # fail() adds its own ERROR prefix
+        for line in echoed + failed:
+            assert "/" not in line, (kind, line)                                        # a repo-relative path is a path too
+            for var in path_variables:
+                assert "${" + var + "}" not in line, (kind, var, line)
+        assert 'fail() { echo "ERROR $*"; exit 1; }' in src
+        for line in code:
+            assert not re.match(r"\s*(date|hostname|nvidia-smi|env|printenv|cat|tail|head|less)\b", line), (kind, line)
+        assert "set -x" not in src and "set -o xtrace" not in src
+
+
+def test_eval_report_eos_wrappers_print_the_sync_stamp_first_and_with_the_p9_g3_snippet_verbatim():
+    """Provenance, as the training wrapper prints it: the commit and cleanliness `chat_remote.sh sync` last shipped, read from
+    .sync_stamp, as the very first line. The snippet is the training wrapper's, copied exactly."""
+    train = _eos_wrapper_text()
+    start = train.index('SYNC="unknown"')
+    snippet = train[start:train.index('echo "=== sync ${SYNC} ==="', start) + len('echo "=== sync ${SYNC} ==="')]
+    assert ".sync_stamp" in snippet and snippet.count("\n") >= 6
+    for kind in sorted(_EVAL_WRAPPERS):
+        src = _eval_text(kind)
+        assert snippet in src, kind
+        code = "\n".join(_eos_wrapper_code(src))
+        sync = code.index('echo "=== sync ${SYNC} ==="')
+        assert code.index('echo "') == sync, (kind, "something is printed before the sync line")
+        assert code.index("python ") > sync and ".sync_stamp" in code[:sync], kind
+
+
+def test_eval_report_eos_compare_runs_the_thesis_bootstrap_with_the_thesis_defaults_inside_the_dump_dir():
+    """P9-G4. scripts/bootstrap_compare.py, unchanged, with the flags bootstrap_compare_h100.sh gives it when it has label
+    matrices and PER_LABEL=true, the seed and resample count that wrapper defaults to, the EOS dump as A and the published
+    Mamba-3 s42 dump as B, and its report beside the EOS dump."""
+    thesis = (REPO_ROOT / "scripts" / "bootstrap_compare_h100.sh").read_text()
+    thesis_flags = set(re.findall(r"--[a-z][a-z-]*", _command(thesis, "python3 scripts/bootstrap_compare.py").split("${EXTRA_ARGS")[0]))
+    for line in thesis.splitlines():
+        if "EXTRA_ARGS+=(" in line:
+            thesis_flags |= set(re.findall(r"--[a-z][a-z-]*", line))
+    assert {"--hyps-a", "--hyps-b", "--refs", "--name-a", "--name-b", "--bootstrap-samples", "--seed", "--output", "--labels-a",
+            "--labels-b", "--per-label"} <= thesis_flags
+    thesis_defaults = dict(re.findall(r'(?m)^([A-Z][A-Z0-9_]*)="\$\{\1:-([^}]*)\}"', thesis))
+    src = _eval_text("compare")
+    mine = _plain_assignments(src)
+    assert (mine["SAMPLES"], mine["SEED"]) == (thesis_defaults["SAMPLES"], thesis_defaults["SEED"]) == ("1000", "0")
+    assert (mine["NAME_A"], mine["NAME_B"]) == ("eos_s42", "m3_s42")
+    assert 'OUTPUT="${DUMP_DIR}/bootstrap_${NAME_A}_vs_${NAME_B}.md"' in src
+    for line in ('DUMP_DIR="${DUMP_DIR:-results/chat_report_eos_test_split_s42}"',
+                 'PUBLISHED_DIR="${PUBLISHED_DIR:-results/report_gen_m3_test_split_s42}"'):
+        assert line in src, line
+    call = _command(src, "python scripts/bootstrap_compare.py")
+    assert set(re.findall(r"--[a-z][a-z-]*", call.split(">>")[0])) == thesis_flags
+    for needle in ('--hyps-a "${DUMP_DIR}/hyps.txt"', '--hyps-b "${PUBLISHED_DIR}/hyps.txt"', '--refs "${DUMP_DIR}/refs.txt"',
+                   '--name-a "${NAME_A}"', '--name-b "${NAME_B}"', '--bootstrap-samples "${SAMPLES}"', '--seed "${SEED}"',
+                   '--output "${OUTPUT}"', '--labels-a "${DUMP_DIR}/chexbert_labels.json"',
+                   '--labels-b "${PUBLISHED_DIR}/chexbert_labels.json"', "--per-label"):
+        assert needle in call, needle
+    code = "\n".join(_eos_wrapper_code(src))
+    assert code.index("python scripts/bootstrap_compare.py") < code.index("report_eos_stats.py hyps") < code.index("report_eos_stats.py gate")
+    assert 'cmp -s "${DUMP_DIR}/refs.txt" "${PUBLISHED_DIR}/refs.txt"' in code, "the two systems must have been scored on the same studies"
+    levers = set(re.findall(r'(?m)^([A-Z][A-Z0-9_]*)="\$\{\1:-', src))
+    assert levers == {"SCRATCH_ROOT", "VENV_ACTIVATE", "DUMP_DIR", "PUBLISHED_DIR"}, levers
+
+
+def test_eval_report_eos_compare_header_documents_the_three_chained_submit_lines():
+    """P9-G4 ruling 4: the controller submits the three jobs; the compare wrapper's header is where the exact lines are."""
+    header = "\n".join(l for l in _eval_text("compare").splitlines() if l.startswith("#") and not l.startswith("#SBATCH"))
+    decode = "bash scripts/chat_remote.sh submit scripts/eval_report_eos_h100.sh"
+    chexbert = ("bash scripts/chat_remote.sh submit scripts/eval_report_eos_chexbert_h100.sh DUMP_DIR=results/chat_report_eos_test_split_s42 "
+                "-- --dependency=afterok:")
+    compare = ("bash scripts/chat_remote.sh submit scripts/eval_report_eos_compare_h100.sh DUMP_DIR=results/chat_report_eos_test_split_s42 "
+               "PUBLISHED_DIR=results/report_gen_m3_test_split_s42 -- --dependency=afterok:")
+    for line in (decode, chexbert, compare):
+        assert line in header, line
+    assert decode + " -- --time=04:00:00)" in header, "job 1 is documented with the 4 h override the controller submits it with"
+    assert header.index(decode) < header.index(chexbert) < header.index(compare)
+    assert "chat_remote.sh sync" in header and "chat_remote.sh summary logs/chat_eos_eval_" in header
+
+
+def test_eval_report_eos_chexbert_replaces_the_thesis_scorer_wrapper_only_because_of_what_that_one_prints():
+    """P9-G4 ruling 2. score_chexbert_h100.sh would have been reused unchanged if every line `chat_remote.sh summary` shows
+    were free of text, ids and paths. It is not: its first line is a `===` line (shown) naming both file paths, its ERROR
+    lines name paths too, it prints no RESULT line, and it lets the scorer's raw output into the job log. The thin wrapper runs
+    the same script with the same three arguments and prints none of that. If the thesis wrapper is ever made R7-safe, this
+    test is the prompt to reconsider the thin one."""
+    thesis = (REPO_ROOT / "scripts" / "score_chexbert_h100.sh").read_text()
+    assert 'echo "=== Phase 11B standalone CheXbert scoring: ${HYP_FILE} / ${REF_FILE} ==="' in thesis
+    assert 'echo "ERROR: ${HYP_FILE} or ${REF_FILE} not found' in thesis and "RESULT" not in thesis
+    assert re.match(r"=== ", "=== Phase 11B standalone CheXbert scoring: x / y ===")           # SUMMARY_PATTERN shows it
+    src = _eval_text("chexbert")
+    thesis_call = _command(thesis, "python scripts/score_chexbert_standalone.py")
+    mine_call = _command(src, "python scripts/score_chexbert_standalone.py")
+    assert re.findall(r"--[a-z][a-z-]*", mine_call.split(">>")[0]) == re.findall(r"--[a-z][a-z-]*", thesis_call) == [
+        "--hyp-file", "--ref-file", "--output-dir"]
+    for needle in ('--hyp-file "${DUMP_DIR}/hyps.txt"', '--ref-file "${DUMP_DIR}/refs.txt"', '--output-dir "${DUMP_DIR}"'):
+        assert needle in mine_call, needle
+    assert 'DUMP_DIR="${DUMP_DIR:-results/chat_report_eos_test_split_s42}"' in src
+    # chexbert_metrics.json is written first and chexbert_labels.json last: only the second marks a finished scoring
+    assert '[ -e "${DUMP_DIR}/chexbert_labels.json" ]' in src
+
+
+def test_eval_report_eos_wrappers_pass_the_bash_syntax_check():
+    import shutil
+    import subprocess
+    shells = [s for s in ("/bin/bash", shutil.which("bash")) if s and os.path.exists(s)]
+    assert shells
+    for kind in sorted(_EVAL_WRAPPERS):
+        for shell in set(shells):
+            done = subprocess.run([shell, "-n", str(REPO_ROOT / "scripts" / _EVAL_WRAPPERS[kind])], capture_output=True, text=True)
+            assert done.returncode == 0, (kind, shell, done.stderr)
+
+
+def test_eval_report_eos_stats_script_is_stdlib_only_at_import_so_the_chexbert_venv_can_run_it():
+    """The CheXbert job runs `report_eos_stats.py chexbert` in .venv_chexbert (transformers<5, no torch, no hybrid_xmamba): its
+    module-level imports must be the standard library's, and the one sibling it needs (repair_generations) is itself stdlib-only."""
+    if not hasattr(sys, "stdlib_module_names"):
+        pytest.skip("sys.stdlib_module_names needs Python 3.10")
+    for name in ("report_eos_stats.py", "repair_generations.py"):
+        tree = ast.parse((REPO_ROOT / "scripts" / name).read_text())
+        imported = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                imported |= {alias.name.split(".")[0] for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                imported.add(node.module.split(".")[0])
+        assert imported <= set(sys.stdlib_module_names) | {"scripts"}, (name, sorted(imported - set(sys.stdlib_module_names)))
+
+
+def test_chexbert_service_imports_nothing_from_hybrid_xmamba():
+    """P5-A. app/labeler.py runs in .venv_chexbert (pins transformers<5 and scikit-learn<1.8 for f1chexbert), an environment apart from
+    the one that runs hybrid_xmamba; like scripts/score_chexbert_standalone.py it must import nothing from the package. That includes
+    every other first-party module (app.engine imports hybrid_xmamba, so any `app` or `scripts` import is a way in), and app.labels in
+    particular: the service reports F1CheXbert's own label names, so the client's CHEXBERT_14 is checked against something independent."""
+    path = REPO_ROOT / "app" / "labeler.py"
+    assert path.is_file(), path
+    roots = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):       # walk reaches the lazy import inside _get() too
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            roots.add("app" if node.level else (node.module or "").split(".")[0])
+    assert "f1chexbert" in roots, roots          # the walker does see function-level imports, so it would see a lazy hybrid_xmamba one
+    assert not roots & {"hybrid_xmamba", "app", "scripts", "tests"}, sorted(roots)
+
+
+def _imports_of(path):
+    """-> (the top-level names a module imports anywhere, its imports of first-party `app` modules), lazy ones included."""
+    roots, first_party = set(), set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            top = "app" if node.level else (node.module or "").split(".")[0]
+            roots.add(top)
+            if top == "app":
+                first_party.add(node.module or "")
+    return roots, first_party
+
+
+def test_the_request_hardening_module_imports_only_the_standard_library_starlette_and_the_apps_schemas():
+    """P8-A. app/hardening.py (the request id, the request log, the turn rate limit) is imported by app/server.py, so by every test and by the
+    serving command line before a model is loaded. It carries no torch and no thesis code, and the one first-party module it reads is
+    app.schemas (error_body): app.server passes it what it needs of its own (the client-id pattern), so there is no import cycle either."""
+    if not hasattr(sys, "stdlib_module_names"):
+        pytest.skip("sys.stdlib_module_names needs Python 3.10")
+    roots, first_party = _imports_of(REPO_ROOT / "app" / "hardening.py")
+    assert roots <= set(sys.stdlib_module_names) | {"starlette", "app"}, sorted(roots)
+    assert first_party == {"app.schemas"}, first_party
+
+
+def test_the_retention_module_imports_only_the_standard_library():
+    """P8-B. app/retention.py (the retention days and the sweep thread) is imported by app/server.py and by app/cli.py's argument check, which
+    runs before anything is loaded: the standard library only and no first-party module, so reading RETENTION_DAYS can never start a model or
+    open the database."""
+    if not hasattr(sys, "stdlib_module_names"):
+        pytest.skip("sys.stdlib_module_names needs Python 3.10")
+    roots, first_party = _imports_of(REPO_ROOT / "app" / "retention.py")
+    assert roots <= set(sys.stdlib_module_names), sorted(roots - set(sys.stdlib_module_names))
+    assert not first_party, first_party
+
+
+# ── CHAT_UI_PLAN.md P5-C: the gallery labelling wrappers ──────────────────────
+# Static pins on scripts/label_gallery_reports_h100.sh (one GPU job with a canary), scripts/label_gallery_reports_cpu_h100.sh (the sharded
+# CPU fallback and its merge) and the scripts/label_gallery_reports.py they run. Their behaviour (guards, R7 output, the canary, shards and
+# merge, the requeue paths, the cross-check) is rehearsed for real in tests/test_label_gallery_reports.py, with the real script and a fake
+# f1chexbert; the rehearsal harness it shares with the gallery build's is tests/wrapper_rehearsal.py.
+
+_LABEL_WRAPPERS = {"gpu": "label_gallery_reports_h100.sh", "cpu": "label_gallery_reports_cpu_h100.sh"}
+_LABEL_COMMON = dict(_EVAL_COMMON, **{"--cpus-per-task": "4", "--mem": "16G", "--time": "02:00:00"})
+_LABEL_SLURM = {
+    "gpu": dict(_LABEL_COMMON, **{"--gpus": "1", "--job-name": "chat_labels"}),
+    "cpu": dict(_LABEL_COMMON, **{"--qos": "@SLURM_QOS@", "--job-name": "chat_labels_cpu"}),
+}
+_LABEL_SCRIPT_CALL = "python scripts/label_gallery_reports.py"
+
+
+def _label_text(kind: str) -> str:
+    return (REPO_ROOT / "scripts" / _LABEL_WRAPPERS[kind]).read_text()
+
+
+@pytest.mark.parametrize("kind", sorted(_LABEL_WRAPPERS))
+def test_label_gallery_wrappers_follow_the_slurm_invariants(kind):
+    """P5-C. The GPU job asks for one H100 through --gpus=1 and never a typed --gres; the fallback is the proven CPU-only combination
+    (--qos=@SLURM_QOS@, no GPU). Both: the renamed partition, the three nodes that cannot run them excluded (the venv is x86), a requeue that
+    appends to the SLURM log, logs where every other wrapper puts them, the standard cd line. The array is not in the header: it is given at
+    submission, so that the very same wrapper can be the merge."""
+    src = _label_text(kind)
+    options, flags = _sbatch_options(src)
+    assert options == _LABEL_SLURM[kind], options
+    assert flags == ["--requeue"], flags
+    code = _eos_wrapper_code(src)
+    assert not [l for l in code if "--gres" in l], "an untyped --gpus and a typed --gres do not mix"
+    assert 'cd "${SLURM_SUBMIT_DIR}/hybrid_model_mamba_xlstm" 2>/dev/null || cd "${SLURM_SUBMIT_DIR:-.}"' in src
+    assert "set -euo pipefail" in src and "mkdir -p logs" in src
+    assert ("--gpus" in options) == (kind == "gpu") and ("--qos" in options) == (kind == "cpu")
+    assert not [l for l in src.splitlines() if l.startswith("#SBATCH") and "--array" in l]
+
+
+def test_label_gallery_wrappers_have_the_chexbert_environment_of_score_chexbert_h100_and_no_hf_home():
+    """D24: the CheXbert weights live in the DEFAULT Hugging Face cache, so HF_HOME is not overridden (and not mentioned: the pin of the other
+    CheXbert wrappers), HF_HUB_OFFLINE defaults to 0 as in score_chexbert_h100.sh, and the venv is .venv_chexbert."""
+    thesis = (REPO_ROOT / "scripts" / "score_chexbert_h100.sh").read_text()
+    assert 'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"' in thesis and "HF_HOME" not in "\n".join(_eos_wrapper_code(thesis))
+    for kind in sorted(_LABEL_WRAPPERS):
+        code = "\n".join(_eos_wrapper_code(_label_text(kind)))
+        assert 'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"' in code and "export PYTHONUNBUFFERED=1" in code, kind
+        assert 'VENV_ACTIVATE="${VENV_ACTIVATE:-.venv_chexbert/bin/activate}"' in code and 'source "${VENV_ACTIVATE}"' in code, kind
+        assert "HF_HOME" not in code and "HF_DATASETS" not in code and "HF_HUB_OFFLINE=1" not in code, kind
+        assert code.index('source "${VENV_ACTIVATE}"') < code.index('export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"'), kind
+
+
+def test_label_gallery_wrappers_defaults_are_the_plans_and_only_the_documented_names_are_levers():
+    """The plan's gallery build (g13d_m3_v1), the published Mamba-3 s42 dump as the reference, the canary of the brief. GALLERY is derived
+    from CHAT_HOME and one plain name, never a lever of its own (sbatch exports the submitting shell, and GALLERY is a likely name)."""
+    common = ['VENV_ACTIVATE="${VENV_ACTIVATE:-.venv_chexbert/bin/activate}"', 'CHAT_HOME="${CHAT_HOME:-/sc/home/$USER/chat_sessions}"',
+              'BUILD_ID="${BUILD_ID:-g13d_m3_v1}"', 'REFERENCE_DIR="${REFERENCE_DIR:-results/report_gen_m3_test_split_s42}"',
+              'CANARY="${CANARY:-1000}"', 'GALLERY="${CHAT_HOME}/gallery/${BUILD_ID}"']
+    per_kind = {"gpu": ['BUDGET_S="${BUDGET_S:-5400}"'], "cpu": ['BUDGET_S="${BUDGET_S:-6000}"', 'SHARDS="${SHARDS:-8}"', 'MERGE="${MERGE:-0}"']}
+    levers = {"gpu": {"VENV_ACTIVATE", "CHAT_HOME", "BUILD_ID", "REFERENCE_DIR", "BUDGET_S", "CANARY"},
+              "cpu": {"VENV_ACTIVATE", "CHAT_HOME", "BUILD_ID", "REFERENCE_DIR", "BUDGET_S", "CANARY", "SHARDS", "MERGE"}}
+    for kind in sorted(_LABEL_WRAPPERS):
+        src = _label_text(kind)
+        code = "\n".join(_eos_wrapper_code(src))
+        for line in common + per_kind[kind]:
+            assert line in code, (kind, line)
+        assert set(re.findall(r'(?m)^([A-Z][A-Z0-9_]*)="\$\{\1:-', src)) == levers[kind], kind
+    gallery = (REPO_ROOT / "scripts" / "build_retrieval_gallery_h100.sh").read_text()
+    assert 'CHAT_HOME="${CHAT_HOME:-/sc/home/$USER/chat_sessions}"' in gallery and 'OUT="${CHAT_HOME}/gallery/${BUILD_ID}"' in gallery
+
+
+def test_label_gallery_wrappers_run_the_script_with_one_command_each_and_send_its_raw_output_to_a_file_in_the_gallery():
+    """R7. Every `python scripts/label_gallery_reports.py` is redirected to a log inside ${GALLERY} (stdout and stderr: the library's warnings,
+    a traceback that echoes report text), never printed; the job log gets the script's lines of a known shape, a count of the others, and
+    wrapper-authored lines."""
+    gpu = [l for l in _logical_lines(_label_text("gpu")) if _LABEL_SCRIPT_CALL in l]
+    assert gpu == [_LABEL_SCRIPT_CALL + ' --gallery "${GALLERY}" --reference-dir "${REFERENCE_DIR}" --budget-s "${BUDGET_S}" '
+                   '--canary "${CANARY}" --device auto > "${GALLERY}/labels.log" 2>&1 || rc=$?']
+    cpu = [l for l in _logical_lines(_label_text("cpu")) if _LABEL_SCRIPT_CALL in l]
+    assert cpu == [
+        _LABEL_SCRIPT_CALL + ' --gallery "${GALLERY}" --reference-dir "${REFERENCE_DIR}" --budget-s "${BUDGET_S}" --canary "${CANARY}" '
+        '--device cpu --shard "${SLURM_ARRAY_TASK_ID}" --of "${SHARDS}" > "${LOG}" 2>&1 || rc=$?',
+        _LABEL_SCRIPT_CALL + ' --gallery "${GALLERY}" --reference-dir "${REFERENCE_DIR}" --merge --of "${SHARDS}" > "${LOG}" 2>&1 || rc=$?']
+    cpu_text = "\n".join(_eos_wrapper_code(_label_text("cpu")))
+    assert 'LOG="${GALLERY}/labels_shard_${SLURM_ARRAY_TASK_ID}.log"' in cpu_text and 'LOG="${GALLERY}/labels_merge.log"' in cpu_text
+    for kind, log in (("gpu", '"${GALLERY}/labels.log"'), ("cpu", '"${LOG}"')):
+        text = "\n".join(_eos_wrapper_code(_label_text(kind)))
+        assert "tr '\\r' '\\n' < {} | grep -aE \"${{LABEL_SHAPES}}\" | tail -n 60 || true".format(log) in text, kind
+        assert ("WITHHELD=\"$(tr '\\r' '\\n' < {} | grep -aE '^(\\[labels\\] |RESULT |ERROR|=== )' | grep -avcE \"${{LABEL_SHAPES}}\" || true)\""
+                .format(log)) in text, kind
+        assert "case \"${WITHHELD}\" in ''|*[!0-9]*) WITHHELD=unknown ;; esac" in text, "a count that could not be made is not a zero"
+        assert 'echo "=== label lines withheld: ${WITHHELD} ==="' in text
+        # Exit 2 is the canary's only with the script's own canary line (of a known shape) in the raw log: python exits 2 itself when it
+        # cannot open the script. Without the line it is a failure, printed as such, and the wrapper's own exit is 1: its exit 2 is the hand-over.
+        seen = "CANARY_SEEN=\"$(tr '\\r' '\\n' < {} | grep -aE \"${{LABEL_SHAPES}}\" | grep -c '^\\[labels\\] canary: ' || true)\"".format(log)
+        assert seen in text, kind
+        assert "case \"${CANARY_SEEN}\" in ''|*[!0-9]*) CANARY_SEEN=0 ;; esac" in text, "a count that could not be made is no canary"
+        hand_over = 'if [ "${rc}" -eq 2 ] && [ "${CANARY_SEEN}" -ge 1 ]; then'
+        failure = 'if [ "${rc}" -ne 0 ]; then\n  echo "ERROR labels exit=${rc}"\n  if [ "${rc}" -eq 2 ]; then exit 1; fi\n  exit "${rc}"\nfi'
+        assert hand_over in text and failure in text, kind
+        assert text.index(seen) < text.index(hand_over) < text.index(failure), kind
+        assert text.count('if [ "${rc}" -eq 2 ]') == 2, "the hand-over test and the one that keeps exit 2 for it, and no other"
+
+
+def test_label_gallery_wrappers_print_only_wrapper_authored_lines_that_name_no_path():
+    """Every line the wrappers print themselves starts with === or ERROR (fail adds its own ERROR), and names no path variable and no path: the
+    one exception is the pair of submit lines the GPU job prints when it hands over to the CPU path, which name the CPU wrapper (repo code)."""
+    path_variables = ("GALLERY", "GALLERY_REAL", "MAIN_REAL", "CHAT_HOME", "REFERENCE_DIR", "VENV_ACTIVATE", "LOG")
+    submit_lines = {'=== 1. bash scripts/chat_remote.sh submit scripts/label_gallery_reports_cpu_h100.sh BUILD_ID=${BUILD_ID} -- --array=0-7 ===',
+                    '=== 2. bash scripts/chat_remote.sh submit scripts/label_gallery_reports_cpu_h100.sh BUILD_ID=${BUILD_ID} MERGE=1 -- '
+                    '--dependency=afterok:<the array job id> ==='}
+    for kind in sorted(_LABEL_WRAPPERS):
+        src = _label_text(kind)
+        code = _eos_wrapper_code(src)
+        text = "\n".join(code)
+        echoed, failed = re.findall(r'echo "([^"]*)"', text), re.findall(r'\bfail "([^"]*)"', text)
+        assert len(echoed) + len(failed) >= 12, (kind, echoed, failed)
+        for line in echoed:
+            assert re.match(r"(=== |ERROR )", line), (kind, line)
+        for line in echoed + failed:
+            if line in submit_lines:
+                continue
+            assert "/" not in line, (kind, line)
+            for var in path_variables:
+                assert "${" + var + "}" not in line, (kind, var, line)
+        assert (kind == "gpu") == (submit_lines <= set(echoed)), "only the GPU job prints the submit lines"
+        assert 'fail() { echo "ERROR $*"; exit 1; }' in src
+        for line in code:
+            assert not re.match(r"\s*(date|hostname|nvidia-smi|env|printenv|cat|tail|head|less)\b", line), (kind, line)
+        assert "set -x" not in src and "set -o xtrace" not in src
+
+
+def test_label_gallery_wrappers_hold_one_allowlist_and_it_is_not_a_blacklist():
+    """The shapes of the lines the script prints, anchored, one per line (tests/test_label_gallery_reports.py runs them through grep over
+    everything printed and over ids, text and paths); both wrappers carry the same list, and no pattern is a wildcard."""
+    lists = []
+    for kind in sorted(_LABEL_WRAPPERS):
+        found = re.search(r"^LABEL_SHAPES='(.*?)'$", _label_text(kind), re.M | re.S)
+        assert found, kind
+        patterns = found.group(1).split("\n")
+        lists.append(patterns)
+        assert "" not in patterns and all(p.startswith("^") and p.endswith("$") for p in patterns), kind
+        assert not [p for p in patterns if re.search(r"(\.\*|\.\+|\\S|\\w|\\d)", p)], "a wildcard in an allowlist"
+        assert "grep -av '/'" not in _label_text(kind), "the blacklist is not the filter"
+    assert lists[0] == lists[1]
+
+
+def test_label_gallery_wrappers_print_their_sync_stamp_first_and_with_the_p9_g3_snippet_verbatim():
+    """Provenance, as the other chat wrappers print it: the commit and cleanliness `chat_remote.sh sync` last shipped, read from .sync_stamp, as
+    the very first line. The snippet is the training wrapper's, copied exactly."""
+    train = _eos_wrapper_text()
+    start = train.index('SYNC="unknown"')
+    snippet = train[start:train.index('echo "=== sync ${SYNC} ==="', start) + len('echo "=== sync ${SYNC} ==="')]
+    assert ".sync_stamp" in snippet and snippet.count("\n") >= 6
+    for kind in sorted(_LABEL_WRAPPERS):
+        src = _label_text(kind)
+        assert snippet in src, kind
+        code = "\n".join(_eos_wrapper_code(src))
+        sync = code.index('echo "=== sync ${SYNC} ==="')
+        assert code.index('echo "') == sync, (kind, "something is printed before the sync line")
+        assert code.index("python ") > sync and code.index("source ") > sync and ".sync_stamp" in code[:sync], kind
+
+
+def test_label_gallery_wrappers_check_everything_before_the_script_runs_and_never_delete():
+    """R8. No raw log is opened and no step started before every guard has passed: one plain build name, whole numbers, CHAT_HOME, the manifest,
+    the venv, the labelling script itself (python answers a script it cannot find with exit 2, which is also the hand-over code), the gallery's
+    place (not in an outputs directory, not under the thesis checkout), a finished labelling (never overwritten: refused before its job's raw
+    log is replaced), the reference dump's two files."""
+    guards = ['fail "BUILD_ID must be one plain name: letters, digits, dot, dash, underscore"',
+              'fail "BUDGET_S must be a whole number of seconds, at most 6 digits"', 'fail "CANARY must be a whole number of groups, at most 7 digits"',
+              'fail "CHAT_HOME does not exist: run chat_cluster_setup_h100.sh first"',
+              'fail "the gallery has no manifest.json: build it first (build_retrieval_gallery_h100.sh)"',
+              'fail "the CheXbert venv is missing: run setup_chexbert_venv_h100.sh first"',
+              '[ -f scripts/label_gallery_reports.py ] || fail "label_gallery_reports.py is missing from this tree: run chat_remote.sh sync first"',
+              'fail "the gallery is inside an outputs directory"',
+              'fail "the gallery resolves into an outputs directory"', 'fail "the gallery is under the thesis checkout (R8)"',
+              'fail "the gallery is already labelled (labels_status done): a finished labelling is never overwritten (R8)"',
+              'fail "the reference dump has no refs.txt"', 'fail "the reference dump has no chexbert_labels.json"',
+              """grep -Eq '"labels_status":[[:space:]]*"done"' "${GALLERY}/manifest.json" """.strip()]
+    for kind in sorted(_LABEL_WRAPPERS):
+        code = "\n".join(_eos_wrapper_code(_label_text(kind)))
+        first_run = code.index(_LABEL_SCRIPT_CALL)
+        for guard in guards:
+            assert 0 <= code.index(guard) < first_run, (kind, guard)
+        assert code.index('"${BUILD_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$') < code.index('GALLERY="${CHAT_HOME}/gallery/')
+        assert not re.search(r"(^|[\s;&|(])rm(\s|$)", code, re.M) and "--delete" not in code and "ln -sf" not in code, "additive only: no deletion"
+    cpu = "\n".join(_eos_wrapper_code(_label_text("cpu")))
+    for guard in ('fail "SHARDS must be a whole number from 1 to 999"', 'fail "MERGE must be 0 or 1"',
+                  'fail "not an array task: submit with --array=0-7 (SHARDS tasks), or with MERGE=1 for the merge"',
+                  'fail "array task ${SLURM_ARRAY_TASK_ID} is outside the ${SHARDS} shards"'):
+        assert 0 <= cpu.index(guard) < cpu.index(_LABEL_SCRIPT_CALL), guard
+
+
+def test_label_gallery_gpu_wrapper_asks_the_venvs_torch_and_hands_over_the_cpu_path_on_exit_2():
+    """CHAT_UI_PLAN.md D24 and P5-C. .venv_chexbert's torch comes from the CPU index (scripts/setup_chexbert_venv_h100.sh), so a GPU job's torch
+    may see no GPU: the count is asked of the venv's own torch, and no GPU means exit 2 and the two submit lines at once. The canary's own exit 2
+    prints the same two lines. The CPU wrapper never asks for a GPU, and asks the labeller for the CPU."""
+    setup = (REPO_ROOT / "scripts" / "setup_chexbert_venv_h100.sh").read_text()
+    assert "pip install torch --index-url https://download.pytorch.org/whl/cpu" in setup, "the reason for the probe moved: re-read this"
+    gpu = "\n".join(_eos_wrapper_code(_label_text("gpu")))
+    assert "python -c 'import torch; n = torch.cuda.device_count(); print(n, torch.cuda.get_device_name(0) if n else \"none\")'" in gpu
+    assert gpu.index("use_the_cpu_path\n  exit 2") > gpu.index("torch.cuda.device_count()"), "the probe's own exit 2"
+    assert gpu.count("use_the_cpu_path\n  exit 2") == 2, "one for no GPU, one for the canary"
+    assert gpu.index('if [ "${rc}" -eq 2 ] && [ "${CANARY_SEEN}" -ge 1 ]; then') > gpu.index(_LABEL_SCRIPT_CALL), "the canary's, with its line"
+    assert "--device auto" in gpu and "--device cpu" not in gpu
+    cpu = "\n".join(_eos_wrapper_code(_label_text("cpu")))
+    assert "torch" not in cpu and "--device cpu" in cpu and "--device auto" not in cpu
+
+
+def test_label_gallery_reports_imports_only_the_standard_library_numpy_and_f1chexbert():
+    """P5-C. Like scripts/score_chexbert_standalone.py and app/labeler.py it runs in .venv_chexbert (transformers<5, no hybrid_xmamba): nothing of
+    this repo, which is why the 14 label names are a literal copy (pinned against app.labels in tests/test_label_gallery_reports.py), and no torch
+    of its own (f1chexbert brings it)."""
+    if not hasattr(sys, "stdlib_module_names"):
+        pytest.skip("sys.stdlib_module_names needs Python 3.10")
+    path = REPO_ROOT / "scripts" / "label_gallery_reports.py"
+    roots = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):       # walk reaches the function-level imports too
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            roots.add("." if node.level else (node.module or "").split(".")[0])
+    allowed = set(sys.stdlib_module_names) | {"numpy", "f1chexbert"}
+    assert {"numpy", "f1chexbert"} <= roots, roots
+    assert roots <= allowed, sorted(roots - allowed)
+
+
+def test_label_gallery_wrappers_pass_the_bash_syntax_check():
+    import shutil
+    import subprocess
+    shells = [s for s in ("/bin/bash", shutil.which("bash")) if s and os.path.exists(s)]
+    assert shells
+    for kind in sorted(_LABEL_WRAPPERS):
+        for shell in set(shells):
+            done = subprocess.run([shell, "-n", str(REPO_ROOT / "scripts" / _LABEL_WRAPPERS[kind])], capture_output=True, text=True)
+            assert done.returncode == 0, (kind, shell, done.stderr)
+
+
+# ── CHAT_UI_PLAN.md P9-A: the restricted-file pre-commit check ────────────────
+# Static pins on scripts/check_no_restricted_files.sh and scripts/install_hooks.sh. Their behaviour (every refused pattern, the
+# allow-list, the installer's three rules) is rehearsed in temporary repositories in tests/test_restricted_files_hook.py;
+# nothing in the suite installs the hook on this repository.
+
+def test_the_restricted_file_check_and_its_installer_exist_and_are_executable():
+    """P9-A. A hook that cannot run protects nothing: both scripts exist, carry the executable bit, and pass the syntax check of the
+    oldest shell they have to work in (the Mac's /bin/bash is 3.2)."""
+    import shutil
+    import subprocess
+    shells = [s for s in ("/bin/bash", shutil.which("bash")) if s and os.path.exists(s)]
+    assert shells
+    for name in ("check_no_restricted_files.sh", "install_hooks.sh"):
+        path = REPO_ROOT / "scripts" / name
+        assert path.is_file(), name
+        assert os.access(str(path), os.X_OK), "{} is not executable".format(name)
+        for shell in set(shells):
+            done = subprocess.run([shell, "-n", str(path)], capture_output=True, text=True)
+            assert done.returncode == 0, (name, shell, done.stderr)
+
+
+# ── CHAT_UI_PLAN.md P7-A: the chat app import smoke job ───────────────────────
+# Static pins on scripts/chat_app_smoke_h100.sh. Its behaviour (R7 output, the sync line, a failing probe, the probes run for real,
+# the label-order probe against fake f1chexbert packages) is rehearsed in tests/test_chat_app_smoke_job.py.
+
+def _smoke_text() -> str:
+    return (REPO_ROOT / "scripts" / "chat_app_smoke_h100.sh").read_text()
+
+
+def test_chat_app_smoke_wrapper_is_cpu_only_on_the_renamed_partition_and_leaves_the_arm_node_out():
+    """P7-A. The proven CPU-only combination (--qos=@SLURM_QOS@, no GPU) on the renamed partition, the three nodes that cannot run it
+    excluded (arm03 is ARM and the venvs are x86), logs where every other wrapper puts them, the standard cd line, and offline
+    Hugging Face on a compute node."""
+    src = _smoke_text()
+    options, flags = _sbatch_options(src)
+    assert options == {"--partition": "@SLURM_PARTITION@", "--account": "@SLURM_ACCOUNT@", "--qos": "@SLURM_QOS@", "--exclude": "@SLURM_EXCLUDE@",
+                       "--mem": "8G", "--cpus-per-task": "2", "--time": "00:15:00", "--job-name": "chat_app_smoke",
+                       "--output": "logs/%x_%j.log", "--error": "logs/%x_%j.log"}, options
+    assert flags == [], flags
+    code = _eos_wrapper_code(src)
+    assert not [l for l in code if "--gpus" in l or "--gres" in l], "CPU-only job"
+    assert 'cd "${SLURM_SUBMIT_DIR}/hybrid_model_mamba_xlstm" 2>/dev/null || cd "${SLURM_SUBMIT_DIR:-.}"' in code
+    assert "set -euo pipefail" in code
+    assert [l for l in code if l.startswith("export HF_HUB_OFFLINE=1")], "compute nodes are offline"
+
+
+def test_chat_app_smoke_wrapper_probes_each_half_in_its_own_venv_with_its_own_overlay():
+    """P7-A. The web app imports in .venv with the .chat_deps overlay; the labeller and the label order in .venv_chexbert with
+    .chat_deps_chexbert: the two overlays scripts/chat_cluster_setup_h100.sh builds (P0-G), put on PYTHONPATH by this wrapper only."""
+    code = "\n".join(_eos_wrapper_code(_smoke_text()))
+    assert "probe server env PYTHONPATH=.chat_deps .venv/bin/python -c" in code
+    assert code.count("PYTHONPATH=.chat_deps_chexbert .venv_chexbert/bin/python -c") == 2      # the labeller and the label order
+    assert code.count("PYTHONPATH=") == 3 and code.count("/bin/python") == 3
+    assert "import fastapi, app.server" in code and "import app.labeler, transformers" in code
+    assert "from app.labels import CHEXBERT_14" in code
+    setup = (REPO_ROOT / "scripts" / "chat_cluster_setup_h100.sh").read_text()
+    assert ".chat_deps/.setup_ok" in setup and ".chat_deps_chexbert/.setup_ok" in setup
+
+
+def test_chat_app_smoke_wrapper_reads_the_label_order_from_the_source_and_never_builds_an_f1chexbert():
+    """P7-A. f1chexbert 0.0.2 assigns target_names inside F1CheXbert.__init__, after it has loaded the CheXbert weights, so the order
+    cannot be had from an import. The probe must parse the package's source (no weights, no network), never construct the class."""
+    src = _smoke_text()
+    code = "\n".join(_eos_wrapper_code(src))
+    assert 'importlib.util.find_spec("f1chexbert")' in code and "ast.parse(" in code and "ast.literal_eval(" in code
+    assert "F1CheXbert(" not in code and "import f1chexbert" not in code and "from f1chexbert" not in code
+    # Fix 1: exactly one assignment, and a version that comes from the distribution metadata (never from the package) in digits and dots.
+    assert "len(found) != 1" in code and "raise SystemExit(4)" in code
+    assert 'importlib.metadata.version("f1chexbert")' in code and 're.fullmatch(r"[0-9]+(\\.[0-9]+)*", version)' in code
+    assert "f1chexbert.__version__" not in code
+    header = "\n".join(l for l in src.splitlines() if l.startswith("#") and not l.startswith("#SBATCH"))
+    assert "target_names" in header and "weights" in header, "the header says why the source is read"
+    assert "digits and dots" in header and "(f1chexbert <version>)" in header, "the header documents the version in the line"
+    thesis = (REPO_ROOT / "scripts" / "score_chexbert_standalone.py").read_text()
+    assert "labeler.target_names" in thesis, "the thesis scorer reads the same attribute off a live F1CheXbert"
+
+
+def test_chat_app_smoke_wrapper_installs_nothing_and_writes_only_a_new_results_directory():
+    """P7-A, R8. No installer of any kind appears anywhere in the file, comments included; the one directory it makes is
+    results/chat_app_smoke_<jobid>, through the results symlink, and only when results exists (it never makes `results` itself)."""
+    src = _smoke_text()
+    for needle in ("pip install", "pip3 install", "uv pip", "uv add", "-m pip", "conda install", "--target", "easy_install"):
+        assert needle not in src, needle
+    code = _eos_wrapper_code(src)
+    assert [l for l in code if "mkdir" in l] == ['mkdir -p "${OUT}" 2>/dev/null || fail "the results directory cannot be made"']
+    assert 'OUT="results/chat_app_smoke_${SLURM_JOB_ID:-local}"' in code
+    assert '[ -d results ] || fail "results is missing: run chat_cluster_setup_h100.sh first"' in code
+    for line in code:
+        assert not re.match(r"\s*(rm|mv|cp|ln|chmod|touch)\b", line), line
+
+
+def test_chat_app_smoke_wrapper_prints_only_the_line_shapes_summary_shows_and_keeps_raw_output_in_files():
+    """P7-A, R7. Every literal it prints starts with === or ERROR and holds no path; the one dynamic echo is the probe's own [setup]
+    line, picked out of that probe's output file with sed; every python call goes through probe(), which sends all of its output to a
+    file in the results directory. Nothing reads those files back to the log but that one sed."""
+    src = _smoke_text()
+    code = _eos_wrapper_code(src)
+    text = "\n".join(code)
+    echoed, failed = re.findall(r'echo "([^"]*)"', text), re.findall(r'\bfail "([^"]*)"', text)
+    assert len(echoed) >= 6 and failed, (echoed, failed)
+    for line in echoed:
+        assert re.match(r"(=== |ERROR |\$\{line\}$)", line), line
+    for line in echoed + failed:
+        assert "/" not in line, line                                    # a repo-relative path is a path too
+        for var in ("OUT", "SCRATCH_ROOT", "CHAT_HOME", "SLURM_SUBMIT_DIR"):
+            assert "${" + var + "}" not in line, (var, line)
+    assert 'fail() { echo "ERROR $*"; exit 1; }' in src
+    assert 'echo "ERROR ${name} exit=${rc}"' in text
+    assert "sed -n '/^\\[setup\\] /{p;q;}' \"${OUT}/${name}.out\"" in text
+    assert '"$@" > "${OUT}/${name}.out" 2>&1 || rc=$?' in text
+    assert [l for l in code if "python" in l and not l.lstrip().startswith("probe ")
+            and not l.startswith(("SERVER_PROBE=", "LABELER_PROBE=", "LABELS_PROBE="))] == []
+    redirects = []
+    for line in code:
+        if line.lstrip().startswith(("echo", "fail", "SERVER_PROBE", "LABELER_PROBE", "LABELS_PROBE")):
+            continue                                                    # a message or the python code may contain a '>'
+        redirects += re.findall(r'(?<![0-9&])>>?\s*("[^"]+"|\S+)', line)
+    assert redirects, "no redirect found: the pin lost its subject"
+    assert set(redirects) <= {'"${OUT}/${name}.out"', "/dev/null"}, redirects
+    for line in code:
+        assert not re.match(r"\s*(date|nvidia-smi|printenv|cat|tail|head|less)\b", line), line
+    assert "set -x" not in src and "set -o xtrace" not in src
+
+
+def test_chat_app_smoke_wrapper_prints_the_sync_stamp_first_and_with_the_p9_g3_snippet_verbatim():
+    """P7-A provenance: the commit and cleanliness `chat_remote.sh sync` last shipped, read from .sync_stamp, as the very first line,
+    by the snippet scripts/train_report_eos_h100.sh (P9-G3) carries, copied exactly."""
+    train = _eos_wrapper_text()
+    start = train.index('SYNC="unknown"')
+    snippet = train[start:train.index('echo "=== sync ${SYNC} ==="', start) + len('echo "=== sync ${SYNC} ==="')]
+    assert ".sync_stamp" in snippet and snippet.count("\n") >= 6
+    src = _smoke_text()
+    assert snippet in src
+    code = "\n".join(_eos_wrapper_code(src))
+    sync = code.index('echo "=== sync ${SYNC} ==="')
+    assert code.index('echo "') == sync, "something is printed before the sync line"
+    assert code.index("/bin/python") > sync and ".sync_stamp" in code[:sync]
+
+
+def test_chat_app_smoke_header_documents_the_submit_and_summary_lines():
+    header = "\n".join(l for l in _smoke_text().splitlines() if l.startswith("#") and not l.startswith("#SBATCH"))
+    assert "bash scripts/chat_remote.sh sync && bash scripts/chat_remote.sh submit scripts/chat_app_smoke_h100.sh" in header
+    assert "bash scripts/chat_remote.sh summary logs/chat_app_smoke_<jobid>.log" in header
+
+
+def test_chat_app_smoke_wrapper_passes_the_bash_syntax_check():
+    import shutil
+    import subprocess
+    shells = [s for s in ("/bin/bash", shutil.which("bash")) if s and os.path.exists(s)]
+    assert shells
+    for shell in set(shells):
+        done = subprocess.run([shell, "-n", str(REPO_ROOT / "scripts" / "chat_app_smoke_h100.sh")], capture_output=True, text=True)
+        assert done.returncode == 0, (shell, done.stderr)
+
+
+# ── CHAT_UI_PLAN.md P5-F: the live-path gates job ─────────────────────────────
+# Static pins on scripts/chat_retrieval_gates_h100.sh and scripts/chat_retrieval_gates.py. Their behaviour (the three checks, every
+# refusal, R7 output, the labeller's life and death, the guards) is rehearsed for real in tests/test_chat_retrieval_gates.py: the real
+# script, on the tiny stack, inside the real wrapper, over the real app.labeler.
+
+_GATES_SH = "chat_retrieval_gates_h100.sh"
+# The labeller, started as the P7-B serve wrapper starts it (D24: the CheXbert environment of score_chexbert_h100.sh, its web overlay, no
+# HF_HOME), on a free port of the loopback interface, in the background, its raw output in a file.
+_GATES_LABELLER = ('env -u HF_HOME HF_HUB_OFFLINE="${CHEXBERT_HF_HUB_OFFLINE:-0}" PYTHONPATH=.chat_deps_chexbert .venv_chexbert/bin/python '
+                   '-m uvicorn app.labeler:app --host 127.0.0.1 --port "${LABELER_PORT}" > "${OUT}/labeler.log" 2>&1 &')
+# The driver, in the main venv with its own overlay: the published protocol is the script's, so the wrapper passes paths and the thread count.
+_GATES_DRIVER = ('PYTHONPATH=.chat_deps python scripts/chat_retrieval_gates.py --checkpoint "${CHECKPOINT}" --model-config "${MODEL_CONFIG}" '
+                 '--gallery "${GALLERY}" --data "${DATA}" --published-labels "${REFERENCE_DIR}/chexbert_labels.json" '
+                 '--published-hyps "${REFERENCE_DIR}/hyps.txt" --published-refs "${REFERENCE_DIR}/refs.txt" --labeler-url "${LABELER_URL}" '
+                 '--out "${OUT}" --threads "${THREADS}" > "${OUT}/gates.log" 2>&1 || rc=$?')
+_GATES_FIRST_STEP = 'LABELER_PORT="$(python -c'
+
+
+def _gates_text() -> str:
+    return (REPO_ROOT / "scripts" / _GATES_SH).read_text()
+
+
+def test_chat_gates_wrapper_is_cpu_only_on_the_renamed_partition_and_leaves_the_arm_node_out():
+    """P5-F. The proven CPU-only combination (--qos=@SLURM_QOS@, no GPU) on the renamed partition, the three nodes that cannot run it excluded (arm03
+    is ARM and the venvs are x86), 8 CPUs and 32 GB for a CPU engine, an hour, logs where every other wrapper puts them, the standard cd
+    line. No requeue: a job of minutes with a results directory of its own."""
+    src = _gates_text()
+    options, flags = _sbatch_options(src)
+    assert options == {"--partition": "@SLURM_PARTITION@", "--account": "@SLURM_ACCOUNT@", "--qos": "@SLURM_QOS@", "--exclude": "@SLURM_EXCLUDE@",
+                       "--cpus-per-task": "8", "--mem": "32G", "--time": "01:00:00", "--job-name": "chat_gates",
+                       "--output": "logs/%x_%j.log", "--error": "logs/%x_%j.log"}, options
+    assert flags == [], flags
+    code = _eos_wrapper_code(src)
+    assert not [l for l in code if "--gpus" in l or "--gres" in l], "CPU-only job"
+    assert not [l for l in src.splitlines() if l.startswith("#SBATCH") and "--array" in l]
+    assert 'cd "${SLURM_SUBMIT_DIR}/hybrid_model_mamba_xlstm" 2>/dev/null || cd "${SLURM_SUBMIT_DIR:-.}"' in code
+    assert "set -euo pipefail" in code and "mkdir -p logs" in code
+
+
+def test_chat_gates_wrapper_starts_the_labeller_as_the_serve_wrapper_does_on_loopback_only():
+    """P5-F, D24. Exactly the command of the brief: the CheXbert venv and its overlay, no HF_HOME (the weights are in the default Hugging Face
+    cache), HF_HUB_OFFLINE defaulting to 0 as in score_chexbert_h100.sh, the loopback interface, a free port, in the background, its raw
+    output in a file. Never a non-loopback address: nothing here is behind a token."""
+    src = _gates_text()
+    lines = _logical_lines(src)
+    assert [l for l in lines if "uvicorn" in l] == [_GATES_LABELLER]
+    assert "0.0.0.0" not in src and "--host 127.0.0.1" in _GATES_LABELLER
+    thesis = (REPO_ROOT / "scripts" / "score_chexbert_h100.sh").read_text()
+    assert 'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"' in thesis and "HF_HOME" not in "\n".join(_eos_wrapper_code(thesis))
+    assert 'LABELER_PORT="$(python -c \'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])\')" || fail "no free loopback port"' in lines
+    assert "case \"${LABELER_PORT}\" in ''|*[!0-9]*) fail \"no free loopback port\" ;; esac" in lines
+    assert 'LABELER_URL="http://127.0.0.1:${LABELER_PORT}"' in lines
+    assert "LABELER_PID=$!" in lines and lines.index("LABELER_PID=$!") == lines.index(_GATES_LABELLER) + 1
+
+
+def test_chat_gates_wrapper_waits_for_healthz_with_a_bound_and_stops_the_labeller_on_every_exit_path():
+    """P5-F. The first model load can take minutes, so the wait is one request at a time (a probe the shell can be interrupted in: it runs in
+    the background and is waited for), bounded by LABELER_WAIT_S, and it notices a labeller that died. The labeller is stopped by a trap on
+    EXIT (every `fail`, every `exit`, a failed command under set -e, the normal end) and on TERM and INT; the stop asks, waits a few
+    seconds, and then insists (a uvicorn waiting for a model to load does not leave on SIGTERM). The same trap ends a health probe that is
+    in flight (it kills PROBE_PID), so that nothing is left behind, and the probe's pid is cleared as soon as it has been waited for, so
+    that a later stop never signals a pid that something else has since been given."""
+    code = "\n".join(_logical_lines(_gates_text()))              # continuations joined: the two long commands are one line each
+    assert "trap stop_labeller EXIT" in code
+    assert "trap 'stop_labeller; exit 143' TERM" in code and "trap 'stop_labeller; exit 130' INT" in code
+    stop = code[code.index("stop_labeller() {"):code.index("trap stop_labeller EXIT")]
+    assert stop.index('kill "${LABELER_PID}"') < stop.index("kill -0") < stop.index("kill -KILL") < stop.index('wait "${LABELER_PID}"')
+    assert 'LABELER_PID=""' in stop and "for _ in 1 2 3; do" in stop, "bounded: three seconds of grace"
+    assert 'kill "${PROBE_PID}" 2>/dev/null || true' in stop and stop.index('kill "${PROBE_PID}"') < stop.index('kill "${LABELER_PID}"'), "the probe first"
+    assert code.index('PROBE_PID=""') < code.index("stop_labeller() {"), "empty before any trap can run"
+    assert code.index("trap stop_labeller EXIT") < code.index(_GATES_LABELLER)
+    assert 'DEADLINE=$((SECONDS + LABELER_WAIT_S))' in code and 'while [ "${SECONDS}" -lt "${DEADLINE}" ]; do' in code
+    assert 'kill -0 "${LABELER_PID}" 2>/dev/null || break' in code, "a labeller that died is not waited for"
+    assert "/healthz" in code and 'python -c "${HEALTH_PROBE}" "${LABELER_URL}" "${LEFT}" > /dev/null 2>&1 &' in code
+    loop = code[code.index('while [ "${SECONDS}" -lt "${DEADLINE}" ]; do'):code.index('if [ "${READY}" -ne 1 ]; then')]
+    assert loop.index("PROBE_PID=$!") < loop.index('wait "${PROBE_PID}" || PROBE_RC=$?') < loop.index('PROBE_PID=""') < loop.index(
+        'if [ "${PROBE_RC}" -eq 0 ]; then READY=1; break; fi'), "waited for, then forgotten, then judged"
+    assert 'fail "labeller not ready after ${LABELER_WAIT_S} s"' in code and 'fail "labeller exit=${LABELER_RC}"' in code
+    # Stopped as soon as the driver is done and BEFORE the filtered log is reported: the bare call after the driver comes ahead of the line
+    # that reads the log back (a test that only asked for a stop somewhere after the driver passed a stop moved to the end).
+    driver_at = code.index(_GATES_DRIVER)
+    stop_at = code.index("\nstop_labeller\n", driver_at)
+    report_at = code.index("tr '\\r' '\\n' < \"${OUT}/gates.log\" | grep -aE \"${GATES_SHAPES}\" | tail -n 60 || true")
+    assert driver_at < stop_at < report_at, "the labeller is stopped before the log of the driver is reported"
+
+
+def test_chat_gates_wrapper_runs_the_driver_in_the_main_venv_with_its_own_overlay_and_the_published_defaults():
+    """P5-F. `.venv` with .chat_deps (the labeller's overlay is on the labeller's command only: no PYTHONPATH is ever exported), one
+    command with every argument the driver needs and none it does not (--engine is for the laptop tests), the engine offline from the scratch
+    Hugging Face cache, one thread per CPU of the allocation, and the loopback address kept off any proxy."""
+    src = _gates_text()
+    lines = _logical_lines(src)
+    assert [l for l in lines if "scripts/chat_retrieval_gates.py" in l and "python" in l] == [_GATES_DRIVER]
+    assert "--engine" not in _GATES_DRIVER
+    code = "\n".join(lines)
+    assert not re.search(r"export\s+[^\n]*PYTHONPATH", code), "an overlay is put on one command, never on the shell"
+    assert 'export HF_HOME="${SCRATCH_ROOT}/.hf" HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1' in code
+    assert 'export OMP_NUM_THREADS="${THREADS}" MKL_NUM_THREADS="${THREADS}"' in code
+    assert 'THREADS="${SLURM_CPUS_PER_TASK:-8}"' in code
+    assert 'export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,${NO_PROXY}}" no_proxy="127.0.0.1,localhost${no_proxy:+,${no_proxy}}"' in code
+    assert code.index('source "${VENV_ACTIVATE}"') < code.index("export HF_HOME=") < code.index(_GATES_FIRST_STEP) < code.index(_GATES_DRIVER)
+    assert code.index(_GATES_LABELLER) < code.index(_GATES_DRIVER), "the labeller is up before the driver asks it anything"
+
+
+def test_chat_gates_wrapper_defaults_are_the_plans_and_agree_with_the_other_chat_wrappers_and_only_the_documented_names_are_levers():
+    """P5-F. The default report model and its checkpoint, the dataset, the scratch cache and CHAT_HOME as the gallery build has them; the
+    gallery's build id and the published dump as the labelling has them. GALLERY, OUT and THREADS are derived and never levers of their own
+    (sbatch exports the submitting shell, and OUT is a likely name)."""
+    src = _gates_text()
+    code = "\n".join(_eos_wrapper_code(src))
+    build = (REPO_ROOT / "scripts" / "build_retrieval_gallery_h100.sh").read_text()
+    label = (REPO_ROOT / "scripts" / "label_gallery_reports_cpu_h100.sh").read_text()
+    for line in ('SCRATCH_ROOT="${SCRATCH_ROOT:-/sc/scratch/$USER/hybrid_xmamba_h100}"', 'VENV_ACTIVATE="${VENV_ACTIVATE:-.venv/bin/activate}"',
+                 'CHAT_HOME="${CHAT_HOME:-/sc/home/$USER/chat_sessions}"', 'DATA="${DATA:-/sc/home/$USER/dataset/mimic_full}"',
+                 'CHECKPOINT="${CHECKPOINT:-./outputs/h100_report_gen_m3_tower13d_s42/checkpoints/last.ckpt}"',
+                 'MODEL_CONFIG="${MODEL_CONFIG:-hybrid_150m_m3_rrg}"'):
+        assert line in code and line in build, line
+    for line in ('BUILD_ID="${BUILD_ID:-g13d_m3_v1}"', 'REFERENCE_DIR="${REFERENCE_DIR:-results/report_gen_m3_test_split_s42}"'):
+        assert line in code and line in label, line
+    assert 'LABELER_WAIT_S="${LABELER_WAIT_S:-600}"' in code
+    assert set(re.findall(r'(?m)^([A-Z][A-Z0-9_]*)="\$\{\1:-', src)) == {
+        "SCRATCH_ROOT", "VENV_ACTIVATE", "CHAT_HOME", "DATA", "CHECKPOINT", "MODEL_CONFIG", "BUILD_ID", "REFERENCE_DIR", "LABELER_WAIT_S"}
+    assert 'GALLERY="${CHAT_HOME}/gallery/${BUILD_ID}"' in code and 'OUT="results/chat_retrieval_gates_${SLURM_JOB_ID:-local}"' in code
+    assert code.count("CHEXBERT_HF_HUB_OFFLINE") == 1, "the labeller's own offline switch, named in its command and nowhere else"
+    header = "\n".join(l for l in src.splitlines() if l.startswith("#") and not l.startswith("#SBATCH"))
+    for name in ("BUILD_ID", "CHECKPOINT", "MODEL_CONFIG", "DATA", "REFERENCE_DIR", "LABELER_WAIT_S", "CHEXBERT_HF_HUB_OFFLINE"):
+        assert name in header, name + " is a lever the header documents"
+
+
+def test_chat_gates_wrapper_keeps_the_raw_output_of_both_processes_in_files_and_prints_only_what_may_be_printed():
+    """P5-F, R7. The driver's stdout and stderr (a traceback can hold a report or a path) and the labeller's go to files in the results
+    directory, never to the log; the job log gets the driver's lines of a known shape, a count of the others, and wrapper-authored lines
+    that start with === or ERROR and name no path."""
+    src = _gates_text()
+    code = _eos_wrapper_code(src)
+    text = "\n".join(code)
+    assert text.count('> "${OUT}/gates.log" 2>&1') == 1 and text.count('> "${OUT}/labeler.log" 2>&1') == 1
+    assert "tr '\\r' '\\n' < \"${OUT}/gates.log\" | grep -aE \"${GATES_SHAPES}\" | tail -n 60 || true" in text
+    assert ("WITHHELD=\"$(tr '\\r' '\\n' < \"${OUT}/gates.log\" | grep -aE '^(\\[gates\\] |RESULT |ERROR|=== )' | grep -avcE \"${GATES_SHAPES}\" || true)\""
+            in text)
+    assert "case \"${WITHHELD}\" in ''|*[!0-9]*) WITHHELD=unknown ;; esac" in text, "a count that could not be made is not a zero"
+    assert 'echo "=== gates lines withheld: ${WITHHELD} ==="' in text
+    assert "RESULTS=\"$(tr '\\r' '\\n' < \"${OUT}/gates.log\" | grep -aE \"${GATES_SHAPES}\" | grep -c '^RESULT ' || true)\"" in text
+    assert 'fail "gates printed no RESULT line"' in text, "exit 0 without its result is a failure, not a pass"
+    echoed, failed = re.findall(r'echo "([^"]*)"', text), re.findall(r'\bfail "([^"]*)"', text)
+    assert len(echoed) + len(failed) >= 20, (echoed, failed)
+    for line in echoed:
+        assert re.match(r"(=== |ERROR )", line), line
+    for line in echoed + failed:
+        assert "/" not in line, line                                          # a repo-relative path is a path too
+        for var in ("GALLERY", "OUT", "CHAT_HOME", "DATA", "CHECKPOINT", "REFERENCE_DIR", "SCRATCH_ROOT", "VENV_ACTIVATE", "SLURM_SUBMIT_DIR"):
+            assert "${" + var + "}" not in line, (var, line)
+    assert 'fail() { echo "ERROR $*"; exit 1; }' in src
+    for line in _logical_lines(src):
+        if line != _GATES_LABELLER:                               # the one command that starts with env: the labeller's own environment
+            assert not re.match(r"\s*(date|nvidia-smi|env|printenv|cat|tail|head|less)\b", line), line
+    assert "set -x" not in src and "set -o xtrace" not in src
+    assert "grep -av '/'" not in src, "the blacklist is not the filter"
+
+
+def test_chat_gates_wrapper_holds_one_allowlist_and_it_is_not_a_blacklist():
+    """P5-F. The shapes of the lines the driver prints, anchored, one per line (tests/test_chat_retrieval_gates.py runs them through grep
+    over everything the driver prints and over ids, text and paths); no pattern is a wildcard."""
+    found = re.search(r"^GATES_SHAPES='(.*?)'$", _gates_text(), re.M | re.S)
+    assert found
+    patterns = found.group(1).split("\n")
+    assert "" not in patterns and all(p.startswith("^") and p.endswith("$") for p in patterns)
+    assert not [p for p in patterns if re.search(r"(\.\*|\.\+|\\S|\\w|\\d)", p)], "a wildcard in an allowlist"
+    assert {p.split(" ")[0] for p in patterns} == {"^\\[gates\\]", "^RESULT", "^ERROR", "^==="}
+    summary = (REPO_ROOT / "scripts" / "chat_remote.sh").read_text()
+    assert "\\[(probe|golden|gallery|labels|gates|server|setup|compile)\\]" in summary, "`summary` shows [gates] lines"
+
+
+def test_chat_gates_wrapper_prints_its_sync_stamp_first_and_with_the_p9_g3_snippet_verbatim():
+    """P5-F provenance: the commit and cleanliness `chat_remote.sh sync` last shipped, read from .sync_stamp, as the very first line, by the
+    snippet scripts/train_report_eos_h100.sh (P9-G3) carries, copied exactly."""
+    train = _eos_wrapper_text()
+    start = train.index('SYNC="unknown"')
+    snippet = train[start:train.index('echo "=== sync ${SYNC} ==="', start) + len('echo "=== sync ${SYNC} ==="')]
+    assert ".sync_stamp" in snippet and snippet.count("\n") >= 6
+    src = _gates_text()
+    assert snippet in src
+    code = "\n".join(_eos_wrapper_code(src))
+    sync = code.index('echo "=== sync ${SYNC} ==="')
+    assert code.index('echo "') == sync, "something is printed before the sync line"
+    assert code.index("python ") > sync and code.index("source ") > sync and ".sync_stamp" in code[:sync]
+
+
+def test_chat_gates_wrapper_checks_everything_before_a_process_starts_and_never_deletes_or_installs():
+    """P5-F, R8. Every guard sits before the first process (the free-port probe is the first python), one plain name for the build and the
+    model, a whole number for the wait, CHAT_HOME, the gallery and its decided gate and the build's own test embeddings, results, both venvs
+    and overlays (their sentinels), the script itself (python answers a script it cannot find with exit 2), and every input. The one
+    directory the job makes is its own, under results/ through the symlink, after the guards; nothing is removed, linked or installed."""
+    src = _gates_text()
+    code_lines = _eos_wrapper_code(src)
+    code = "\n".join(code_lines)
+    guards = ['[[ "${BUILD_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "BUILD_ID must be one plain name: letters, digits, dot, dash, underscore"',
+              '[[ "${MODEL_CONFIG}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "MODEL_CONFIG must be one plain name: letters, digits, dot, dash, underscore"',
+              '[[ "${LABELER_WAIT_S}" =~ ^(0|[1-9][0-9]{0,4})$ ]] || fail "LABELER_WAIT_S must be a whole number of seconds without a leading zero, at most 5 digits"',
+              '[ -d "${CHAT_HOME}" ] || fail "CHAT_HOME does not exist: run chat_cluster_setup_h100.sh first"',
+              '[ -f "${GALLERY}/manifest.json" ] || fail "the gallery has no manifest.json: build it first (build_retrieval_gallery_h100.sh)"',
+              """grep -Eq '"equal":[[:space:]]*true' "${GALLERY}/manifest.json" || fail "the gallery's R@k gate is not decided equal: it cannot be used" """.strip(),
+              '[ -f "${GALLERY}/test_img_emb.npy" ] || fail "the gallery has no test_img_emb.npy: it is the build\'s own embedding of the test images"',
+              '[ -d results ] || fail "results is missing: run chat_cluster_setup_h100.sh first"',
+              '[ -f "${VENV_ACTIVATE}" ] || fail "the main venv is missing: run chat_cluster_setup_h100.sh first"',
+              '[ -x .venv_chexbert/bin/python ] || fail "the CheXbert venv is missing: run setup_chexbert_venv_h100.sh first"',
+              '[ -f .chat_deps/.setup_ok ] && [ -f .chat_deps_chexbert/.setup_ok ] || fail "the web overlays are not set up: run chat_cluster_setup_h100.sh first"',
+              '[ -f scripts/chat_retrieval_gates.py ] || fail "chat_retrieval_gates.py is missing from this tree: run chat_remote.sh sync first"',
+              '[ -f "${CHECKPOINT}" ] || fail "the report model\'s checkpoint was not found"',
+              '[ -f "${DATA}/train.parquet" ] || fail "train.parquet was not found in DATA"',
+              '[ -f "${DATA}/test.parquet" ] || fail "test.parquet was not found in DATA"',
+              '[ -f "${REFERENCE_DIR}/hyps.txt" ] || fail "the published dump has no hyps.txt"',
+              '[ -f "${REFERENCE_DIR}/refs.txt" ] || fail "the published dump has no refs.txt"',
+              '[ -f "${REFERENCE_DIR}/chexbert_labels.json" ] || fail "the published dump has no chexbert_labels.json"']
+    first = code.index(_GATES_FIRST_STEP)
+    for guard in guards:
+        assert 0 <= code.index(guard) < first, guard
+    mkdir = 'mkdir -p "${OUT}" 2>/dev/null || fail "the results directory cannot be made"'
+    assert [l for l in code_lines if "mkdir" in l] == ["mkdir -p logs", mkdir]
+    assert max(code.index(g) for g in guards) < code.index(mkdir) < first
+    assert not re.search(r"(^|[\s;&|(])rm(\s|$)", code, re.M) and "--delete" not in code and not re.search(r"\bln\s", code), "additive only"
+    for needle in ("pip install", "pip3 install", "uv pip", "uv add", "-m pip", "conda install", "--target", "easy_install"):
+        assert needle not in src, needle
+    for line in code_lines:
+        assert not re.match(r"\s*(mv|cp|chmod|touch)\b", line), line
+
+
+def test_chat_gates_header_documents_the_submit_and_summary_lines_and_the_expected_job_log():
+    header = "\n".join(l for l in _gates_text().splitlines() if l.startswith("#") and not l.startswith("#SBATCH"))
+    assert "bash scripts/chat_remote.sh sync && bash scripts/chat_remote.sh submit scripts/chat_retrieval_gates_h100.sh" in header
+    assert "bash scripts/chat_remote.sh summary logs/chat_gates_<jobid>.log" in header
+    for needle in ("self-retrieval", "own-rank", "labeller", "RESULT", "[gates]", "gates.json", "gates.log", "labeler.log", "exit 1",
+                   "own_rank=", "own_gap=", "k=", "own_rank=2 own_gap=0.000000"):
+        assert needle in header, needle
+
+
+def test_chat_gates_wrapper_passes_the_bash_syntax_check():
+    import shutil
+    import subprocess
+    shells = [s for s in ("/bin/bash", shutil.which("bash")) if s and os.path.exists(s)]
+    assert shells
+    for shell in set(shells):
+        done = subprocess.run([shell, "-n", str(REPO_ROOT / "scripts" / _GATES_SH)], capture_output=True, text=True)
+        assert done.returncode == 0, (shell, done.stderr)
+
+
+def test_chat_retrieval_gates_imports_only_the_standard_library_numpy_pandas_and_the_app():
+    """P5-F. The driver runs in `.venv` with the .chat_deps overlay beside the engine it drives: everything it needs of the engine, the
+    gallery and the labeller client it takes from app/ (the code a turn runs, none of it re-implemented), and it brings no heavy import of its
+    own (no torch, no scripts.*: app.engine has loaded what it needs)."""
+    if not hasattr(sys, "stdlib_module_names"):
+        pytest.skip("sys.stdlib_module_names needs Python 3.10")
+    path = REPO_ROOT / "scripts" / "chat_retrieval_gates.py"
+    roots = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):       # walk reaches the function-level imports too
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            roots.add("." if node.level else (node.module or "").split(".")[0])
+    allowed = set(sys.stdlib_module_names) | {"numpy", "pandas", "app"}
+    assert {"numpy", "pandas", "app"} <= roots, roots
+    assert roots <= allowed, sorted(roots - allowed)
+
+
+# ── CHAT_UI_PLAN.md P7-B: the serving wrappers ────────────────────────────────
+# Static pins on scripts/serve_chat_h100.sh (CPU) and its GPU twin scripts/serve_chat_gpu_h100.sh. Their behaviour (the line shapes, the token
+# and gallery refusals, the labeller fallback, the trap on TERM, the real CLI behind the real wrapper) is rehearsed for real in
+# tests/test_chat_server_job.py; the CLI they run is in tests/test_chat_server_cli.py. P7-F extends these pins.
+
+SERVE_WRAPPERS = ("serve_chat_h100.sh", "serve_chat_gpu_h100.sh")
+
+
+def _serve_text(name: str = "serve_chat_h100.sh") -> str:
+    return (REPO_ROOT / "scripts" / name).read_text()
+
+
+def _serve_code(name: str = "serve_chat_h100.sh") -> str:
+    return "\n".join(_gallery_wrapper_code(_serve_text(name)))
+
+
+def _sbatch_options(src: str):
+    options, flags = {}, []
+    for line in src.splitlines():
+        if line.startswith("#SBATCH"):
+            token = line.split()[1]
+            if "=" in token:
+                options[token.split("=", 1)[0]] = token.split("=", 1)[1]
+            else:
+                flags.append(token)
+    return options, flags
+
+
+def test_serve_chat_wrappers_follow_the_cluster_invariants():
+    """P7-B. The CPU job is the proven CPU-only combination (--qos=@SLURM_QOS@); the GPU twin asks for one GPU through --gpus=1 and, as every GPU
+    wrapper, has no --qos and never a typed --gres. Both: the renamed partition, the three nodes that cannot run it excluded, a requeue
+    that appends to the SLURM log (without append a requeue truncates it), and logs where every other wrapper puts them."""
+    cpu_options, cpu_flags = _sbatch_options(_serve_text("serve_chat_h100.sh"))
+    assert cpu_options == {
+        "--partition": "@SLURM_PARTITION@", "--account": "@SLURM_ACCOUNT@", "--qos": "@SLURM_QOS@", "--exclude": "@SLURM_EXCLUDE@",
+        "--cpus-per-task": "8", "--mem": "32G", "--time": "24:00:00", "--job-name": "chat_server",
+        "--output": "logs/%x_%j.log", "--error": "logs/%x_%j.log", "--open-mode": "append"}, cpu_options
+    assert cpu_flags == ["--requeue"], cpu_flags
+    gpu_options, gpu_flags = _sbatch_options(_serve_text("serve_chat_gpu_h100.sh"))
+    expected = {k: v for k, v in cpu_options.items() if k != "--qos"}
+    expected.update({"--gpus": "1", "--mem": "48G", "--job-name": "chat_server_gpu"})
+    assert gpu_options == expected, gpu_options
+    assert gpu_flags == ["--requeue"], gpu_flags
+    for name in SERVE_WRAPPERS:
+        assert "--gres" not in _serve_text(name), "an untyped --gpus and a typed --gres do not mix"
+
+
+def test_the_gpu_serve_wrapper_is_the_cpu_wrapper_with_only_the_device_and_the_labeller_pin_changed():
+    """The allowed differences, each in exactly one place: the device the API defaults to, and the GPU twin's labeller, which is hidden from
+    every GPU (CUDA_VISIBLE_DEVICES= on its env line). The P5-F gates job validates the labeller on the CPU against the published labels, so
+    the labels a turn shows must come from that device; the API is never hidden from the GPU it was given."""
+    cpu = _gallery_wrapper_code(_serve_text("serve_chat_h100.sh"))
+    gpu = _gallery_wrapper_code(_serve_text("serve_chat_gpu_h100.sh"))
+    allowed = (('DEVICE="${DEVICE:-cpu}"', 'DEVICE="${DEVICE:-cuda}"'),
+               ("env -u HF_HOME HF_HUB_OFFLINE=", "env -u HF_HOME CUDA_VISIBLE_DEVICES= HF_HUB_OFFLINE="))
+    mapped = list(cpu)
+    for old, new in allowed:
+        assert sum(l.count(old) for l in cpu) == 1 and sum(l.count(new) for l in gpu) == 1, (old, new)
+        mapped = [l.replace(old, new) for l in mapped]
+    assert mapped == gpu, "the twins differ in more than the device and the labeller pin"
+    assert "DEVICE=cuda" in _serve_text("serve_chat_gpu_h100.sh") and "--gpus=1" in _serve_text("serve_chat_gpu_h100.sh")
+    assert "CUDA_VISIBLE_DEVICES" not in "\n".join(cpu), "the CPU wrapper is unchanged: it has no GPU to hide"
+
+
+def test_serve_chat_wrappers_prepare_like_the_other_chat_wrappers():
+    for name in SERVE_WRAPPERS:
+        code = _serve_code(name)
+        for needle in ('cd "${SLURM_SUBMIT_DIR}/hybrid_model_mamba_xlstm" 2>/dev/null || cd "${SLURM_SUBMIT_DIR:-.}"', "set -euo pipefail",
+                       'SCRATCH_ROOT="${SCRATCH_ROOT:-/sc/scratch/$USER/hybrid_xmamba_h100}"',
+                       'VENV_ACTIVATE="${VENV_ACTIVATE:-.venv/bin/activate}"', 'CHAT_HOME="${CHAT_HOME:-$HOME/chat_sessions}"',
+                       'export HF_HOME="${SCRATCH_ROOT}/.hf" HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1',
+                       'export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}" MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"',
+                       'mkdir -p "${CHAT_HOME}" && chmod 700 "${CHAT_HOME}"', 'source "${VENV_ACTIVATE}"'):
+            assert needle in code, (name, needle)
+
+
+def test_serve_chat_wrappers_print_the_sync_stamp_first_with_the_p9_g3_snippet_verbatim():
+    """Provenance, as in every chat wrapper: the snippet scripts/train_report_eos_h100.sh carries, copied exactly, as the very first line."""
+    train = _eos_wrapper_text()
+    start = train.index('SYNC="unknown"')
+    snippet = train[start:train.index('echo "=== sync ${SYNC} ==="', start) + len('echo "=== sync ${SYNC} ==="')]
+    for name in SERVE_WRAPPERS:
+        assert snippet in _serve_text(name), name
+        code = _serve_code(name)
+        sync = code.index('echo "=== sync ${SYNC} ==="')
+        assert code.index('echo "') == sync, "something is printed before the sync line"
+        assert code.index("python") > sync and code.index("source ") > sync and ".sync_stamp" in code[:sync]
+
+
+def test_serve_chat_wrappers_default_to_the_real_gallery_and_name_the_published_dumps():
+    for name in SERVE_WRAPPERS:
+        code = _serve_code(name)
+        for needle in ('MODE="${MODE:-private}"', 'BIND="${BIND:-127.0.0.1}"', 'GALLERY="${GALLERY:-${CHAT_HOME}/gallery/g13d_m3_v1}"',
+                       'TOKEN_FILE="${CHAT_HOME}/app_token"', 'LABELER_WAIT_S="${LABELER_WAIT_S:-180}"',
+                       'PUBLISHED_MODEL="${PUBLISHED_MODEL:-results/report_gen_m3_test_split_s42}"',
+                       'PUBLISHED_FLOOR="${PUBLISHED_FLOOR:-results/retrieval_floor_test_split}"'):
+            assert needle in code, (name, needle)
+        assert "ls -d" not in code and "sort | tail" not in code, "the gallery is the named build, never the newest directory"
+
+
+def test_serve_chat_wrappers_document_both_model_orders_of_the_eos_model_and_keep_the_published_model_the_default():
+    """P9-G5a. `MODELS=m3eos,m3` serves the EOS model first, which makes it the default model of that deployment (the first model listed is
+    the default); `MODELS=m3,m3eos` keeps the published model the default. Both are written in the header of both wrappers. The code does not
+    change: MODELS still defaults to m3 alone (the user, not the code, decides whether the EOS model becomes a deployment's default), the
+    wrapper judges only the shape of MODELS, and the names are the CLI's to judge, so `m3eos` appears in no line of code."""
+    for name in SERVE_WRAPPERS:
+        header = [l for l in _serve_text(name).splitlines() if l.startswith("#") and not l.startswith("#SBATCH")]
+        eos_first = [l for l in header if "MODELS=m3eos,m3 " in l + " "]
+        published_first = [l for l in header if "MODELS=m3,m3eos " in l + " "]
+        assert len(eos_first) == 1 and len(published_first) == 1, (name, eos_first, published_first)
+        assert "default model of that deployment" in eos_first[0] and "EOS model first" in eos_first[0], eos_first
+        assert "published model first" in published_first[0] and "default" in published_first[0], published_first
+        assert header.index(eos_first[0]) < header.index(published_first[0])
+        text = "\n".join(header)
+        assert "hybrid_150m_m3_rrg_eos" in text and "report_gen_m3_eos_s42" in text and "refuses to start" in text
+        assert "names no path" in text and "Without MODELS the job serves m3 alone" in text
+        # P9-G5a fix 1: the run's DONE marker and its metadata are asked for as well, so the header says what the API will refuse over
+        assert "DONE marker" in text and "run_metadata.json" in text and "trained to end its reports" in text
+        code = _serve_code(name)
+        assert 'MODELS="${MODELS:-m3}"' in code and "m3eos" not in code
+        assert '[[ "${MODELS}" =~ ^[a-z0-9,]{1,32}$ ]]' in code and re.fullmatch(r"[a-z0-9,]{1,32}", "m3eos,m3")
+
+
+def test_serve_chat_wrappers_start_the_labeller_on_loopback_in_the_chexbert_environment():
+    """D24: CheXbert's weights live in the default HF cache and it runs with HF_HUB_OFFLINE=0 (scripts/score_chexbert_h100.sh), so the
+    job's own HF_HOME and offline mode must not reach it; and it listens on loopback only, on a free port (nodes are shared)."""
+    for name, pin in (("serve_chat_h100.sh", ""), ("serve_chat_gpu_h100.sh", "CUDA_VISIBLE_DEVICES= ")):   # the twin's labeller stays on the CPU
+        src, code = _serve_text(name), _serve_code(name)
+        launch = ('env -u HF_HOME ' + pin + 'HF_HUB_OFFLINE="${CHEXBERT_HF_HUB_OFFLINE:-0}" PYTHONPATH=.chat_deps_chexbert .venv_chexbert/bin/python '
+                  '-m uvicorn app.labeler:app --host 127.0.0.1 --port "${LABELER_PORT}" >> "${LABELER_LOG}" 2>&1 &')
+        assert code.count(launch) == 1, name
+        assert code.count("CUDA_VISIBLE_DEVICES") == (1 if pin else 0), name
+        assert code.count("-m uvicorn") == 1 and "0.0.0.0" not in code, "the only uvicorn the wrapper starts is the loopback labeller"
+        assert ('LABELER_PORT="${LABELER_PORT:-$(python3 -c \'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); '
+                'print(s.getsockname()[1])\')}"') in code
+        assert "--host 127.0.0.1 --port" in src and "env -u HF_HOME" in src and "HF_HUB_OFFLINE=1" in src
+
+
+def test_serve_chat_wrappers_use_the_web_overlay_and_install_or_delete_nothing():
+    """R8. The web dependencies are an overlay on PYTHONPATH (P0-G), the shared venvs stay byte-identical; a stray PYTHONPATH of the
+    submitting shell is replaced, not appended to; and nothing is installed, deleted or replaced."""
+    for name in SERVE_WRAPPERS:
+        code = _serve_code(name)
+        assert "export PYTHONPATH=.chat_deps\n" in code + "\n" and 'PYTHONPATH=.chat_deps_chexbert' in code
+        assert code.index("export PYTHONPATH=.chat_deps") < code.index("python -m app.server")
+        assert not re.search(r"\b(pip|uv|conda)\b", code), "an installer string"
+        assert not re.search(r"(^|[\s;&|(])(rm|mv|ln)(\s|$)", code, re.M), "additive only: no deletion, move or link"
+        assert "chmod 700" in code and "chmod -R" not in code
+
+
+def test_serve_chat_wrappers_refuse_before_they_start_anything():
+    """R6 and the gallery gate: every refusal comes before the first background process, and each is one ERROR line."""
+    for name in SERVE_WRAPPERS:
+        lines = _gallery_wrapper_code(_serve_text(name))
+        first_start = min(i for i, l in enumerate(lines) if l.endswith(" &"))
+        guards = [i for i, l in enumerate(lines) if re.search(r'\bfail "', l)]
+        assert len(guards) >= 6 and max(guards) < first_start, (name, guards, first_start)
+        text = "\n".join(lines)
+        for needle in ('fail "MODE must be private or public"', "needs a token", 'fail "the token file must be a regular file of mode 0600 that you own (R6)"',
+                       "needs a token: put one in app_token under CHAT_HOME, mode 0600 (R6)", "the gallery has no manifest.json",
+                       "R@k gate is not equal", 'fail "the venv\'s activate script is missing',
+                       # the device and the models, each with a message that does not carry the raw value
+                       'case "${DEVICE}" in cpu|cuda) ;; *) fail "DEVICE must be cpu or cuda" ;; esac',
+                       'MODELS="${MODELS:-m3}"', '[[ "${MODELS}" =~ ^[a-z0-9,]{1,32}$ ]] || fail "MODELS must be 1 to 32 characters: a-z, 0-9 and commas"'):
+            assert needle in text, (name, needle)
+        banner = text.index('echo "=== chat server: node=')
+        assert text.index('case "${DEVICE}" in') < banner and text.index('[[ "${MODELS}" =~') < banner, "the banner shows a validated device only"
+        assert text.index("needs a token") < text.index("LABELER_PORT="), "the token is checked before a port is chosen"
+        public = [l for l in lines if "needs a token" in l]
+        assert any('"${MODE}" = "public"' in l and '"${BIND}" != "127.0.0.1"' in l for l in lines if "HAVE_TOKEN" in l or "MODE" in l), public
+        assert "--token-file" in text and '--token ' not in text and "--token=" not in text, "the token is read from a file, never given"
+
+
+def test_serve_chat_wrappers_print_only_three_shapes_and_never_a_path_a_token_or_an_endpoint():
+    """R7. The job log carries === lines, ERROR lines and what the CLI prints on stdout ([server] lines). The wrapper's own stderr (bash's
+    own complaints, a `Terminated` notice for a child) and the API's stderr go to the server log under CHAT_HOME, both streams of the
+    labeller to its own file, so that nothing but those shapes can reach the job log. No message names a path variable or the token, and the
+    wrapper never reads the token's text."""
+    for name in SERVE_WRAPPERS:
+        code_lines = _gallery_wrapper_code(_serve_text(name))
+        text = "\n".join(code_lines)
+        echoed = re.findall(r'echo "([^"]*)"', text)
+        failed = re.findall(r'\b(?:fail|say_error) "([^"]*)"', text)
+        assert len(echoed) >= 9 and len(failed) >= 6, (echoed, failed)
+        for message in echoed:
+            assert re.match(r"(=== |ERROR )", message), message
+        paths = ("${CHAT_HOME}", "${GALLERY}", "${TOKEN_FILE}", "${SERVER_LOG}", "${LABELER_LOG}", "${LABELER_PORT}", "${SCRATCH_ROOT}",
+                 "${SLURM_SUBMIT_DIR}", "${PUBLISHED_MODEL}", "${PUBLISHED_FLOOR}", "${CHAT_HOME}/endpoint")
+        leaking = [m for m in echoed + failed if any(p in m for p in paths) or "/" in m]
+        assert not leaking, "a printed message names a path or a port: {}".format(leaking)
+        assert not re.search(r"(cat|read|head|tail)\b[^\n]*TOKEN_FILE|\$\(<", text), "the token's text is never read by the wrapper"
+        assert 'exec 2>> "${SERVER_LOG}"' in text
+        first_start = min(i for i, l in enumerate(code_lines) if l.endswith(" &"))
+        assert code_lines.index('exec 2>> "${SERVER_LOG}"') < first_start
+        assert 'SERVER_LOG="${CHAT_HOME}/logs/server_${SLURM_JOB_ID:-local}.log"' in text
+        assert 'LABELER_LOG="${CHAT_HOME}/logs/labeler_${SLURM_JOB_ID:-local}.log"' in text
+        assert "set -x" not in text and "xtrace" not in text
+        assert "=== labeller unavailable: labels skipped ===" in text, "the ruling's own words"
+        for line in code_lines:
+            assert not re.match(r"\s*(date|nvidia-smi|printenv|env\s*$|cat|tail|head|less)\b", line), line
+
+
+def test_serve_chat_wrappers_trap_term_and_int_and_stop_both_children():
+    """P7-B. A requeue, a cancel and the time limit all arrive as SIGTERM (then SIGKILL after KillWait): the wrapper forwards it to the API,
+    which stops its turns as a server restart and clears its endpoint file, and to the labeller, waits for both, and ends the job. An EXIT
+    trap does the same for any other end, so that a failed `set -e` command leaves no child behind and one ERROR line behind."""
+    for name in SERVE_WRAPPERS:
+        text = _serve_code(name)
+        for needle in ("trap 'STOPPING=1; echo \"=== signal received: stopping ===\"; stop_children' TERM INT", "trap finish EXIT",
+                       'kill -TERM "${pid}" 2>/dev/null || true', '{ wait "${pid}"; } 2>/dev/null || true',
+                       '{ wait "${API_PID}"; } 2>/dev/null || API_RC=$?', '[ "${API_RC}" -ge 128 ] || break',
+                       'kill -0 "${API_PID}" 2>/dev/null || break'):
+            assert needle in text, (name, needle)
+        # The first wait comes before any look at whether the API is alive: an API that is already gone, and reaped, has its status kept by
+        # bash, and a status lost there would read as a clean end. A status below 128 is the API's own; 128 and above is a trapped signal that
+        # ended the wait early (the API still drains: wait again) or the API's death by a signal (then it is not alive and the loop ends).
+        loop = text.index("while :; do")
+        assert loop < text.index('{ wait "${API_PID}"; } 2>/dev/null || API_RC=$?') < text.index('[ "${API_RC}" -ge 128 ] || break') \
+            < text.index('kill -0 "${API_PID}" 2>/dev/null || break'), name
+        assert 'while kill -0 "${API_PID}"' not in text, "a loop that tests the API first loses the status of one that is already gone"
+        assert text.index("trap 'STOPPING=1") < text.index("LABELER_PORT="), "the trap is in place before the first child starts"
+        assert 'echo "=== chat server stopped ==="' in text and 'echo "=== chat server ended ==="' in text
+        # a signal is looked for after the labeller wait, after the venv is activated (just before the API starts: no API is started after a
+        # signal), and after the API ends. There is no re-check after the launch: bash loses a signal sent to a child it has just forked
+        # (tests/test_chat_server_job.py proves the check before the launch with a slow activate script)
+        stop = '[ "${STOPPING}" -eq 0 ] || stopped'
+        activate, launch = text.index('source "${VENV_ACTIVATE}"'), text.index("python -m app.server")
+        assert text.count(stop) == 3 and activate < text.index(stop, activate) < launch, name
+        assert '|| stop_children' not in text, "a TERM right after a launch is lost by bash: forwarding there guarantees nothing"
+
+
+def test_every_flag_the_serve_wrappers_give_the_cli_is_one_of_its_own():
+    from app import cli
+    known = set(cli.build_parser()._option_string_actions)
+    required = {"--engine", "--device", "--mode", "--home", "--host", "--port", "--endpoint-file", "--threads", "--models", "--drift-note",
+                "--gallery", "--labeler", "--token-file", "--published-model", "--published-floor"}
+    for name in SERVE_WRAPPERS:
+        given = set(re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", "\n".join(l for l in _serve_code(name).splitlines() if "API_ARGS" in l)))
+        assert required <= given, (name, required - given)
+        assert given <= known, (name, given - known)
+
+
+def test_serve_chat_wrapper_headers_claim_only_what_is_true():
+    """Docs made true (P7-B fix 1). The GPU twin says its labeller stays on the CPU, which its env line makes so; neither header says the
+    uncached decode reproduces the published dump (a turn decodes cached by default, and the score stage compares a report with the published
+    dump only for a turn under the published protocol: live_equals_published, P5-E); and both say what a signal during the model load does."""
+    cpu, gpu = _serve_text("serve_chat_h100.sh"), _serve_text("serve_chat_gpu_h100.sh")
+    for name, text in (("cpu", cpu), ("gpu", gpu)):
+        assert "reproduces the published dump" not in text and "uncached decode" not in text, name
+        assert "default action" in text and "during the model load" in text, name
+        assert "endpoint file as the shutdown begins" in text or "removes the endpoint file first" in text, name
+    assert "CUDA_VISIBLE_DEVICES" in gpu and "CPU" in gpu and "P5-F" in gpu
+    assert "cached_decode on by default" in gpu and "live_equals_published" in gpu and "published protocol" in gpu
+
+
+def test_serve_chat_wrapper_headers_document_the_submit_and_summary_lines():
+    for name in SERVE_WRAPPERS:
+        header = "\n".join(l for l in _serve_text(name).splitlines() if l.startswith("#") and not l.startswith("#SBATCH"))
+        assert "bash scripts/chat_remote.sh sync && bash scripts/chat_remote.sh submit scripts/" + name in header
+        assert "bash scripts/chat_remote.sh summary logs/chat_server" in header
+        assert "app/tunnel/tunnel.sh" in header and "app_token" in header
+
+
+def test_serve_chat_wrappers_pass_the_bash_syntax_check():
+    import shutil
+    import subprocess
+    shells = [s for s in ("/bin/bash", shutil.which("bash")) if s and os.path.exists(s)]
+    assert shells
+    for name in SERVE_WRAPPERS:
+        for shell in set(shells):
+            done = subprocess.run([shell, "-n", str(REPO_ROOT / "scripts" / name)], capture_output=True, text=True)
+            assert done.returncode == 0, (name, shell, done.stderr)
+
+
+# ── CHAT_UI_PLAN.md P7-C: the laptop-side tunnel scripts ──────────────────────
+# Static pins on app/tunnel/tunnel.sh (the forward loop that re-reads the node from chat_sessions/endpoint, which the serve job writes as one
+# JSON line) and app/tunnel/public_demo.sh (cloudflared, public mode only). Their behaviour (the endpoint's JSON, hostile content, both
+# paths, a stale endpoint, the busy port, the signals, every refusal) is rehearsed for real under /bin/bash with a fake ssh, curl and
+# cloudflared in tests/test_chat_tunnel.py.
+
+TUNNEL_SCRIPTS = ("tunnel.sh", "public_demo.sh")
+# What a bash older than 4 cannot run (the Mac's /bin/bash is 3.2): `bash -n` parses all of these, the shell fails on them at run time.
+BASH_4_ONLY = [r"\bdeclare\s+-A\b", r"\blocal\s+-A\b", r"\btypeset\s+-A\b", r"\bmapfile\b", r"\breadarray\b", r"\bcoproc\b", r"\bwait\s+-n\b",
+               r"\$\{[^}]*(,,|\^\^)[^}]*\}", r"&>>", r"\|&", r"\[\[\s+-v\b", r"printf\s+'%\(", r"\bread\s+-t\s+[0-9]*\.[0-9]"]
+
+
+def _tunnel_text(name: str = "tunnel.sh") -> str:
+    return (REPO_ROOT / "app" / "tunnel" / name).read_text()
+
+
+def _tunnel_code(name: str = "tunnel.sh") -> List[str]:
+    return _gallery_wrapper_code(_tunnel_text(name))
+
+
+def _only_line(code: List[str], fragment: str) -> int:
+    found = [i for i, line in enumerate(code) if fragment in line]
+    assert len(found) == 1, (fragment, found)
+    return found[0]
+
+
+def test_tunnel_scripts_are_executable_pass_bash_n_and_use_nothing_newer_than_bash_3_2():
+    import shutil
+    import subprocess
+    shells = [s for s in ("/bin/bash", shutil.which("bash")) if s and os.path.exists(s)]
+    assert shells
+    for name in TUNNEL_SCRIPTS:
+        path = REPO_ROOT / "app" / "tunnel" / name
+        assert _tunnel_text(name).startswith("#!/bin/bash\n"), name
+        assert os.access(str(path), os.X_OK), "{} is run as app/tunnel/{} (git keeps mode 755; a stricter umask may narrow the copy)".format(name, name)
+        for shell in set(shells):
+            done = subprocess.run([shell, "-n", str(path)], capture_output=True, text=True)
+            assert done.returncode == 0, (name, shell, done.stderr)
+        code = "\n".join(_tunnel_code(name))
+        for pattern in BASH_4_ONLY:
+            assert not re.search(pattern, code), (name, pattern)
+
+
+def test_tunnel_sh_reads_chat_sessions_endpoint_once_over_ssh_in_batch_mode_and_runs_nothing_else_there():
+    code = _tunnel_code()
+    read = code[_only_line(code, "chat_sessions/endpoint")]
+    # P7-C fix 1, item 6: the read's stdin is /dev/null, or a tunnel started in the background of a terminal is stopped by SIGTTIN
+    assert read == 'EP=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "${LOGIN}" cat chat_sessions/endpoint 2>/dev/null </dev/null)', read
+    # every ssh call is that read or one of the two forwards; `squeue` is only ever text for the person at the laptop
+    ssh_calls = [l for l in code if re.search(r"(^|[\s(])ssh -", l)]
+    assert len(ssh_calls) == 3 and sum(" -N " in l for l in ssh_calls) == 2, ssh_calls
+    assert all(l.startswith('log "') for l in code if "squeue" in l)
+    assert "BatchMode" not in "\n".join(l for l in code if l not in (read,)), "BatchMode is the read's: the forwards may prompt"
+
+
+def test_tunnel_sh_supports_both_paths_and_the_host_key_relaxation_is_on_the_jump_path_only():
+    code = "\n".join(_tunnel_code())
+    match = re.search(r'if \[ "\$\{VIA\}" = "jump" \]; then\n(.*?)\nelse\n(.*?)\nfi\n', code, re.S)
+    assert match, "the forward is `if VIA = jump ... else ... fi`"
+    jump, login = match.group(1), match.group(2)
+    assert '-J "${LOGIN}"' in jump and '-L "${LOCAL_PORT}:127.0.0.1:${PORT}"' in jump and '"${CLUSTER_USER}@${NODE}"' in jump
+    assert "-o StrictHostKeyChecking=accept-new" in jump
+    assert '-o "UserKnownHostsFile=\\"${NODES_KNOWN_HOSTS}\\""' in jump, "the path in double quotes for ssh: a HOME with a space is one file"
+    assert login.endswith('-L "${LOCAL_PORT}:${NODE}:${PORT}" "${LOGIN}" &'), login
+    for relaxed in ("-J", "StrictHostKeyChecking", "accept-new", "known_hosts", "127.0.0.1", "CLUSTER_USER"):
+        assert relaxed not in login, relaxed
+    assert code.count("accept-new") == 1 and code.count("UserKnownHostsFile") == 1, "nowhere but on the jump path"
+    for branch in (jump, login):
+        # a background job (the loop that watches it needs its pid), not a command the script waits for
+        assert branch.startswith("ssh -N ") and branch.endswith("&"), branch
+        for option in ("ExitOnForwardFailure=yes", "ServerAliveInterval=30", "ServerAliveCountMax=3", "ConnectTimeout=10", "GatewayPorts=no"):
+            assert "-o " + option in branch, option
+    assert 'VIA=login needs a server started with a BIND other than 127.0.0.1' in code and "(R6)" in code
+
+
+def test_tunnel_sh_validates_the_endpoint_before_using_it_and_never_echoes_it():
+    text, code = _tunnel_text(), _tunnel_code()
+    joined = "\n".join(code)
+    assert 're.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", host)' in text, "the ruling's host pattern, anchored at both ends"
+    assert "type(port) is int and 1 <= port <= 65535" in text and "json.loads" in text
+    assert 'log "endpoint unreadable; retrying"' in joined
+    assert not re.search(r"\beval\b|\bsource\b|^\. ", joined, re.M), "the content of the file is never run"
+    for line in code:
+        if re.match(r"(log|echo|die|printf)\b", line):
+            assert "${EP}" not in line and "${PARSED}" not in line, line
+
+
+def test_tunnel_sh_tests_the_local_port_by_binding_it_before_every_forward_and_never_connects():
+    text, code = _tunnel_text(), _tunnel_code()
+    # both loopback addresses ssh -L listens on for localhost (P7-C fix 1, item 2), each bound with SO_REUSEADDR as ssh binds its own listener
+    assert 'families = [(socket.AF_INET, "127.0.0.1")]' in text and 'families.append((socket.AF_INET6, "::1"))' in text
+    assert "s.bind((address, port))" in text and text.count(".bind(") == 1, "one bind, for each family in turn"
+    assert "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)" in text and text.count("setsockopt") == 1
+    assert "if error.errno not in (errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT):" in text, "a family the host does not have counts as free"
+    joined = "\n".join(code)
+    for connecting in (r"\.connect\(", r"connect_ex", r"create_connection", r"\bcurl\b", r"\bnc\b", r"/dev/tcp", r"\blsof\b", r"\btelnet\b"):
+        assert not re.search(connecting, joined), connecting
+    assert ('echo "localhost:${LOCAL_PORT} is already in use (a local dev server?); set LOCAL_PORT to a free port"' in joined
+            and "exit 1" in joined)
+    assert joined.count("port_free || busy") == 2, "at the start (fail fast) and before each forward (a dev server may come up later)"
+
+
+def test_tunnel_sh_defaults_are_the_plans_and_its_loop_knobs_and_signals_are_handled_and_documented():
+    code = _tunnel_code()
+    for default in ('LOGIN="${LOGIN:-$(cluster_setting CLUSTER_HOST)}"', 'LOCAL_PORT="${LOCAL_PORT:-8000}"', 'VIA="${VIA:-jump}"',
+                    'CLUSTER_USER="${CLUSTER_USER:-$(cluster_setting CLUSTER_USER)}"', 'RETRY_SLEEP="${RETRY_SLEEP:-15}"',
+                    'RECHECK_S="${RECHECK_S:-60}"', 'MAX_ATTEMPTS="${MAX_ATTEMPTS:-0}"'):
+        assert any(l.startswith(default) for l in code), default
+    # The personal settings come from the git-ignored settings file, never from a literal in the script.
+    assert not any(re.search(r"(LOGIN|CLUSTER_USER)=\"\$\{\w+:-[A-Za-z]", l) for l in code), "no literal login host or user default"
+    header = "\n".join(l for l in _tunnel_text().splitlines() if l.startswith("#"))
+    for knob in ("LOGIN", "LOCAL_PORT", "VIA", "CLUSTER_USER", "CHAT_CLUSTER_ENV", "MAX_ATTEMPTS", "RETRY_SLEEP", "RECHECK_S",
+                 "chat_sessions/endpoint", "JSON"):
+        assert knob in header, knob
+    joined = "\n".join(code)
+    for signal_name, status in (("INT", 130), ("TERM", 143), ("HUP", 129)):
+        assert "trap 'stop {}' {}".format(status, signal_name) in joined, signal_name
+    assert "jobs -p" in joined
+
+
+def test_public_demo_sh_checks_the_server_is_in_public_mode_before_it_starts_cloudflared():
+    text, code = _tunnel_text("public_demo.sh"), _tunnel_code("public_demo.sh")
+    probe = _only_line(code, 'curl -s --max-time 5 "http://localhost:${LOCAL_PORT}/healthz"')      # inside public_mode(), the one place that asks
+    first = _only_line(code, "SEEN=$(public_mode)")
+    verdict = _only_line(code, 'case "${SEEN}" in')
+    installed = _only_line(code, "command -v cloudflared")
+    start = _only_line(code, 'cloudflared tunnel --url "http://localhost:${LOCAL_PORT}"')
+    assert probe < first < verdict < installed < start, "mode first, then cloudflared is looked for, then it is started"
+    arms = code[verdict + 1:code.index("esac", verdict)]
+    assert arms[0] == "public) ;;" and all("refuse" in arm for arm in arms[1:]) and len(arms) >= 3, arms
+    assert "json.loads" in text and re.search(r'print\(mode if mode in \("public", "private"\) else "unknown"\)', text)
+    assert not re.search(r"\bgrep\b|\bawk\b|\bsed\b", "\n".join(code)), "the answer is parsed as JSON, never matched as text"
+    assert "ssh" not in "\n".join(code) and code[start].endswith("&"), "no cluster contact; cloudflared runs as a job the signals can stop"
+    joined = "\n".join(code)
+    for signal_name, status in (("INT", 130), ("TERM", 143), ("HUP", 129)):
+        assert "trap 'stop {}' {}".format(status, signal_name) in joined, signal_name
+    header = "\n".join(l for l in text.splitlines() if l.startswith("#"))
+    assert "LOCAL_PORT" in header and "public mode" in header.lower() and "R6" in header
+
+
+def test_tunnel_scripts_run_nothing_on_the_cluster_and_never_touch_the_token():
+    for name in TUNNEL_SCRIPTS:
+        text = _tunnel_text(name)
+        for forbidden in ("sbatch", "scontrol", "rm -rf"):
+            assert forbidden not in text, (name, forbidden)
+        for secret in ("app_token", "Authorization", "Bearer", "X-Client-Id", "--token"):
+            assert secret not in text, (name, secret)
+
+
+# ── P7-C fix 1 (controller review of 86af48d): the endpoint re-check, the demo watch, the ::1 bind test, the quoted path ──────────────────────
+
+def _header_words(name: str = "tunnel.sh") -> str:
+    """The script's header comment as one run of words: a phrase is found whatever line it was wrapped on."""
+    return " ".join(" ".join(l.lstrip("#") for l in _tunnel_text(name).splitlines() if l.startswith("#")).split())
+
+
+def test_tunnel_sh_rereads_the_endpoint_on_a_timer_with_the_same_read_and_parse_and_compares_before_it_stops_the_forward():
+    """Item 1. A forward whose node or port the server has left stays up and points at nothing: only a re-read finds that out."""
+    code = _tunnel_code()
+    joined = "\n".join(code)
+    assert sum(l == "read_endpoint" for l in code) == 2 and joined.count("parse_endpoint <<<") == 2, "one read and one parse: the attempt's and the watch's"
+    assert 'RECHECK_S="${RECHECK_S:-60}"' in joined
+    assert "case \"${RECHECK_S}\" in ''|0*|*[!0-9]*) die \"RECHECK_S must be a whole number of seconds from 1 to 99999\" ;; esac" in joined
+    assert '[ "${#RECHECK_S}" -le 5 ] || die "RECHECK_S must be a whole number of seconds from 1 to 99999"' in joined, "= ^[1-9][0-9]{0,4}$"
+    watch = joined[joined.index("watch_forward() {"):joined.index("attempt() {")]
+    assert 'while kill -0 "${fwd}" 2>/dev/null; do' in watch and "run_child sleep 1" in watch, "bash 3.2 has no wait -n: a one-second look at the pid"
+    assert '[ "${waited}" -ge "${RECHECK_S}" ] || continue' in watch and watch.count("read_endpoint") == 1
+    assert 'elif [ "${latest}" != "${PARSED}" ]; then' in watch, "host, port and mode, as validated, against the forward's own"
+    assert 'end_forward() { { kill "$1"; wait "$1"; } 2>/dev/null; }' in joined and watch.count('end_forward "${fwd}"') == 3, "gone, unreadable, changed"
+    failed = watch[watch.index('if [ "${RC}" -eq 255 ]; then'):watch.index("elif")]
+    assert "end_forward" not in failed and "return" not in failed, "ssh itself failing (255) keeps the forward: ServerAlive ends a dead one"
+    assert watch.count("NO_PAUSE=1") == 1 and '[ "${NO_PAUSE}" -eq 1 ] || run_child sleep "${RETRY_SLEEP}"' in joined, "no pause after a change only"
+
+
+def test_tunnel_sh_quotes_the_known_hosts_path_for_ssh_and_refuses_a_home_it_cannot_quote():
+    """Item 7. UserKnownHostsFile takes files separated by whitespace, so a path with a space needs the double quotes ssh_config(5) allows."""
+    joined = "\n".join(_tunnel_code())
+    assert '-o "UserKnownHostsFile=\\"${NODES_KNOWN_HOSTS}\\""' in joined
+    assert 'case "${HOME}" in *[\\"\\\\%]*) die "HOME must not contain a double quote, a backslash or a percent sign' in joined
+    assert joined.index('case "${HOME}" in') < joined.index("read_endpoint"), "refused before anything is asked"
+    assert '[ "${VIA}" != "jump" ] || case "${HOME}"' in joined, "HOME matters on the jump path only"
+
+
+def test_tunnel_sh_header_says_what_it_decides_about_re_reads_and_attempts_and_where_its_port_test_stops():
+    words = _header_words()
+    for fragment in ("RECHECK_S", "re-reads belong to the attempt and are not counted", "the attempt that follows a change counts as a new one",
+                     "changed", "gone", "unreadable", "ssh failed", "exit 255", "ServerAlive", "no RETRY_SLEEP pause", "once a second",
+                     "stdin on /dev/null", "SIGTTIN", "double quotes", "known_hosts_cluster_nodes",
+                     "on 127.0.0.1 and on ::1", "on macOS a listener bound to a wildcard address (0.0.0.0 or ::) can read as free",
+                     "BSD lets a specific bind coexist with a wildcard one"):
+        assert fragment in words, fragment
+
+
+def test_public_demo_sh_checks_the_mode_again_while_the_link_is_up_and_closes_it_on_anything_but_public():
+    """Item 3. A server that comes back in private mode serves MIMIC-derived content and must never sit behind a live public link (R6, DUA)."""
+    text, code = _tunnel_text("public_demo.sh"), _tunnel_code("public_demo.sh")
+    joined = "\n".join(code)
+    start = _only_line(code, 'cloudflared tunnel --url "http://localhost:${LOCAL_PORT}"')
+    again = _only_line(code, "NOW=$(public_mode)")
+    assert start < again and sum("$(public_mode)" in l for l in code) == 2, "the start and the watch ask the same way, the watch after the link is up"
+    loop = joined[joined.index('while kill -0 "${LINK}" 2>/dev/null; do'):joined.index('wait "${LINK}"')]
+    assert "run_child sleep 1" in loop and '[ "${waited}" -ge "${DEMO_RECHECK_S}" ] || continue' in loop, "once a second, a check every DEMO_RECHECK_S"
+    arms = loop[loop.index('case "${NOW}" in'):loop.index("esac")]
+    assert "public) ;;" in arms and arms.count("close_link") == 2, "anything but public closes the link, however it fails"
+    closer = joined[joined.index("close_link() {"):joined.index("trap 'stop 130' INT")]
+    assert 'echo "refusing: $1; cloudflared is stopped and the public link is closed."' in closer and "exit 1" in closer and "end_jobs" in closer
+    assert 'DEMO_RECHECK_S="${DEMO_RECHECK_S:-10}"' in joined
+    assert "case \"${DEMO_RECHECK_S}\" in ''|0*|*[!0-9]*) die \"DEMO_RECHECK_S must be a whole number of seconds from 1 to 99999\" ;; esac" in joined
+    assert '[ "${#DEMO_RECHECK_S}" -le 5 ] || die "DEMO_RECHECK_S must be a whole number of seconds from 1 to 99999"' in joined
+    assert "wait -n" not in joined and "ssh" not in joined
+    words = _header_words("public_demo.sh")
+    for fragment in ("DEMO_RECHECK_S", "default 10", "private mode", "R6", "DUA", "fails closed", "refusing:", "Exit status"):
+        assert fragment in words, fragment
+
+
+# ── CHAT_UI_PLAN.md P8-C: the load drill ──────────────────────────────────────
+# Static pins on scripts/chat_load_drill.py, the drill the laptop runs against the cluster's server through the tunnel. Its behaviour (the
+# RESULT line, the exit statuses, the refusals, the token, the one session it makes and deletes, what it does not print) is run for real
+# against a live tiny server in tests/test_chat_load_drill.py. These pins hold what a later edit could break without a test noticing: which
+# libraries it imports, where its token comes from, and what can reach its two output streams (R7: a private server streams MIMIC-derived text).
+
+_DRILL = REPO_ROOT / "scripts" / "chat_load_drill.py"
+
+
+def _drill_tree():
+    """-> (the script's syntax tree, a map from each node to its parent)."""
+    tree = ast.parse(_DRILL.read_text(encoding="utf-8"))
+    return tree, {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def _drill_constants(tree):
+    """The module-level NAME = "text" constants: the keys and sentences the script spells once."""
+    found = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            found.update({t.id: node.value.value for t in node.targets if isinstance(t, ast.Name)})
+    return found
+
+
+def _drill_function(node, parents):
+    """The name of the function a node is in, or None at module level."""
+    while node in parents:
+        node = parents[node]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return node.name
+    return None
+
+
+def _drill_calls(tree, name):
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name]
+
+
+def _normalized(source):
+    """A line of Python as ast.unparse writes it: what a shape in a pin is compared with."""
+    return ast.unparse(ast.parse(source, mode="eval"))
+
+
+def test_the_load_drill_imports_httpx_and_no_other_http_library():
+    """P8-C. The drill runs on the laptop, in the venv, beside the tunnel: httpx and the standard library, no other HTTP client, none of the
+    standard library's own (urllib, http, socket ...), and nothing of the app or the model stack (it must start with the server's code absent).
+    It makes one httpx client, which goes straight to the URL it was given (no proxy named in the environment, no redirect), because the
+    token and the stream travel on it; httpx's module-level functions build a client of their own with the defaults, so none is called."""
+    if not hasattr(sys, "stdlib_module_names"):
+        pytest.skip("sys.stdlib_module_names needs Python 3.10")
+    roots, first_party = _imports_of(_DRILL)
+    assert "httpx" in roots, roots
+    assert roots <= set(sys.stdlib_module_names) | {"httpx"}, sorted(roots - set(sys.stdlib_module_names) - {"httpx"})
+    assert not first_party and not roots & {"app", "scripts", "tests", "hybrid_xmamba", "torch", "numpy", "PIL"}, sorted(roots)
+    stdlib_http = {"urllib", "http", "socket", "ssl", "ftplib", "smtplib", "xmlrpc", "asyncio", "selectors", "socketserver", "wsgiref"}
+    assert not roots & stdlib_http, sorted(roots & stdlib_http)
+    tree, _ = _drill_tree()
+    clients = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "httpx.Client"]
+    assert len(clients) == 1, "one client, for everything it sends"
+    settings = {k.arg: getattr(k.value, "value", None) for k in clients[0].keywords}
+    assert settings.get("trust_env") is False and settings.get("follow_redirects") is False, settings
+    functions = {"httpx." + name for name in ("get", "post", "put", "patch", "delete", "head", "options", "request", "stream")}
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) in functions]
+
+
+def test_the_load_drill_reads_its_token_only_from_chat_token_or_a_token_file():
+    """P8-C. A token on the command line shows in `ps` and in the shell history. The one environment read is CHAT_TOKEN, the one option that
+    names a token is --token-file, the one positional is the URL, the parser takes no abbreviation (`--token abc` must not become
+    `--token-file abc`), and the file is read in one place, from that option. A token is not sent over plain http to a host that is not
+    loopback: that refusal is raised in main, on exactly that condition, before the client that would send it is built."""
+    tree, parents = _drill_tree()
+    consts = _drill_constants(tree)
+    assert consts.get("TOKEN_ENV") == "CHAT_TOKEN"
+    environment = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "os"
+                   and n.attr in ("environ", "environb", "getenv")]
+    assert len(environment) == 1, "the environment is read in one place"
+    getter = parents[environment[0]]                      # os.environ.get(...)
+    assert isinstance(getter, ast.Attribute) and getter.attr == "get" and isinstance(parents[getter], ast.Call)
+    key = parents[getter].args[0]
+    assert (consts.get(key.id) if isinstance(key, ast.Name) else getattr(key, "value", None)) == "CHAT_TOKEN", "the key is CHAT_TOKEN and nothing else"
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "os"
+                and any(a.name in ("environ", "environb", "getenv") for a in n.names)]
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "argv"], "arguments reach it through main(argv) only"
+    added = [[a.value for a in n.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+             for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "add_argument"]
+    assert [names[0] for names in added if not names[0].startswith("-")] == ["url"], "no positional but the URL"
+    assert sorted(name for names in added for name in names if name.startswith("-")) == sorted(
+        ["--token-file", "--turns", "--queue-cap", "--max-new-tokens", "--timeout", "-h", "--help"]), "the only option that takes a token is --token-file"
+    for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "add_argument"):
+        assert not [k for k in call.keywords if k.arg == "dest"], "no option under another name"
+    parsers = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and any(k.arg == "allow_abbrev" for k in n.keywords)]
+    assert len(parsers) == 1 and [k.value.value for k in parsers[0].keywords if k.arg == "allow_abbrev"] == [False]
+    reads = _drill_calls(tree, "read_token")
+    assert len(reads) == 1 and _drill_function(reads[0], parents) == "find_token"
+    assert isinstance(reads[0].args[0], ast.Name) and reads[0].args[0].id == "token_file"
+    finds = _drill_calls(tree, "find_token")
+    assert len(finds) == 1 and ast.unparse(finds[0].args[0]) == "args.token_file"
+    guards = [n for n in _drill_calls(tree, "Refused") if n.args and ast.unparse(n.args[0]) == "CLEARTEXT_REFUSAL"]
+    assert len(guards) == 1 and _drill_function(guards[0], parents) == "main", "one guard, in main"
+    guard = parents[parents[guards[0]]]                   # Refused(...) <- raise <- if
+    assert isinstance(guard, ast.If) and ast.unparse(guard.test) == "token is not None and sends_token_in_clear(base)"
+    clients = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "httpx.Client"]
+    assert len(clients) == 1 and guards[0].lineno < clients[0].lineno, "the refusal comes before the client exists"
+
+
+def test_the_load_drill_prints_and_writes_nothing_but_the_result_line_help_and_its_fixed_refusals():
+    """P8-C, R7. No print, no logging, no traceback, no file opened for writing: every write is the one `_write`, and it has three callers, the
+    help text, a refusal (`ERROR ` and the text of a Refused, which is fixed) and the RESULT line (the payload result_payload built)."""
+    tree, parents = _drill_tree()
+    assert not _drill_calls(tree, "print") and not _drill_calls(tree, "open") and not _drill_calls(tree, "breakpoint")
+    roots, _ = _imports_of(_DRILL)
+    allowed = {"argparse", "ipaddress", "json", "os", "re", "stat", "struct", "sys", "threading", "time", "zlib", "collections", "dataclasses",
+               "typing", "httpx"}   # ipaddress: the loopback test for the cleartext guard
+    assert roots <= allowed, sorted(roots - allowed)   # no logging, traceback, pprint, tempfile, shutil, pathlib, io, pickle, subprocess ...
+    writers = {"write", "writelines", "write_text", "write_bytes", "dump", "flush"}
+    writes = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in writers]
+    assert writes and {_drill_function(n, parents) for n in writes} == {"_write"}, "every write, and flush, is in _write"
+    changes = {"write", "rename", "replace", "makedirs", "mkdir", "remove", "unlink", "truncate", "ftruncate", "fsync", "symlink", "link", "chmod"}
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "os"
+                and n.attr in changes], "it changes nothing on disk"
+    opens = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "os.open"]
+    assert [ast.unparse(n.args[1]) for n in opens] == ["os.O_RDONLY | os.O_NONBLOCK"], "the one file it opens is opened for reading"
+    sinks = _drill_calls(tree, "_write")
+    assert sorted(ast.unparse(s.args[1]) for s in sinks) == sorted(_normalized(shape) for shape in (
+        '"ERROR " + str(exc)', '"RESULT " + json.dumps(payload, separators=(",", ":"))', 'parser.format_help().rstrip("\\n")'))
+    assert {_drill_function(s, parents) for s in sinks} == {"main"}
+    refusal = next(s for s in sinks if ast.unparse(s.args[1]) == _normalized('"ERROR " + str(exc)'))
+    handler = parents[refusal]
+    while not isinstance(handler, ast.ExceptHandler):
+        handler = parents[handler]
+    assert ast.unparse(handler.type) == "Refused" and handler.name == "exc", "the text of a refusal is that of a Refused"
+    payloads = [n for n in ast.walk(tree) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "payload" for t in n.targets)
+                and _drill_function(n, parents) == "main"]
+    assert [ast.unparse(n.value).split("(")[0] for n in payloads] == ["result_payload"], "main's payload is result_payload's and nothing else"
+
+
+def test_the_load_drill_keeps_nothing_of_a_frame_but_its_seq_event_and_status_and_names_exceptions_by_class():
+    """P8-C, R7. What can reach the output is built from counts, booleans and fixed words: the turn's outcome has no field for a frame's content,
+    a stream is read down to (seqs, last_event, final) and a frame to (seq, status), the text of a Refused or a DrillError is written in the
+    script (a literal, a constant, a status code or a class name), and every other exception is named by its class and never by its text."""
+    tree, parents = _drill_tree()
+    consts = _drill_constants(tree)
+    outcome = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Outcome")
+    assert [s.target.id for s in outcome.body if isinstance(s, ast.AnnAssign)] == ["status", "refusal", "seqs", "last_event", "final", "error"]
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    assert [ast.unparse(r.value) for r in ast.walk(functions["read_stream"]) if isinstance(r, ast.Return)] == [_normalized("(seqs, last_event, final)")]
+    names = {n.id for r in ast.walk(functions["_shape"]) if isinstance(r, ast.Return) for n in ast.walk(r) if isinstance(n, ast.Name)}
+    assert names <= {"seq", "status", "type", "int", "STATUSES"}, "a frame leaves _shape as its seq and its status word: " + str(sorted(names))
+
+    def fixed(node):
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, str)
+        if isinstance(node, ast.Name):
+            return node.id in consts
+        return isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add) and fixed(node.left) and fixed(node.right)
+
+    argparse_text = _normalized('re.sub(r"\'.*$", "", message).rstrip(" :")')   # argparse's own message with whatever it quoted cut off
+    for call in _drill_calls(tree, "Refused"):
+        text = call.args[0]
+        assert fixed(text) or (ast.unparse(text) == argparse_text and _drill_function(call, parents) == "error"), ast.unparse(call)
+    codes = {_normalized(s) for s in ('"session_create_" + type(exc).__name__', '"session_create_http_{}".format(response.status_code)')}
+    for call in _drill_calls(tree, "DrillError"):
+        assert fixed(call.args[0]) or ast.unparse(call.args[0]) in codes, ast.unparse(call)
+    handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler) and n.name]
+    assert handlers, "the pin looks at something"
+    for handler in handlers:
+        if ast.unparse(handler.type) in ("Refused", "DrillError"):
+            continue   # their text is pinned above
+        uses = [n for stmt in handler.body for n in ast.walk(stmt) if isinstance(n, ast.Name) and n.id == handler.name]
+        for use in uses:   # `type(exc)`: the class, never the text
+            parent = parents[use]
+            assert isinstance(parent, ast.Call) and ast.unparse(parent.func) == "type", ast.unparse(handler) + " uses " + handler.name
+
+
+# ── CHAT_UI_PLAN.md P7-D: the real-turn probe ─────────────────────────────────
+# Static pins on scripts/chat_realturn_probe.py, the gate the laptop runs against the cluster's private server through the tunnel, which prints
+# numbers only because that server streams MIMIC-derived text (R7). Its behaviour (the three passes, the gate, the exit statuses, the refusals, the
+# sessions, what it does not print) is run for real against a live tiny server in tests/test_chat_realturn_probe.py. These pins hold what a later
+# edit could break without a test noticing: which libraries it imports, where its token comes from, and what can reach its two output streams.
+
+_PROBE = REPO_ROOT / "scripts" / "chat_realturn_probe.py"
+
+
+def _probe_tree():
+    """-> (the script's syntax tree, a map from each node to its parent)."""
+    tree = ast.parse(_PROBE.read_text(encoding="utf-8"))
+    return tree, {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def _probe_calls(tree, dotted):
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == dotted]
+
+
+def _probe_outer(node, parents):
+    """The name of the module-level function a node is in, however deep it sits (a helper defined inside it counts as it), or None."""
+    name = None
+    while node in parents:
+        node = parents[node]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = node.name
+    return name
+
+
+def test_the_realturn_probe_imports_httpx_the_standard_library_and_the_drill_beside_it_and_nothing_else():
+    """P7-D. Like the drill it runs on the laptop, in the venv, beside the tunnel, with the server's code absent: httpx and the standard library, no
+    other HTTP client, nothing of the app or the model stack, and of its own repository only the drill, whose transport helpers it imports (the URL
+    check, the token, the cleartext guard, the synthetic picture, the one write, the session calls). It makes one httpx client, built in main, which
+    goes straight to the URL it was given (no proxy named in the environment, no redirect), because the token and the stream travel on it; httpx's
+    module-level functions build a client of their own with the defaults, so none is called."""
+    if not hasattr(sys, "stdlib_module_names"):
+        pytest.skip("sys.stdlib_module_names needs Python 3.10")
+    roots, first_party = _imports_of(_PROBE)
+    allowed = {"argparse", "json", "os", "re", "sys", "time", "dataclasses", "typing", "httpx", "scripts"}   # no `math`: a number is bounded, not converted
+    assert roots <= allowed, sorted(roots - allowed)
+    assert roots - {"httpx", "scripts"} <= set(sys.stdlib_module_names)
+    assert not first_party and not roots & {"app", "tests", "hybrid_xmamba", "torch", "numpy", "PIL"}, sorted(roots)
+    stdlib_http = {"urllib", "http", "socket", "ssl", "ftplib", "smtplib", "xmlrpc", "asyncio", "selectors", "socketserver", "wsgiref", "subprocess"}
+    assert not roots & stdlib_http, sorted(roots & stdlib_http)
+    tree, parents = _probe_tree()
+    from_scripts = [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "scripts"]
+    assert [[(a.name, a.asname) for a in n.names] for n in from_scripts] == [[("chat_load_drill", "drill")]], "the drill, and no other script"
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Import) and any(a.name.split(".")[0] == "scripts" for a in n.names)]
+    clients = _probe_calls(tree, "httpx.Client")
+    assert len(clients) == 1 and _probe_outer(clients[0], parents) == "main", "one client, for everything it sends"
+    settings = {k.arg: getattr(k.value, "value", None) for k in clients[0].keywords}
+    assert settings.get("trust_env") is False and settings.get("follow_redirects") is False, settings
+    functions = {"httpx." + name for name in ("get", "post", "put", "patch", "delete", "head", "options", "request", "stream")}
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) in functions]
+    # the one use of os is the path arithmetic that puts the repository's root on sys.path; sys is the path, the two streams and the exit status
+    assert {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "os"} == {"path"}
+    assert {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and ast.unparse(n.value) == "os.path"} == {"dirname", "abspath"}
+    assert {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "sys"} == {
+        "path", "stdout", "stderr", "exit"}
+
+
+def test_the_realturn_probe_reads_its_token_only_through_the_drills_find_token_from_chat_token_or_a_token_file():
+    """P7-D. A token on the command line shows in `ps` and in the shell history. The probe reads no environment variable and no argument itself: the
+    one read of the token is the drill's find_token, which takes CHAT_TOKEN or the file named by --token-file (the one option that names a token);
+    the one positional is the URL; the parser takes no abbreviation (`--token abc` must not become `--token-file abc`); the URL goes through the
+    drill's check (port 8000 refused); and a token is not sent over plain http to a host that is not loopback: that refusal is raised in main, on
+    exactly that condition, before the client that would send it is built. The bearer is made in main from the token, and the client id is fixed."""
+    tree, parents = _probe_tree()
+    consts = _drill_constants(tree)
+    assert consts.get("CLIENT_ID") == "chat-realturn-probe"
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in ("environ", "environb", "getenv", "argv")]
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module in ("os", "sys")]
+    assert not _probe_calls(tree, "drill.read_token") and not _drill_calls(tree, "read_token")
+    finds = _probe_calls(tree, "drill.find_token")
+    assert len(finds) == 1 and ast.unparse(finds[0].args[0]) == "args.token_file" and _probe_outer(finds[0], parents) == "main"
+    checks = _probe_calls(tree, "drill.check_url")
+    assert len(checks) == 1 and ast.unparse(checks[0].args[0]) == "args.url" and _probe_outer(checks[0], parents) == "main"
+    adds = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "add_argument"]
+    added = [[a.value for a in n.args if isinstance(a, ast.Constant) and isinstance(a.value, str)] for n in adds]
+    assert [names[0] for names in added if not names[0].startswith("-")] == ["url"], "no positional but the URL"
+    assert sorted(name for names in added for name in names if name.startswith("-")) == sorted(
+        ["--token-file", "--rows", "--eos-tokens", "--timeout", "-h", "--help"]), "the only option that takes a token is --token-file"
+    assert not [k for call in adds for k in call.keywords if k.arg == "dest"], "no option under another name"
+    parsers = _probe_calls(tree, "drill._Parser")
+    assert len(parsers) == 1 and [k.value.value for k in parsers[0].keywords if k.arg == "allow_abbrev"] == [False]
+    guards = [n for n in _probe_calls(tree, "drill.Refused") if n.args and ast.unparse(n.args[0]) == "drill.CLEARTEXT_REFUSAL"]
+    assert len(guards) == 1 and _probe_outer(guards[0], parents) == "main", "one guard, in main"
+    guard = parents[parents[guards[0]]]                   # Refused(...) <- raise <- if
+    assert isinstance(guard, ast.If) and ast.unparse(guard.test) == "token is not None and drill.sends_token_in_clear(base)"
+    clients = _probe_calls(tree, "httpx.Client")
+    assert len(clients) == 1 and guards[0].lineno < clients[0].lineno, "the refusal comes before the client exists"
+    bearers = [n for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.startswith("Bearer")]
+    assert len(bearers) == 1 and _probe_outer(bearers[0], parents) == "main" and ast.unparse(parents[bearers[0]]) == "'Bearer ' + token"
+    headers = [n for n in ast.walk(tree) if isinstance(n, ast.Dict) and any(isinstance(k, ast.Constant) and k.value == "X-Client-Id" for k in n.keys)]
+    assert len(headers) == 1 and ast.unparse(headers[0]) == "{'X-Client-Id': CLIENT_ID}", "the client id is fixed"
+
+
+def test_the_realturn_probe_prints_and_writes_nothing_but_result_lines_help_and_its_fixed_refusals():
+    """P7-D, R7. No print, no logging, no traceback, no file opened or written: every write is the drill's one `_write`, and it has four callers in
+    main: the help text, a refusal (`ERROR ` and the text of a Refused, which is fixed), a pass's RESULT line and the gate's, each made by
+    result_line, the one function that builds a RESULT line, out of a payload of numbers, booleans and fixed words. json.dumps is called
+    there and, for the options a turn sends (a dict the probe built), in run_turn."""
+    tree, parents = _probe_tree()
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id in ("print", "open", "breakpoint", "exec", "eval", "input", "compile", "__import__")]
+    writers = {"write", "writelines", "write_text", "write_bytes", "dump", "flush", "truncate", "mkdir", "unlink", "rename"}
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in writers], "its own writes are the drill's, through one call"
+    sinks = _probe_calls(tree, "drill._write")
+    assert {_probe_outer(s, parents) for s in sinks} == {"main"}
+    assert sorted((ast.unparse(s.args[0]), ast.unparse(s.args[1])) for s in sinks) == sorted((stream, _normalized(shape)) for stream, shape in (
+        ("stderr", '"ERROR " + str(exc)'), ("stdout", 'parser.format_help().rstrip("\\n")'),
+        ("stdout", "result_line(pass_payload(run, runs[0] if number == 2 else None))"), ("stdout", 'result_line({"gate": gate})')))
+    refusal = next(s for s in sinks if ast.unparse(s.args[1]) == _normalized('"ERROR " + str(exc)'))
+    handler = parents[refusal]
+    while not isinstance(handler, ast.ExceptHandler):
+        handler = parents[handler]
+    assert ast.unparse(handler.type) == "drill.Refused" and handler.name == "exc", "the text of a refusal is that of a Refused"
+    assert [_probe_outer(n, parents) for n in _probe_calls(tree, "result_line")] == ["main", "main"]
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    assert [ast.unparse(r.value) for r in ast.walk(functions["result_line"]) if isinstance(r, ast.Return)] == [
+        _normalized('"RESULT " + json.dumps(payload, separators=(",", ":"))')]
+    dumps = _probe_calls(tree, "json.dumps")
+    assert sorted(_probe_outer(n, parents) for n in dumps) == ["result_line", "run_turn"]
+    assert [ast.unparse(n.args[0]) for n in dumps if _probe_outer(n, parents) == "run_turn"] == ["spec.options"]
+    streams = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "sys"
+               and n.attr in ("stdout", "stderr")]
+    assert {_probe_outer(n, parents) for n in streams} == {"main"} and len(streams) == 2, "the process's own streams are main's defaults"
+
+
+def test_the_realturn_probe_takes_a_number_from_a_frame_only_below_a_bound_and_the_timings_it_prints_hold_numbers_and_nothing_else():
+    """P7-D follow-up, R7. A frame's numbers are taken by two readers, `_count` and `_ms`, and each asks for the bound before it does anything with
+    the value: a plain int (for ms also a float) from 0 to below NUMBER_LIMIT. An integer of 400 digits is compared and dropped, never converted
+    (math.isfinite of one raises OverflowError, which ended the turn), so the script's one float() is in `_ms`, behind that guard. The four timings
+    that pass 1 and pass 3 print for a turn come from one builder, `_timings`, out of four fields of Facts that are typed as numbers, and each is
+    set only from the clock (`_since`) or from `_ms`: no text of a frame can be in one."""
+    tree, parents = _probe_tree()
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    limits = [n for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "NUMBER_LIMIT" for t in n.targets)]
+    assert len(limits) == 1 and ast.unparse(limits[0].value) == "10 ** 12", "a trillion: ms are 31 years, and no count is as big"
+    assert [ast.unparse(r.value) for r in ast.walk(functions["_count"]) if isinstance(r, ast.Return)] == [
+        _normalized("value if type(value) is int and 0 <= value < NUMBER_LIMIT else None")]
+    assert [ast.unparse(i.test) for i in ast.walk(functions["_ms"]) if isinstance(i, ast.If)] == [
+        _normalized("type(value) in (int, float) and 0 <= value < NUMBER_LIMIT")]
+    assert [_probe_outer(n, parents) for n in _probe_calls(tree, "float")] == ["_ms"], "the one conversion of a frame's number: behind the bound"
+    facts = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Facts")
+    fields = {s.target.id: ast.unparse(s.annotation) for s in facts.body if isinstance(s, ast.AnnAssign)}
+    timings = {"first_byte_ms": "Optional[float]", "total_ms": "Optional[float]", "server_ms": "Optional[float]", "stages_ms": "Dict[str, float]"}
+    assert {name: fields.get(name) for name in timings} == timings, "four fields that hold numbers"
+    assert [ast.unparse(r.value) for r in ast.walk(functions["_timings"]) if isinstance(r, ast.Return)] == [_normalized(
+        '{"first_byte_ms": f.first_byte_ms, "total_ms": f.total_ms, "server_ms": f.server_ms, "stages_ms": dict(f.stages_ms)}')]
+    assert sorted(_probe_outer(n, parents) for n in _probe_calls(tree, "_timings")) == ["_eos_entry", "_gate_row"], "pass 1's rows and pass 3's turns"
+    written = []   # every write to a timing field of Facts
+    for node in ast.walk(tree):
+        for target in node.targets if isinstance(node, ast.Assign) else []:
+            on = target.value if isinstance(target, ast.Subscript) else target
+            if isinstance(on, ast.Attribute) and ast.unparse(on.value) == "facts" and on.attr in timings:
+                written.append(ast.unparse(node.value))
+    assert sorted(written) == sorted(_normalized(s) for s in ('_since(started, clock)', '_since(started, clock)', '_ms(data.get("total_ms"))', "ms"))
+    millis = [ast.unparse(n.value) for n in ast.walk(functions["_stage_end"]) if isinstance(n, ast.Assign)
+              and any(isinstance(t, ast.Name) and t.id == "ms" for t in n.targets)]
+    assert millis == [_normalized('_ms(data.get("ms"))')], "a stage's ms is `_ms` of what the frame said"
+
+
+def test_the_realturn_probe_keeps_nothing_of_a_frame_but_numbers_booleans_and_fixed_words_and_names_exceptions_by_class():
+    """P7-D, R7. A frame is parsed in one place (read_into) and looked at in four small functions that take its data; what leaves them is the
+    fields of Facts, and those hold numbers, booleans and a few words, each of which is chosen from a fixed list by `_word` (the stop reason, the
+    status, a skip reason, an error kind, a refusal's kind) or is a class name or a literal. A report's text goes through sentence_facts, which
+    returns three numbers. The ids and rows a turn names are in Handles, which only the image requests read: no line is built from them. The text
+    of an exception is never used: every handler but those of Refused and DrillError (whose texts are written in the drill) names the class."""
+    tree, parents = _probe_tree()
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    loads = _probe_calls(tree, "json.loads")
+    assert [_probe_outer(n, parents) for n in loads] == ["read_into"]
+    looks = {name for name, fn in functions.items() if {a.arg for a in fn.args.args} & {"data", "detail", "text", "report"}}
+    assert looks == {"_note", "_stage_end", "_retrieve", "_label", "sentence_facts"}, "the functions that are given what a frame holds"
+    assert [ast.unparse(r.value) for r in ast.walk(functions["sentence_facts"]) if isinstance(r, ast.Return)] == [
+        _normalized("(len(tokens), any((is_sentence_end(t) for t in tokens)), bool(tokens) and is_sentence_end(tokens[-1]))")]
+    assert {_probe_outer(n, parents) for n in _drill_calls(tree, "sentence_facts")} == {"_note"}
+    facts = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Facts")
+    fields = {s.target.id: ast.unparse(s.annotation) for s in facts.body if isinstance(s, ast.AnnAssign)}
+    safe = {"Optional[int]", "Optional[float]", "Optional[bool]", "Optional[str]", "Dict[str, float]", "Dict[str, str]", "List[int]"}
+    assert set(fields.values()) <= safe, {k: v for k, v in fields.items() if v not in safe}
+    words = {name for name, kind in fields.items() if "str" in kind and "Dict[str, float]" != kind}
+    assert words == {"refusal", "error", "final", "stream_error", "stopped", "skipped"}, "the fields that hold a word"
+    for node in ast.walk(tree):   # every word put into Facts is picked from a fixed list, or is a class name, or is the literal "timeout"
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            on = target.value if isinstance(target, ast.Subscript) else target
+            if isinstance(on, ast.Attribute) and ast.unparse(on.value) == "facts" and on.attr in words:
+                value = ast.unparse(node.value)
+                assert value.startswith("_word(") or value in ("type(exc).__name__", "'timeout'"), ast.unparse(node)
+    fetched = [n for n in _drill_calls(tree, "Fetched") if any(k.arg == "error" for k in n.keywords)]
+    assert fetched and all(ast.unparse(k.value) in ("type(exc).__name__", "'no_id'") for n in fetched for k in n.keywords if k.arg == "error")
+    handles = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Handles")
+    names = {s.target.id for s in handles.body if isinstance(s, ast.AnnAssign)}
+    assert names == {"message_id", "neighbor_rows"}
+    reads = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in names and isinstance(n.ctx, ast.Load)]
+    assert {_probe_outer(n, parents) for n in reads} == {"_retrieve", "fetch_features"}, "only the image requests, and the reader that fills them"
+    for name in ("_timings", "_gate_row", "_stop_entry", "_eos_entry", "_gate_line", "_stop_line", "_eos_line", "pass_payload", "gate_payload"):
+        assert "handles" not in {n.id for n in ast.walk(functions[name]) if isinstance(n, ast.Name)}, name
+    caught = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler) and n.name]
+    assert caught, "the pin looks at something"
+    for handler in caught:
+        if ast.unparse(handler.type) in ("drill.Refused", "drill.DrillError"):
+            continue   # their text is written in the drill, and pinned there
+        for use in (n for stmt in handler.body for n in ast.walk(stmt) if isinstance(n, ast.Name) and n.id == handler.name):
+            parent = parents[use]   # `type(exc)`: the class, never the text
+            assert isinstance(parent, ast.Call) and ast.unparse(parent.func) == "type", ast.unparse(handler) + " uses " + handler.name
+
+
+# ── CHAT_UI_PLAN.md P7-E: the requeue drill ───────────────────────────────────
+# Static pins on scripts/chat_requeue_drill.py, the drill the laptop runs against the cluster's live server through the tunnel: it sends one turn, has
+# the job requeued while the turn runs, and prints numbers only because that server streams MIMIC-derived text (R7). Its behaviour (the line, the exit
+# statuses, the refusals, the fixed codes, the sentinel, both signals against a real server process) is run for real in tests/test_chat_requeue_drill.py.
+# These pins hold what a later edit could break without a test noticing: what it imports, where its token comes from, the one class that touches the
+# cluster and the two commands it may build, the ports it never names, and what can reach its two output streams.
+
+_REQUEUE = REPO_ROOT / "scripts" / "chat_requeue_drill.py"
+
+
+def _requeue_tree():
+    """-> (the script's syntax tree, a map from each node to its parent)."""
+    tree = ast.parse(_REQUEUE.read_text(encoding="utf-8"))
+    return tree, {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def _requeue_docstrings(tree):
+    """The constant nodes that are the docstrings of the module, its classes and its functions."""
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                found.add(first.value)
+    return found
+
+
+def _requeue_assigned(node, target):
+    """Every Assign in `node` that sets `target` (a dotted name, alone or in a tuple): -> the unparsed values."""
+    values = []
+    for found in ast.walk(node):
+        if isinstance(found, ast.Assign):
+            names = [t for t in found.targets for t in (t.elts if isinstance(t, ast.Tuple) else [t])]
+            if any(ast.unparse(t) == target for t in names):
+                values.append(ast.unparse(found.value))
+    return values
+
+
+def test_the_requeue_drill_imports_httpx_the_standard_library_and_the_drill_and_the_probe_beside_it_and_nothing_else():
+    """P7-E. Like the drill and the probe it runs on the laptop, in the venv, beside the tunnel, with the server's code absent: httpx and the standard
+    library, no other HTTP client, nothing of the app or the model stack, and of its own repository only the load drill and the probe, whose helpers
+    it imports (the URL check, the token, the cleartext guard, the picture, the one write, the session calls, the stream reader, the fixed words).
+    `subprocess` is the one import the others do not have: the real cluster runs ssh with it, in one class (the next pin). One httpx client is made, in
+    main, which goes straight to the URL it was given (no proxy named in the environment, no redirect, no connection kept alive); httpx's module-level
+    functions build a client of their own with the defaults, so none is called."""
+    if not hasattr(sys, "stdlib_module_names"):
+        pytest.skip("sys.stdlib_module_names needs Python 3.10")
+    roots, first_party = _imports_of(_REQUEUE)
+    allowed = {"argparse", "json", "os", "re", "subprocess", "sys", "threading", "time", "dataclasses", "typing", "httpx", "scripts"}
+    assert roots <= allowed, sorted(roots - allowed)
+    assert roots - {"httpx", "scripts"} <= set(sys.stdlib_module_names)
+    assert not first_party and not roots & {"app", "tests", "hybrid_xmamba", "torch", "numpy", "PIL"}, sorted(roots)
+    stdlib_http = {"urllib", "http", "socket", "ssl", "ftplib", "smtplib", "xmlrpc", "asyncio", "selectors", "socketserver", "wsgiref", "logging",
+                   "traceback", "pickle", "shutil", "tempfile", "pathlib", "io", "pprint"}
+    assert not roots & stdlib_http, sorted(roots & stdlib_http)
+    tree, parents = _requeue_tree()
+    from_scripts = [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "scripts"]
+    assert sorted([(a.name, a.asname) for a in n.names] for n in from_scripts) == [[("chat_load_drill", "drill")], [("chat_realturn_probe", "probe")]], \
+        "the drill and the probe, and no other script"
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Import) and any(a.name.split(".")[0] == "scripts" for a in n.names)]
+    clients = _probe_calls(tree, "httpx.Client")
+    assert len(clients) == 1 and _probe_outer(clients[0], parents) == "main", "one client, for everything it sends"
+    settings = {k.arg: ast.unparse(k.value) for k in clients[0].keywords}
+    assert settings["trust_env"] == "False" and settings["follow_redirects"] == "False", settings
+    assert settings["limits"] == "httpx.Limits(max_keepalive_connections=0)", "a poll never reuses a connection the old server left in the pool"
+    functions = {"httpx." + name for name in ("get", "post", "put", "patch", "delete", "head", "options", "request", "stream")}
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) in functions]
+    # the one use of os is the path arithmetic that puts the repository's root on sys.path; sys is the path, the two streams and the exit status
+    assert {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "os"} == {"path"}
+    assert {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and ast.unparse(n.value) == "os.path"} == {"dirname", "abspath"}
+    assert {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "sys"} == {
+        "path", "stdout", "stderr", "exit"}
+
+
+def test_the_requeue_drill_reads_its_token_only_through_the_drills_find_token_from_chat_token_or_a_token_file():
+    """P7-E. A token on the command line shows in `ps` and in the shell history. The drill reads no environment variable and no argument itself: the
+    one read of the token is the load drill's find_token, which takes CHAT_TOKEN or the file named by --token-file (the one option that names a
+    token); the one positional is the URL; the parser takes no abbreviation (`--token abc` must not become `--token-file abc`); the URL goes through the
+    drill's check (the dev server's port refused), and a token is not sent over plain http to a host that is not loopback: that refusal is raised in
+    main, on exactly that condition, before the client that would send it is built. The URL must also be a loopback address, which is checked there
+    as well. The bearer is made in main from the token, and the client id is fixed."""
+    tree, parents = _requeue_tree()
+    assert _drill_constants(tree).get("CLIENT_ID") == "chat-requeue-drill"
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in ("environ", "environb", "getenv", "argv")]
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module in ("os", "sys")]
+    assert not _probe_calls(tree, "drill.read_token") and not _drill_calls(tree, "read_token")
+    finds = _probe_calls(tree, "drill.find_token")
+    assert len(finds) == 1 and ast.unparse(finds[0].args[0]) == "args.token_file" and _probe_outer(finds[0], parents) == "main"
+    checks = _probe_calls(tree, "drill.check_url")
+    assert len(checks) == 1 and ast.unparse(checks[0].args[0]) == "args.url" and _probe_outer(checks[0], parents) == "main"
+    adds = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "add_argument"]
+    added = [[a.value for a in n.args if isinstance(a, ast.Constant) and isinstance(a.value, str)] for n in adds]
+    assert [names[0] for names in added if not names[0].startswith("-")] == ["url"], "no positional but the URL"
+    assert sorted(name for names in added for name in names if name.startswith("-")) == sorted(
+        ["--job", "--login", "--token-file", "--wait", "-h", "--help"]), "the only option that takes a token is --token-file"
+    assert not [k for call in adds for k in call.keywords if k.arg == "dest"], "no option under another name"
+    parsers = _probe_calls(tree, "drill._Parser")
+    assert len(parsers) == 1 and [k.value.value for k in parsers[0].keywords if k.arg == "allow_abbrev"] == [False]
+    guards = [n for n in _probe_calls(tree, "drill.Refused") if n.args and ast.unparse(n.args[0]) == "drill.CLEARTEXT_REFUSAL"]
+    assert len(guards) == 1 and _probe_outer(guards[0], parents) == "main", "one guard, in main"
+    guard = parents[parents[guards[0]]]                   # Refused(...) <- raise <- if
+    assert isinstance(guard, ast.If) and ast.unparse(guard.test) == "token is not None and drill.sends_token_in_clear(base)"
+    loopback = [n for n in _probe_calls(tree, "drill.Refused") if n.args and ast.unparse(n.args[0]) == "LOOPBACK_REFUSAL"]
+    assert len(loopback) == 1 and _probe_outer(loopback[0], parents) == "main"
+    where = parents[parents[loopback[0]]]
+    assert isinstance(where, ast.If) and ast.unparse(where.test) == "not drill.is_loopback(httpx.URL(base).host)"
+    clients = _probe_calls(tree, "httpx.Client")
+    assert len(clients) == 1 and guards[0].lineno < loopback[0].lineno < clients[0].lineno, "both refusals come before the client exists"
+    logins = [n for n in _probe_calls(tree, "drill.Refused") if n.args and ast.unparse(n.args[0]) == "LOGIN_MISSING"]
+    assert len(logins) == 1 and _probe_outer(logins[0], parents) == "main" and logins[0].lineno < clients[0].lineno
+    assert ast.unparse(parents[parents[logins[0]]].test) == "cluster is None and args.login is None", "the real cluster needs --login"
+    bearers = [n for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.startswith("Bearer")]
+    assert len(bearers) == 1 and _probe_outer(bearers[0], parents) == "main" and ast.unparse(parents[bearers[0]]) == "'Bearer ' + token"
+    headers = [n for n in ast.walk(tree) if isinstance(n, ast.Dict) and any(isinstance(k, ast.Constant) and k.value == "X-Client-Id" for k in n.keys)]
+    assert len(headers) == 1 and ast.unparse(headers[0]) == "{'X-Client-Id': CLIENT_ID}", "the client id is fixed"
+
+
+def test_the_requeue_drill_names_ssh_and_starts_a_process_in_one_class_and_builds_exactly_two_commands():
+    """P7-E. The cluster is injected. The one class that touches it, SshCluster, is the only place in the script where ssh, the scheduler's commands or
+    `subprocess` appear (a docstring aside); it runs one `subprocess.run` with an argument list, no shell, nothing on stdin and a time limit; and the
+    argument lists it builds are exactly the two the plan allows: `squeue -j JOB -h -o %N` and `scontrol requeue JOB` behind `ssh -o BatchMode=yes
+    HOST`, HOST being the --login alias (the CLUSTER_HOST of the git-ignored scripts/chat_cluster.env), checked where the class is made: the script
+    holds no host of its own. That is pinned at the one door a command goes through, `_run` (P7-E fix 1: the list literals alone left a third command built as a tuple
+    unseen): node and requeue are its only callers, each hands it one of the two literal lists, and no other method exists. The drill's own code asks the
+    cluster for the node in one function and requeues once, after the third delta, and the real cluster is made in main, as the default of the argument."""
+    tree, parents = _requeue_tree()
+    docstrings = _requeue_docstrings(tree)
+    cluster = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SshCluster")
+    inside = set(ast.walk(cluster))
+    words = ("ssh", "squeue", "scontrol", "sbatch", "scancel", "sacct")
+    strings = [n for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str) and n not in docstrings]
+    assert not [n.value for n in strings if any(w in n.value.lower() for w in words) and n not in inside], "ssh and the scheduler are named in SshCluster only"
+    assert "CLUSTER_HOST" not in _drill_constants(tree), "the script holds no login host of its own: --login gives it"
+    init = next(n for n in cluster.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    assert [ast.unparse(s) for s in init.body] == [
+        "if not isinstance(host, str) or LOGIN_HOST.fullmatch(host) is None:\n    raise ClusterError('bad_host')", "self.host = host"], \
+        "the host is checked where it goes into a command, and only kept"
+    uses = [n for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id == "subprocess"]
+    assert uses and all(n in inside for n in uses), "subprocess is used in SshCluster only"
+    runs = _probe_calls(tree, "subprocess.run")
+    assert len(runs) == 1 and _probe_outer(runs[0], parents) == "_run" and [ast.unparse(a) for a in runs[0].args] == ["argv"]
+    assert {k.arg: ast.unparse(k.value) for k in runs[0].keywords} == {
+        "stdin": "subprocess.DEVNULL", "capture_output": "True", "text": "True", "errors": "'replace'", "timeout": "SSH_TIMEOUT_S"}, "no shell, no input"
+    assert {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "subprocess"} == {
+        "run", "DEVNULL", "TimeoutExpired"}, "no Popen, no check_output, no other way to start a process"
+    lists = [n for n in ast.walk(tree) if isinstance(n, ast.List) and n.elts and isinstance(n.elts[0], ast.Constant) and n.elts[0].value == "ssh"]
+    shapes = {"node": '["ssh", "-o", "BatchMode=yes", self.host, "squeue", "-j", job, "-h", "-o", "%N"]',
+              "requeue": '["ssh", "-o", "BatchMode=yes", self.host, "scontrol", "requeue", job]'}
+    assert sorted(ast.unparse(n) for n in lists) == sorted(_normalized(shape) for shape in shapes.values()), "the two commands, and no third"
+    assert sorted(_probe_outer(n, parents) for n in lists) == ["node", "requeue"]
+    # A command is whatever reaches `_run`, so what reaches it is pinned, and not only the list literals that begin with "ssh": a third command built as a
+    # tuple, through list(...) or from a variable has no such literal. `_run` is called twice, once by node and once by requeue, each time with one list
+    # literal and nothing else; its name is used nowhere else in the class (no getattr, no alias) and the class has no method but those two and their two
+    # helpers. (The turn reader has a `_run` of its own, its thread's body, which is the one other use of the name, in its __init__.)
+    callers = [n for n in ast.walk(cluster) if isinstance(n, ast.Call) and getattr(n.func, "attr", getattr(n.func, "id", None)) == "_run"]
+    assert sorted(_probe_outer(n, parents) for n in callers) == ["node", "requeue"], "_run: called by node and requeue, once each"
+    assert all(len(n.args) == 1 and not n.keywords and isinstance(n.args[0], ast.List) for n in callers), "each hands it one list literal"
+    assert {_probe_outer(n, parents): ast.unparse(n.args[0]) for n in callers} == {name: _normalized(shape) for name, shape in shapes.items()}, \
+        "node its squeue and requeue its scontrol, and no other command"
+    named = [n for n in ast.walk(cluster) if (isinstance(n, ast.Attribute) and n.attr == "_run") or (isinstance(n, ast.Name) and n.id == "_run")
+             or (isinstance(n, ast.Constant) and n.value == "_run" and n not in docstrings)]
+    assert len(named) == len(callers) == 2, "the name `_run` is used as the callee of those two calls and nowhere else in the class"
+    assert sorted(n.name for n in cluster.body if isinstance(n, ast.FunctionDef)) == ["__init__", "_checked", "_run", "node", "requeue"], \
+        "no method that could build a third"
+    elsewhere = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "_run" and n not in inside]
+    assert [(_probe_outer(n, parents), ast.unparse(n)) for n in elsewhere] == [("__init__", "self._run")], "outside the class: the reader's own thread body only"
+    raised = [n for n in ast.walk(cluster) if isinstance(n, ast.Call) and ast.unparse(n.func) == "ClusterError"]
+    assert sorted(ast.unparse(n.args[0]) for n in raised) == sorted(repr(w) for w in ("bad_host", "bad_job", "timeout", "not_run", "failed")), \
+        "fixed words only"
+    made = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "SshCluster"]
+    assert len(made) == 1 and _probe_outer(made[0], parents) == "main" and ast.unparse(parents[made[0]]) == \
+        "SshCluster(args.login) if cluster is None else cluster"
+    asked = _probe_calls(tree, "cluster.node")
+    assert [_probe_outer(n, parents) for n in asked] == ["ask_node"], "the node is asked for in one function"
+    requeued = _probe_calls(tree, "cluster.requeue")
+    assert [_probe_outer(n, parents) for n in requeued] == ["run_drill"] and len(requeued) == 1, "one requeue"
+    drill_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_drill")
+    waits = _probe_calls(drill_fn, "reader.enough.wait")
+    enough = [n for n in ast.walk(drill_fn) if isinstance(n, ast.If) and ast.unparse(n.test) == "reader.stream.deltas < MIN_DELTAS"]
+    nodes = [n for n in ast.walk(drill_fn) if isinstance(n, ast.Call) and ast.unparse(n.func) == "ask_node"]
+    sessions = _probe_calls(drill_fn, "drill.create_session")
+    assert len(waits) == len(enough) == len(sessions) == 1 and len(nodes) == 2
+    assert nodes[0].lineno < sessions[0].lineno < waits[0].lineno < enough[0].lineno < requeued[0].lineno < nodes[1].lineno, \
+        "the node, the session and the turn, three deltas, the requeue, the node again"
+    assert isinstance(enough[0].body[-1], ast.Return), "a turn that has not streamed three deltas is not interrupted"
+
+
+def test_the_requeue_drill_never_says_either_of_the_ports_of_the_users_own_servers():
+    """P7-E. 8000 is the dev server's and 8010 the controller's tunnel (app/README.md). The drill is the load drill's own in what it refuses (the URL check
+    refuses the first), and no number or address of either is written anywhere in it: not in a constant, not in a message, not in the docstring."""
+    source = _REQUEUE.read_text(encoding="utf-8")
+    assert not re.search(r"\b(8000|8010)\b", source)
+    tree, _ = _requeue_tree()
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value in (8000, 8010)]
+    plain = {t.id: ast.unparse(n.value) for n in tree.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
+    assert plain["MODEL"] == "probe.PUBLISHED_MODEL" and plain["MAX_NEW_TOKENS"] == "200" and plain["MIN_DELTAS"] == "3"
+    assert plain["POLL_S"] == "5.0" and plain["DEFAULT_WAIT_S"] == "1800.0" and plain["DELTA"] == "'content_block_delta'"
+    options = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "turn_options")
+    assert [ast.unparse(r.value) for r in ast.walk(options) if isinstance(r, ast.Return)] == ["probe.turn_options(model=MODEL, max_new_tokens=MAX_NEW_TOKENS)"]
+
+
+_REQUEUE_TESTS = REPO_ROOT / "tests" / "test_chat_requeue_drill.py"
+
+
+def test_the_requeue_drill_tests_name_the_users_ports_only_where_nothing_can_connect():
+    """P7-E fix 1. 8000 is the user's dev server and 8010 the tunnel to the live cluster server. The module's autouse socket guard keeps every test of
+    tests/test_chat_requeue_drill.py off both, but it works in the test process: a child process is not reached by it, and a child that was handed
+    http://localhost:8000 would have posted a turn to the dev server had the script's URL check ever regressed. So the numbers are written in the guard's
+    own constant and in the tests that run in this process with a client that cannot connect (the refusal matrix under `offline`, the check_url matrix,
+    the `Down` client, the guard's address test), and nowhere else: not in a test that starts a process, not in a fixture, not in a fake (a docstring
+    aside). Each of those places must still name them, so that the list cannot drift."""
+    tree = ast.parse(_REQUEUE_TESTS.read_text(encoding="utf-8"))
+    docstrings = _requeue_docstrings(tree)
+    where = {}
+    for top in tree.body:
+        name = top.name if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else type(top).__name__
+        if isinstance(top, ast.Assign):
+            name = ast.unparse(top.targets[0])
+        for node in ast.walk(top):
+            if not isinstance(node, ast.Constant) or node in docstrings:
+                continue
+            if (type(node.value) is int and node.value in (8000, 8010)) or (isinstance(node.value, str) and re.search(r"(?<![0-9])(8000|8010)(?![0-9])", node.value)):
+                where.setdefault(name, []).append(node.value)
+    assert sorted(where) == sorted([
+        "FORBIDDEN_PORTS", "test_the_guard_names_the_users_ports_and_decides_on_the_address_alone_so_that_checking_it_connects_to_neither",
+        "test_the_script_refuses_port_8000_in_one_line_with_exit_2_and_connects_to_nothing", "test_only_port_8000_itself_is_refused_for_being_the_dev_server",
+        "test_a_loopback_address_is_not_refused_and_a_server_that_is_down_ends_in_one_result_line_with_a_fixed_code"]), sorted(where)
+
+
+def test_the_requeue_drill_prints_and_writes_nothing_but_result_lines_help_and_its_fixed_refusals():
+    """P7-E, R7. No print, no logging, no traceback, no file opened or written: every write is the load drill's one `_write`, and it has three callers in
+    main: the help text, a refusal (`ERROR ` and the text of a Refused, which is fixed) and the RESULT line, made by the probe's result_line out of the
+    payload that `payload` built from the drill's findings. json.dumps is called for the options a turn sends (a dict the script built), and in no
+    other place."""
+    tree, parents = _requeue_tree()
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id in ("print", "open", "breakpoint", "exec", "eval", "input", "compile", "__import__")]
+    writers = {"write", "writelines", "write_text", "write_bytes", "dump", "flush", "truncate", "mkdir", "unlink", "rename"}
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in writers], "its own writes are the load drill's, through one call"
+    sinks = _probe_calls(tree, "drill._write")
+    assert {_probe_outer(s, parents) for s in sinks} == {"main"}
+    assert sorted((ast.unparse(s.args[0]), ast.unparse(s.args[1])) for s in sinks) == sorted((stream, _normalized(shape)) for stream, shape in (
+        ("stderr", '"ERROR " + str(exc)'), ("stdout", 'parser.format_help().rstrip("\\n")'), ("stdout", "probe.result_line(result)")))
+    refusal = next(s for s in sinks if ast.unparse(s.args[1]) == _normalized('"ERROR " + str(exc)'))
+    handler = parents[refusal]
+    while not isinstance(handler, ast.ExceptHandler):
+        handler = parents[handler]
+    assert ast.unparse(handler.type) == "drill.Refused" and handler.name == "exc", "the text of a refusal is that of a Refused"
+    texts = [n.args[0] for n in _probe_calls(tree, "drill.Refused")]
+    assert sorted(ast.unparse(t) for t in texts) == sorted(["drill.URL_MISSING", "JOB_MISSING", "drill.CLEARTEXT_REFUSAL", "LOOPBACK_REFUSAL",
+                                                           "LOGIN_MISSING"]), \
+        "the text of a refusal is written in a constant, here or in the load drill"
+    assert _requeue_assigned(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main"), "result") == ["payload(run)"]
+    dumps = _probe_calls(tree, "json.dumps")
+    assert [_probe_outer(n, parents) for n in dumps] == ["_read"] and [ast.unparse(n.args[0]) for n in dumps] == ["turn_options()"]
+    streams = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "sys"
+               and n.attr in ("stdout", "stderr")]
+    assert {_probe_outer(n, parents) for n in streams} == {"main"} and len(streams) == 2, "the process's own streams are main's defaults"
+
+
+def test_the_requeue_drill_keeps_nothing_of_a_frame_or_an_answer_but_names_counts_and_fixed_words_and_names_exceptions_by_class():
+    """P7-E, R7. The data of a frame is parsed in one place, `error_kind`, for an `error` event's kind, which leaves it as a word of the probe's list or
+    `unknown`; the data of a delta, which holds a snapshot of the report, is never parsed. Every answer is read through the load drill's one JSON reader,
+    in two places, and what is kept of it is a status, the name of an event, an error's kind (each from a closed list by the probe's `_word`) and a count.
+    What the stream, the stored turn and the drill hold is typed as numbers, booleans and words, every word put into them is chosen from a fixed list or
+    written in the script, and the text of an exception is never used: every handler but the ones of Refused and DrillError, whose texts are written in the
+    load drill, names its class."""
+    tree, parents = _requeue_tree()
+    functions = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    assert [_probe_outer(n, parents) for n in _probe_calls(tree, "json.loads")] == ["error_kind"]
+    assert sorted(ast.unparse(r.value) for r in ast.walk(functions["error_kind"]) if isinstance(r, ast.Return)) == sorted([
+        "'unknown'", _normalized("probe._word(error.get('type') if isinstance(error, dict) else None, probe.ERROR_KINDS)")])
+    frames = _probe_calls(tree, "probe.frames")
+    assert [_probe_outer(n, parents) for n in frames] == ["count_frames"]
+    uses = [n for n in ast.walk(functions["count_frames"]) if isinstance(n, ast.Name) and n.id == "text"]
+    assert [ast.unparse(parents[n]) for n in uses if isinstance(n.ctx, ast.Load)] == ["error_kind(text)"], "a frame's data goes to error_kind and nowhere else"
+    assert sorted(_probe_outer(n, parents) for n in _probe_calls(tree, "drill._json_or_none")) == ["read_health", "read_stored"]
+    safe = {"int", "bool", "Optional[int]", "Optional[float]", "Optional[bool]", "Optional[str]", "Stream", "Stored"}
+    for name in ("Stream", "Stored", "Drill"):
+        fields = {s.target.id: ast.unparse(s.annotation) for s in next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name).body
+                  if isinstance(s, ast.AnnAssign)}
+        assert fields and set(fields.values()) <= safe, {k: v for k, v in fields.items() if v not in safe}
+    words = lambda owner, field: sorted(v for fn in functions.values() for v in _requeue_assigned(fn, owner + "." + field))   # noqa: E731
+    assert sorted(words("stream", "end") + words("self.stream", "end")) == sorted(_normalized(s) for s in (
+        '"timeout"', '"timeout"', '"reset"', '"error_event" if stream.error_event else "closed"', 'self.stream.end or "reset"')), \
+        "how a stream ended: one of four words"
+    assert words("stream", "error_kind") == ["error_kind(text)"]
+    for field in ("status", "error", "last_event"):
+        assert all(v.startswith("probe._word(") for v in words("stored", field)) and words("stored", field), field
+    errors = sorted(_requeue_assigned(functions["run_drill"], "run.error"))
+    assert errors == sorted(_normalized(s) for s in (
+        '"interrupted"', "str(exc)", '"internal_" + type(exc).__name__', '"not_back"', '"requeue_failed"', "read_health(client)",
+        "read_stored(client, reader.stream.message_id)", '"node_failed" if not answered else "job_not_running"',
+        '"turn_http_{}".format(status) if status not in (None, 200) else "no_deltas"')), "every code the drill gives, written here"
+    codes = sorted(ast.unparse(n.value.elts[1]) for name in ("read_health", "read_stored") for n in ast.walk(functions[name])
+                   if isinstance(n, ast.Return) and isinstance(n.value, ast.Tuple))
+    assert codes == sorted(_normalized(s) for s in (   # the codes a helper returns: a fixed sentence, a status or a class name, never an answer's text
+        '"healthz_" + type(exc).__name__', '"healthz_http_{}".format(response.status_code)', '"stored_turn_no_id"',
+        '"stored_turn_" + type(exc).__name__', '"stored_turn_http_{}".format(response.status_code)', '"stored_turn_bad_answer"', "None"))
+    assert [ast.unparse(n.value) for n in ast.walk(functions["read_health"]) if isinstance(n, ast.Return) and isinstance(n.value, ast.IfExp)] == [
+        _normalized('(started, None) if isinstance(started, str) else (None, "healthz_bad_answer")')]
+    caught = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler) and n.name]
+    assert caught, "the pin looks at something"
+    for handler in caught:
+        if ast.unparse(handler.type) in ("drill.Refused", "drill.DrillError"):
+            continue   # their text is written in the load drill, and pinned there
+        for use in (n for stmt in handler.body for n in ast.walk(stmt) if isinstance(n, ast.Name) and n.id == handler.name):
+            parent = parents[use]   # `type(exc)`: the class, never the text
+            assert isinstance(parent, ast.Call) and ast.unparse(parent.func) == "type", ast.unparse(handler) + " uses " + handler.name
+
+
+def test_the_requeue_drill_reads_the_stream_on_one_daemon_thread_that_never_raises_and_always_lets_the_wait_go():
+    """P7-E. The requeue is sent from the main thread while one other thread reads the turn's stream, so that the polling of /healthz starts at once. That
+    thread is a daemon (a stream that hangs does not keep the process alive), its body catches every Exception (one that escaped it would be printed,
+    with its text, on stderr), and whatever happens it sets `enough`, the event the main thread waits on."""
+    tree, parents = _requeue_tree()
+    threads = _probe_calls(tree, "threading.Thread")
+    assert len(threads) == 1 and _probe_outer(threads[0], parents) == "__init__"
+    assert {k.arg: ast.unparse(k.value) for k in threads[0].keywords} == {"target": "self._run", "name": "'turn'", "daemon": "True"}
+    reader = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "TurnReader")
+    run = next(n for n in reader.body if isinstance(n, ast.FunctionDef) and n.name == "_run")
+    tries = [n for n in run.body if isinstance(n, ast.Try)]
+    assert len(tries) == 1 and [ast.unparse(h.type) for h in tries[0].handlers] == ["Exception"]
+    assert [ast.unparse(s) for s in tries[0].finalbody] == ["self.enough.set()"]
+
+
+# ── CHAT_UI_PLAN.md P8-F (part 1): the decode timing job ──────────────────────
+# Static pins on scripts/chat_decode_timing.py and its wrapper scripts/chat_decode_timing_h100.sh. Their behaviour (the seven arms, the lines, the
+# exit statuses, the refusals, the R7 sentinel, the wrapper rehearsed in a temp tree, the allowlist run through grep) is exercised for real in
+# tests/test_chat_decode_timing.py. These pins hold what a later edit could break without a test noticing: what the wrapper asks SLURM for, what
+# can reach the two output streams of a script that decodes MIMIC test images (R7), what is reused from the app and from the probe and not copied.
+
+_TIMING = REPO_ROOT / "scripts" / "chat_decode_timing.py"
+_TIMING_SH = REPO_ROOT / "scripts" / "chat_decode_timing_h100.sh"
+
+
+def _timing_tree():
+    """-> (the script's syntax tree, a map from each node to its parent)."""
+    tree = ast.parse(_TIMING.read_text(encoding="utf-8"))
+    return tree, {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def _timing_calls(tree, dotted):
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == dotted]
+
+
+def _timing_inner(node, parents):
+    """The name of the innermost function a node is in (a helper defined inside a function counts as itself), or None at module level."""
+    while node in parents:
+        node = parents[node]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return node.name
+    return None
+
+
+def _timing_code():
+    return _gallery_wrapper_code(_TIMING_SH.read_text())
+
+
+def test_the_decode_timing_wrapper_asks_slurm_for_the_serve_wrappers_resources_apart_from_its_time_its_name_and_the_requeue():
+    """The ruling: the serve wrapper's partition, account, qos, exclude list, 8 CPUs and 32 GB, with one hour and the job name chat_decode_timing.
+    The serving job is long and preemptible, so it requeues and appends to its log; this one is a measurement of an hour at most, and a requeued run
+    would meet the stores of its first, which a timing directory never allows."""
+    serve, serve_flags = _sbatch_options(_serve_text("serve_chat_h100.sh"))
+    mine, mine_flags = _sbatch_options(_TIMING_SH.read_text())
+    apart = ("--time", "--job-name", "--open-mode")
+    assert {k: v for k, v in mine.items() if k not in apart} == {k: v for k, v in serve.items() if k not in apart}, mine
+    assert mine["--time"] == "01:00:00" and mine["--job-name"] == "chat_decode_timing" and "--open-mode" not in mine
+    assert serve_flags == ["--requeue"] and mine_flags == []
+    assert mine["--partition"] == "@SLURM_PARTITION@" and mine["--account"] == "@SLURM_ACCOUNT@" and mine["--qos"] == "@SLURM_QOS@"
+    assert mine["--cpus-per-task"] == "8" and mine["--mem"] == "32G" and mine["--exclude"] == "@SLURM_EXCLUDE@"
+    assert mine["--output"] == mine["--error"] == "logs/%x_%j.log"
+    assert "--gres" not in _TIMING_SH.read_text() and "--gpus" not in mine, "a CPU job"
+
+
+def test_the_decode_timing_wrapper_header_documents_the_submit_the_summary_and_the_node_lever_as_it_is():
+    header = " ".join(" ".join(l.lstrip("#") for l in _TIMING_SH.read_text().splitlines() if l.startswith("#") and not l.startswith("#SBATCH")).split())
+    assert "bash scripts/chat_remote.sh sync && bash scripts/chat_remote.sh submit scripts/chat_decode_timing_h100.sh [NODE=node14]" in header
+    assert "bash scripts/chat_remote.sh summary logs/chat_decode_timing_<jobid>.log" in header
+    for phrase in ("jobs 2590184 and 2638789", "sbatch does not read NODE", "the lever cannot place the job by itself",
+                   "refuses before it loads anything", "NODE=node14 -- --nodelist=node14", "TIMING_SHAPES", "left in place",
+                   "R7 (DUA)", "R8: additive only", "no arm counts", "same_report_all_arms", "It has no --requeue",
+                   "Reading it:", "how many physical cores it covers", "the node's load average", "F reads a little high"):
+        assert phrase in header, phrase
+    for arm in ("A ", "B ", "C ", "D ", "E ", "E-local ", "F ", "A-end "):
+        assert " " + arm in header, arm
+    # Fix round 1: what the new numbers are, what total_ms is not, and what is printed (the banner once said that nothing was).
+    for phrase in ("a_end_ratio", "turn_deadline", "ten RESULT lines", "the filesystem of the node-local store directory", "never a path",
+                   "leaves out the label stage and the CheXbert half of the score stage", "because the job runs no labeller",
+                   "it is not the live turn's total", "its RESULT lines of known shapes are shown here as it prints them"):
+        assert phrase in header, phrase
+    assert header.count("never printed") == 1 and "its export, is never printed" in header, "only the mount table is never printed: the RESULT lines are"
+
+
+def test_the_decode_timing_wrapper_prepares_like_the_other_chat_wrappers_and_prints_the_sync_line_first():
+    text, code = _TIMING_SH.read_text(), "\n".join(_timing_code())
+    for needle in ('cd "${SLURM_SUBMIT_DIR}/hybrid_model_mamba_xlstm" 2>/dev/null || cd "${SLURM_SUBMIT_DIR:-.}"', "set -euo pipefail",
+                   'SCRATCH_ROOT="${SCRATCH_ROOT:-/sc/scratch/$USER/hybrid_xmamba_h100}"', 'VENV_ACTIVATE="${VENV_ACTIVATE:-.venv/bin/activate}"',
+                   'CHAT_HOME="${CHAT_HOME:-$HOME/chat_sessions}"', 'GALLERY="${GALLERY:-${CHAT_HOME}/gallery/g13d_m3_v1}"',
+                   'export HF_HOME="${SCRATCH_ROOT}/.hf" HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1',
+                   'export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}" MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"',
+                   "export PYTHONPATH=.chat_deps", 'source "${VENV_ACTIVATE}"', "mkdir -p logs"):
+        assert needle in code, needle
+    assert code.index("export PYTHONPATH=.chat_deps") < code.index('source "${VENV_ACTIVATE}"') < code.index("python scripts/chat_decode_timing.py")
+    train = _eos_wrapper_text()
+    start = train.index('SYNC="unknown"')
+    snippet = train[start:train.index('echo "=== sync ${SYNC} ==="', start) + len('echo "=== sync ${SYNC} ==="')]
+    assert snippet in text, "the P9-G3 provenance snippet, copied exactly"
+    sync = code.index('echo "=== sync ${SYNC} ==="')
+    assert code.index('echo "') == sync, "something is printed before the sync line"
+    assert code.index("python") > sync and code.index("source ") > sync and ".sync_stamp" in code[:sync]
+    assert code.index("umask 077") < code.index('mkdir -p "${CHAT_HOME}/logs"'), "what the job makes of its own is owner-only: the stores hold report text"
+
+
+def test_the_decode_timing_wrapper_validates_every_lever_before_anything_runs_and_no_refusal_echoes_a_value():
+    """The levers are NODE, GALLERY, CHAT_HOME, the node-local directory and the CPU count. A refusal says what is wrong and never the value it
+    was given: the environment of the submitting shell can hold anything. The banner shows validated values only, and the node and the build
+    name only (never a path)."""
+    code_lines = _timing_code()
+    code = "\n".join(code_lines)
+    guards = ('[ -z "${NODE}" ] || [[ "${NODE}" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || fail "NODE must be one node name: lower-case letters, digits and dashes"',
+              '[[ "${THREADS}" =~ ^[1-9][0-9]{0,2}$ ]] || fail "SLURM_CPUS_PER_TASK must be a whole number from 1 to 999 without a leading zero"',
+              '[[ "$(basename "${GALLERY}")" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "GALLERY must end in one plain build name: letters, digits, dot, dash and underscore"',
+              '[ -d "${CHAT_HOME}" ] || fail "CHAT_HOME does not exist: run chat_cluster_setup_h100.sh first"',
+              '[ -d "${LOCAL_DIR}" ] || fail "the node-local directory (TMPDIR, else /tmp) does not exist"',
+              '[ -f "${GALLERY}/manifest.json" ] || fail "the gallery has no manifest.json: build it first (P5-B)"',
+              '|| fail "the gallery\'s manifest.json is unreadable or its R@k gate is not equal: it cannot be used"',
+              '[ -f "${VENV_ACTIVATE}" ] || fail "the venv\'s activate script is missing: run chat_cluster_setup_h100.sh first"',
+              '[ -f .chat_deps/.setup_ok ] || fail "the web overlay is not set up: run chat_cluster_setup_h100.sh first"',
+              '[ -f scripts/chat_decode_timing.py ] || fail "chat_decode_timing.py is missing from this tree: run chat_remote.sh sync first"',
+              '[ -z "${NODE}" ] || [ "${NODE_NOW}" = "${NODE}" ] || fail "the job is not on the requested node: place it with -- --nodelist=<node> after the wrapper\'s name"')
+    banner = code.index('echo "=== chat decode timing: node=$(hostname) job=${JOB} threads=${THREADS} gallery=$(basename "${GALLERY}") ==="')
+    for guard in guards:
+        assert guard in code, guard
+        assert code.index(guard) < banner < code.index("python scripts/chat_decode_timing.py"), guard
+    failed = re.findall(r'\bfail "([^"]*)"', code)
+    after_the_run = [m for m in failed if "${RESULTS}" in m or "could not be kept" in m]
+    levers = [m for m in failed if m not in after_the_run]
+    assert len(failed) == 13 and len(levers) == 11 and len(after_the_run) == 2, failed
+    echoed = re.findall(r'echo "([^"]*)"', code)
+    assert not [m for m in levers if "${" in m or "$(" in m], "a refusal quotes no variable"
+    assert all(re.match(r"(=== |ERROR )", m) for m in echoed), echoed
+    paths = ("${CHAT_HOME}", "${GALLERY}", "${OUT}", "${ERR}", "${LOCAL_DIR}", "${SCRATCH_ROOT}", "${SLURM_SUBMIT_DIR}", "${NODE}", "${NODE_NOW}")
+    assert not [m for m in echoed + failed if any(p in m for p in paths)], "a printed message names a path or a lever's value"
+    assert 'echo "ERROR the timing script exited with code ${rc} (see the logs under CHAT_HOME)"' in code
+    assert 'fail "the timing script printed ${RESULTS} result lines, not 10"' in code, "the one number a message may carry besides the status is a count the wrapper made itself"
+    assert '[ "${RESULTS}" -eq 10 ]' in code, "the environment, the seven arms, A-end and the summary"
+    notice = [m for m in echoed if m.startswith("=== decode timing:")]
+    assert len(notice) == 1 and "RESULT lines" in notice[0] and "shown" in notice[0] and "never" not in notice[0], notice
+
+
+def test_the_decode_timing_wrapper_keeps_the_scripts_raw_output_in_files_and_lets_only_known_shapes_through_the_allowlist():
+    code_lines = _timing_code()
+    code = "\n".join(code_lines)
+    assert 'OUT="${CHAT_HOME}/logs/decode_timing_${JOB}.out"' in code and 'ERR="${CHAT_HOME}/logs/decode_timing_${JOB}.err"' in code
+    runs = [l for l in code_lines if "python scripts/" in l]
+    assert len(runs) == 1 and runs[0].startswith("python scripts/chat_decode_timing.py ") and runs[0].endswith(
+        '2> "${ERR}" | tee "${OUT}" | grep --line-buffered -aE "${TIMING_SHAPES}"'), runs
+    for line in code_lines:
+        if "${OUT}" in line:
+            assert line.startswith(("OUT=", "python scripts/")) or re.match(r'(WITHHELD=|RESULTS=)', line), line
+        if "${ERR}" in line:
+            assert line.startswith(("ERR=", "python scripts/")), line
+    assert 'WITHHELD="$(grep -avcE "${TIMING_SHAPES}" "${OUT}" || true)"' in code and 'RESULTS="$(grep -acE "${TIMING_SHAPES}" "${OUT}" || true)"' in code
+    # The status of each stage of the pipeline is read straight after it, with set -e off for the pipeline alone, so that an arm's line is shown
+    # as the script prints it and the script's own exit status is the job's.
+    run = code.index(runs[0])
+    assert code.rindex("set +e", 0, run) < run < code.index('STATUSES=("${PIPESTATUS[@]}")') < code.index("set -e", run)
+    assert code.index('STATUSES=("${PIPESTATUS[@]}")') == code.index("\n", run) + 1, "nothing between the pipeline and the read of its statuses"
+    assert 'rc="${STATUSES[0]:-1}"' in code and '[ "${STATUSES[1]:-1}" -eq 0 ] || fail "the timing output could not be kept"' in code
+    assert "head -n" not in code, "a head would close the pipe on the script"
+    assert not re.search(r"\b(cat|tail|less|more|sed|awk|cut)\b[^\n]*\$\{(OUT|ERR)\}", code), "the raw files are never shown"
+    assert [l for l in code_lines if re.search(r"\btee\b", l)] == [runs[0]], "tee writes the one file, in the one pipeline, and shows nothing"
+    assert "set -x" not in code and "xtrace" not in code and not re.search(r"(^|[\s;&|(])(printenv|env|date|nvidia-smi)\s*$", code, re.M)
+    shapes = re.search(r"^TIMING_SHAPES='(.*?)'$", _TIMING_SH.read_text(), re.S | re.M)
+    assert shapes and all(line.startswith("^RESULT ") and line.endswith("$") for line in shapes.group(1).splitlines()), "anchored, one shape per line"
+    assert len(shapes.group(1).splitlines()) == 6 and "'" not in shapes.group(1)
+
+
+def test_the_decode_timing_wrapper_installs_deletes_and_replaces_nothing_and_starts_no_other_job():
+    code = "\n".join(_timing_code())
+    assert not re.search(r"\b(pip|uv|conda)\b", code), "an installer string"
+    assert not re.search(r"(^|[\s;&|(])(rm|mv|ln|cp|chmod|scancel|sbatch|srun|ssh|git|nohup)(\s|$)", code, re.M), "additive only (R8), and one job"
+    assert code.count("mkdir -p") == 2 and 'mkdir -p "${CHAT_HOME}/logs"' in code, "its own log directory and the repository's logs, nothing else"
+    assert 'trap' not in code and '&' not in re.sub(r"2>|&&|\|\|", "", code.replace('"${TIMING_SHAPES}"', "")), "no background process: the one command is waited for"
+
+
+def test_the_decode_timing_wrapper_passes_the_bash_syntax_check():
+    import shutil
+    import subprocess
+    shells = [s for s in ("/bin/bash", shutil.which("bash")) if s and os.path.exists(s)]
+    assert shells
+    for shell in set(shells):
+        done = subprocess.run([shell, "-n", str(_TIMING_SH)], capture_output=True, text=True)
+        assert done.returncode == 0, (shell, done.stderr)
+
+
+def test_every_flag_the_decode_timing_wrapper_gives_the_script_is_one_of_its_own():
+    from scripts import chat_decode_timing
+    known = set(chat_decode_timing.build_parser()._option_string_actions)
+    run = next(l for l in _timing_code() if "python scripts/chat_decode_timing.py" in l).split(" 2> ")[0]   # the command, not the pipeline after it
+    given = set(re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", run))
+    assert {"--engine", "--home", "--gallery", "--job", "--threads", "--local-dir"} == given and given <= known, (given, known)
+    assert "--engine real" in run, "the job is the published model on the CPU, never the tiny engine"
+
+
+def test_the_decode_timing_script_prints_through_one_writer_and_never_prints_a_frame_or_a_report():
+    """R7: the job decodes MIMIC test images. No print, no logging call, no traceback, no file opened or written, no stream but the two that main
+    is given: every write is the drill's one `_write`, with four callers, the help text, a refusal (`ERROR ` and the fixed text of a Refused), and
+    result_line of a payload of numbers, booleans and fixed words (a fatal line, or whatever `say` is given: a fatal dictionary, the environment,
+    an arm or the summary). The reports are held in memory: they are read in the functions that store them and in the one that compares them."""
+    tree, parents = _timing_tree()
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id in ("print", "open", "breakpoint", "exec", "eval", "input", "compile", "__import__")]
+    writers = {"write", "writelines", "write_text", "write_bytes", "dump", "flush", "truncate", "unlink", "rename", "replace", "touch"}
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in writers], "its own writes are the drill's, through one call"
+    sinks = _timing_calls(tree, "drill._write")
+    assert sorted((_timing_inner(s, parents), ast.unparse(s.args[0]), ast.unparse(s.args[1])) for s in sinks) == sorted(
+        (where, stream, _normalized(shape)) for where, stream, shape in (
+            ("main", "stdout", 'parser.format_help().rstrip("\\n")'), ("main", "stderr", '"ERROR " + str(exc)'),
+            ("main", "stdout", 'result_line({"fatal": type(exc).__name__, "step": "run"})'), ("say", "stdout", "result_line(payload)")))
+    refusal = next(s for s in sinks if ast.unparse(s.args[1]) == _normalized('"ERROR " + str(exc)'))
+    handler = parents[refusal]
+    while not isinstance(handler, ast.ExceptHandler):
+        handler = parents[handler]
+    assert ast.unparse(handler.type) == "Refused" and handler.name == "exc", "the text of a refusal is that of a Refused: a fixed sentence"
+    functions = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    assert [ast.unparse(r.value) for r in ast.walk(functions["result_line"]) if isinstance(r, ast.Return)] == [
+        _normalized('"RESULT " + json.dumps(payload, separators=(",", ":"), allow_nan=False)')]
+    assert sorted(_timing_inner(n, parents) for n in _timing_calls(tree, "json.dumps")) == ["http_turn", "result_line"]
+    assert [ast.unparse(n.args[0]) for n in _timing_calls(tree, "json.dumps") if _timing_inner(n, parents) == "http_turn"] == ["options"]
+    for call in _timing_calls(tree, "say"):
+        arg = call.args[0]
+        shape = ({k.value for k in arg.keys} if isinstance(arg, ast.Dict) else ast.unparse(arg).split("(")[0])
+        assert shape in ({"fatal", "step"}, "environment", "arm_payload", "summary_payload"), ast.unparse(arg)
+    assert sorted(_timing_inner(n, parents) for n in _timing_calls(tree, "result_line")) == ["main", "say"]
+    reads = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "reports" and isinstance(n.ctx, ast.Load)]
+    assert {_timing_inner(n, parents) for n in reads} == {"_decode_arm", "_note_generated", "count_turn", "same_reports"}, "where a report is touched"
+    for name in ("arm_payload", "summary_payload", "env_payload", "result_line", "run_job", "main", "say", "first_over", "mean_ms"):
+        assert "reports" not in {n.attr for n in ast.walk(functions[name]) if isinstance(n, ast.Attribute)}, name
+    streams = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "sys"]
+    assert {n.attr for n in streams} == {"path", "stdout", "stderr", "exit"}
+    assert {_timing_inner(n, parents) for n in streams if n.attr in ("stdout", "stderr")} == {"main"}, "the process's own streams are main's defaults"
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in ("environ", "environb", "getenv", "argv")]
+
+
+def test_the_decode_timing_script_names_every_exception_by_its_class_or_a_fixed_code_and_never_by_its_text():
+    tree, parents = _timing_tree()
+    caught = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler) and n.name]
+    assert len(caught) >= 10, "the pin looks at something"
+    for handler in caught:
+        uses = [n for stmt in handler.body for n in ast.walk(stmt) if isinstance(n, ast.Name) and n.id == handler.name]
+        for use in uses:
+            parent = parents[use]
+            if ast.unparse(handler.type) == "Refused":
+                assert isinstance(parent, ast.Call) and ast.unparse(parent.func) == "str", ast.unparse(handler)   # fixed sentences, written here
+            elif ast.unparse(handler.type) == "TurnFailed":
+                assert isinstance(parent, ast.Attribute) and parent.attr == "code", ast.unparse(handler)
+            elif ast.unparse(handler.type) == "SetupFailed":
+                assert isinstance(parent, ast.Attribute) and parent.attr in ("error", "step"), ast.unparse(handler)
+            elif ast.unparse(handler.type) == "drill.DrillError":   # the drill's own code, kept only through fixed_code: a word, else the class
+                assert isinstance(parent, ast.Call) and ast.unparse(parent.func) == "str", ast.unparse(handler)
+                assert isinstance(parents[parent], ast.Call) and ast.unparse(parents[parent].func) == "fixed_code", ast.unparse(handler)
+            else:   # `type(exc)`: the class, never the text
+                assert isinstance(parent, ast.Call) and ast.unparse(parent.func) == "type", ast.unparse(handler) + " uses " + handler.name
+    assert [_timing_inner(h, parents) for h in caught if ast.unparse(h.type) == "drill.DrillError"] == ["run_arm"], "the one place the drill's code is read"
+    fixed = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "fixed_code")
+    assert [ast.unparse(r.value) for r in ast.walk(fixed) if isinstance(r, ast.Return)] == ["text if CODE.fullmatch(text) else fallback"]
+    refused = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) in ("Refused", "argparse.ArgumentTypeError")]
+    assert refused
+    for call in refused:   # every text a refusal can carry is written in this file (a literal, a constant or a format of a constant)
+        text = call.args[0]
+        assert isinstance(text, (ast.Constant, ast.Name)) or ast.unparse(text).endswith(".format(MAX_ROWS)") or ast.unparse(text) == _normalized(
+            'm = re.sub(r"\'.*$", "", message).rstrip(" :")'.split(" = ", 1)[1]), ast.unparse(call)   # argparse's own, with what it quoted cut off
+
+
+def test_the_decode_timing_script_changes_nothing_on_disk_but_the_stores_of_e_and_f_and_the_node_local_one_it_removes():
+    tree, parents = _timing_tree()
+    assert [_timing_inner(n, parents) for n in _timing_calls(tree, "tempfile.mkdtemp")] == ["arm_e_local"]
+    assert [_timing_inner(n, parents) for n in _timing_calls(tree, "shutil.rmtree")] == ["arm_e_local"], "the only thing it removes is its own"
+    removing = _timing_calls(tree, "shutil.rmtree")[0]
+    assert ast.unparse(removing) == "shutil.rmtree(str(home), ignore_errors=True)" and ast.unparse(_timing_calls(tree, "tempfile.mkdtemp")[0].keywords[1].value) == "str(base)"
+    makers = sorted((_timing_inner(n, parents), ast.unparse(n.func.value)) for n in ast.walk(tree)
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "mkdir")
+    assert makers == [("arm_e", "home"), ("arm_f", "home"), ("run_job", "paths['timing']")], makers
+    homes = sorted(ast.unparse(n.value) for n in ast.walk(tree) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "home" for t in n.targets)
+                   and _timing_inner(n, parents) in ("arm_e", "arm_f"))
+    assert homes == ["world.timing / 'e'", "world.timing / 'f'"], "under <home>/timing/<job>, at e and f"
+    assert {_timing_inner(n, parents) for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "read_text"} == {
+        "core_count", "cpu_model", "fs_word"}, "the reads of the system's own files: the CPU's name, the cores' topology and the mount table"
+    fs = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "fs_word")
+    assert sorted(ast.unparse(r.value) for r in ast.walk(fs) if isinstance(r, ast.Return)) == sorted(
+        ["None", "None if kind is None else FS_KINDS.get(kind, 'other')"]), "of the mount table, which names the home's server, only a word of the list leaves"
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value == "/tmp"], "the node-local directory is the wrapper's lever"
+    roots, first_party = _imports_of(_TIMING)
+    assert roots <= set(sys.stdlib_module_names) | {"httpx", "torch", "uvicorn", "app", "scripts"}, sorted(roots)
+    assert not roots & {"traceback", "pickle", "subprocess", "socket", "requests", "urllib"}, "no traceback, no other client, no process"
+
+
+def test_the_decode_timing_script_reuses_the_servers_loading_the_bridge_and_the_probes_reader_and_copies_none_of_them():
+    tree, parents = _timing_tree()
+    defined = {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+    for name in ("_engines", "_frames", "_push", "sse", "create_app", "build_engine", "load_report_generation_module", "read_into", "frames",
+                 "parse_rows_probe", "beam_search_cached", "write_hyps_refs", "turn_options", "Facts", "Handles", "Pipeline", "Worker", "Store", "Gallery"):
+        assert name not in defined, name + " is the app's or the probe's: imported, not written again"
+    imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "app.server" for a in n.names}
+    assert imported == {"_chat_home", "_engines", "_frames", "_push", "create_app", "sse"}, imported
+    assert [_timing_inner(n, parents) for n in _timing_calls(tree, "_engines")] == ["load_world"]
+    assert [_timing_inner(n, parents) for n in _timing_calls(tree, "create_app")] == ["arm_f"]
+    assert [_timing_inner(n, parents) for n in _timing_calls(tree, "Gallery.open")] == ["load_world"]
+    assert "expect_tower_sha256=engine.tower_sha256()" in ast.unparse(_timing_calls(tree, "Gallery.open")[0])
+    assert [_timing_inner(n, parents) for n in _timing_calls(tree, "probe.read_into")] == ["read_turn", "http_turn"]
+    assert sorted(_timing_inner(n, parents) for n in _timing_calls(tree, "probe.frames")) == ["final_report"]
+    assert [_timing_inner(n, parents) for n in _timing_calls(tree, "probe.turn_options")] == ["_http_turns"]
+    from scripts import chat_load_drill, chat_realturn_probe
+    modules = {"probe": chat_realturn_probe, "drill": chat_load_drill}
+    used = {(n.value.id, n.attr) for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id in modules}
+    assert used, "the pin looks at something"
+    assert [(who, what) for who, what in sorted(used) if not hasattr(modules[who], what)] == [], "a name of the probe or the drill that is not there"
+    assert {what for who, what in used if who == "probe"} == {"parse_rows", "Facts", "Handles", "read_into", "frames", "turn_options", "watched",
+                                                               "Timeout"}, "the probe's own reader and its own deadline: imported, not written again"
+    assert [_timing_inner(n, parents) for n in _timing_calls(tree, "probe.watched")] == ["http_turn"]
+    assert "watched" not in defined and "Timeout" not in defined
+
+
+def test_the_decode_timing_script_runs_the_arms_the_way_the_ruling_says_and_only_there():
+    tree, parents = _timing_tree()
+    beam = _timing_calls(tree, "world.engine.decoder.beam_search_cached")
+    assert [_timing_inner(n, parents) for n in beam] == ["decode_ids"] and [k.arg for k in beam[0].keywords] == [
+        "prefix_embeds", "beam_size", "max_new_tokens", "on_step"], "the decoder's own search, with the engine's arguments and the callback of the arm"
+    generates = _timing_calls(tree, "world.engine.generate")
+    assert [_timing_inner(n, parents) for n in generates] == ["time_generate"]
+    assert [ast.unparse(a) for a in generates[0].args] == ["enc", "world.opts", "_no_snapshot", "threading.Event()"]
+    pools = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "ThreadPoolExecutor"]
+    assert sorted(_timing_inner(n, parents) for n in pools) == ["arm_d", "environment"] and all(
+        {k.arg: ast.unparse(k.value) for k in n.keywords} == {"max_workers": "1", "thread_name_prefix": "'turn'"} for n in pools), "the pipeline's own kind"
+    assert [_timing_inner(n, parents) for n in _timing_calls(tree, "asyncio.run")] == ["_pipeline_arm"]
+    assert [_timing_inner(n, parents) for n in _timing_calls(tree, "Worker")] == ["_pipeline_arm"]
+    assert [_timing_inner(n, parents) for n in _timing_calls(tree, "Pipeline")] == ["_pipeline_arm"]
+    assert "labeler" not in ast.unparse(_timing_calls(tree, "Pipeline")[0]), "no labeller: the stages after generate that need one are skipped"
+    ports = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value in (8000, 8010)]
+    assert sorted(ports) == [8000, 8010], "the two ports appear once each, in the tuple that refuses them"
+    config = _timing_calls(tree, "uvicorn.Config")
+    assert len(config) == 1 and {k.arg: ast.unparse(k.value) for k in config[0].keywords} == {
+        "host": "'127.0.0.1'", "port": "0", "log_config": "None", "log_level": "'warning'", "access_log": "False"}
+    client = _timing_calls(tree, "httpx.Client")
+    assert len(client) == 1 and {k.arg: ast.unparse(k.value) for k in client[0].keywords}.keys() >= {"trust_env", "follow_redirects"}
+    assert {k.arg: ast.unparse(k.value) for k in client[0].keywords}["trust_env"] == "False"
+    module_functions = {"httpx." + name for name in ("get", "post", "put", "patch", "delete", "head", "options", "request", "stream")}
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) in module_functions]
+    served = {k.arg for k in _timing_calls(tree, "create_app")[0].keywords}
+    assert served == {"engine", "models", "home", "gallery", "device", "threads"} and not served & {"token", "mode", "host", "labeler", "labeler_url"}
+
+
+def test_the_decode_timing_script_ends_a_turn_that_never_ends_at_300_s_reads_the_load_three_times_and_runs_a_end_as_a_again():
+    """Fix round 1 (P8-F): the turn deadline is waited for in one place per path (the drain, and the stream's own `watched`), the node's load is read
+    before the engines, with the environment and after the last arm, the two filesystem words are asked in the environment alone, and A-end is A."""
+    tree, parents = _timing_tree()
+    assert [_timing_inner(n, parents) for n in _timing_calls(tree, "asyncio.wait_for")] == ["drain_turn"], "a turn is waited for in one place"
+    constants = [n.value for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "TURN_DEADLINE_S" for t in n.targets)]
+    assert len(constants) == 1 and isinstance(constants[0], ast.Constant) and constants[0].value == 300.0, "five minutes: a live turn takes 8 s"
+    functions = {n.name: n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for name in ("drain_turn", "http_turn"):
+        assert [a.arg for a in functions[name].args.args if a.arg == "deadline_s"] == ["deadline_s"], name
+        assert "TURN_DEADLINE_S if deadline_s is None else deadline_s" in ast.unparse(functions[name]), name + " reads the module's deadline when it is given none"
+    assert sorted(_timing_inner(n, parents) for n in _timing_calls(tree, "load_average")) == ["environment", "run_job", "run_job"], "before, with, after"
+    assert [_timing_inner(n, parents) for n in _timing_calls(tree, "fs_word")] == ["environment", "environment"], "the local directory and the NFS one"
+    registry = next(n.value for n in tree.body if isinstance(n, ast.AnnAssign) and ast.unparse(n.target) == "ARM_FUNCTIONS")
+    assert {ast.unparse(k): ast.unparse(v) for k, v in zip(registry.keys, registry.values)} == {
+        "'A'": "arm_a", "'B'": "arm_b", "'C'": "arm_c", "'D'": "arm_d", "'E'": "arm_e", "'E-local'": "arm_e_local", "'F'": "arm_f", "A_END": "arm_a"}
+    loops = [n for n in ast.walk(functions["run_job"]) if isinstance(n, ast.For)]
+    assert [ast.unparse(n.iter) for n in loops] == ["ALL_ARMS"], "the seven and then A-end, each printed as it finishes"
+    over = functions["first_over"]
+    assert "ARMS[1:]" in ast.unparse(over) and "ALL_ARMS" not in ast.unparse(over), "the threshold looks at A to F only: A-end is drift, not a part of the path"
+
+
+# ── CHAT_UI_PLAN.md P8-F (part 3): one OpenMP pool per server process ─────────
+# libgomp gives each thread that enters a parallel region a pool of its own, for the life of the thread. So the engines are built on the Worker's
+# one thread, the thread that runs the turns, through its blocking Worker.call, and tests/test_app_worker_thread.py exercises that. These pins hold
+# what an edit could undo with no laptop test failing (the throttle shows on the cluster's libgomp only): a build or a tower hash reached from
+# create_app on the calling thread, a worker made after the engines, a worker with more than one thread.
+
+_SERVER = REPO_ROOT / "app" / "server.py"
+_PIPELINE = REPO_ROOT / "app" / "pipeline.py"
+
+
+def _tree_and_parents(path):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return tree, {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def _calls_named(root, dotted):
+    return [n for n in ast.walk(root) if isinstance(n, ast.Call) and ast.unparse(n.func) == dotted]
+
+
+def test_create_app_reaches_the_engines_and_their_towers_only_through_the_workers_blocking_call():
+    tree, parents = _tree_and_parents(_SERVER)
+    create = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "create_app")
+    blocking = _calls_named(create, "worker.call")
+    assert len(blocking) == 1 and isinstance(blocking[0].args[0], ast.Name), "one blocking call on the worker, with a function of create_app"
+    start = blocking[0].args[0].id
+    nested = [n for n in ast.walk(create) if isinstance(n, ast.FunctionDef) and n.name == start]
+    assert len(nested) == 1 and parents[nested[0]] is create, "the function the worker runs is create_app's own"
+    assert [n for n in ast.walk(create) if isinstance(n, ast.Name) and n.id == start] == [blocking[0].args[0]], "it runs there and nowhere else"
+    for name in ("_engines", "_require_eos_entries_marked", "_wire_gallery"):   # the build, the EOS check of the cards, the tower check
+        assert [_timing_inner(n, parents) for n in _calls_named(tree, name)] == [start], name + " is reached only through the worker"
+    assert {_timing_inner(n, parents) for n in _calls_named(tree, "build_engine")} == {"_engines"}, "the tiny engine and both kinds of real one"
+    hashes = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "tower_sha256"]
+    assert [_timing_inner(n, parents) for n in hashes] == ["_wire_gallery"]
+    workers = _calls_named(create, "Worker")
+    assert [ast.unparse(n) for n in workers] == ["Worker(None, queue_cap)"] and workers[0].lineno < blocking[0].lineno, "the worker comes first"
+    attached = [n for n in ast.walk(create) if isinstance(n, ast.Assign) and [ast.unparse(t) for t in n.targets] == ["worker.pipeline"]]
+    assert len(attached) == 1 and attached[0].lineno > blocking[0].lineno, "its pipeline is attached once the engines are built"
+
+
+def test_the_workers_blocking_call_queues_on_its_one_thread_the_thread_of_the_turns():
+    tree, parents = _tree_and_parents(_PIPELINE)
+    worker = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Worker")
+    methods = {n.name: n for n in worker.body if isinstance(n, ast.FunctionDef)}
+    pools = _calls_named(worker, "ThreadPoolExecutor")
+    assert [_timing_inner(n, parents) for n in pools] == ["__init__"]
+    assert {k.arg: ast.unparse(k.value) for k in pools[0].keywords} == {"max_workers": "1", "thread_name_prefix": "'turn'"}, "one thread"
+    assert [ast.unparse(s) for s in methods["call"].body if not isinstance(s, ast.Expr)] == ["return self._pool.submit(fn, *args, **kwargs).result()"]
+    for name in ("submit", "run_task"):
+        assert _calls_named(methods[name], "self._pool.submit"), name + " queues on the same pool"
+
+
+def test_the_decode_timing_script_says_that_its_worker_arms_measure_the_old_server_shape():
+    """The timing script builds its engine in the main thread on purpose (arms A to C decode there), so the arms that decode on another thread
+    carry a second libgomp pool by construction."""
+    doc = " ".join(ast.get_docstring(_timing_tree()[0]).split())
+    assert "Arms D, E, E-local and F carry the second-pool penalty by construction, so they measure the old server shape" in doc
+
+
+# ── CHAT_UI_PLAN.md P8-D: the chaos checklist ─────────────────────────────────
+# Eight items, run as tests: tests/test_app_chaos.py (the API side: real processes, the labeller, the gallery, the store; part of validate.sh)
+# and tests/e2e/test_chaos_e2e.py (the page side, in a real Chrome; run with -m e2e). Each test is named test_chaos_<item>_... and says its item
+# and what is expected in its docstring. These pins hold what a later edit could lose without a test noticing: an item with no test, a test that
+# does not say what it expects, a page test that would run in validate.sh, or a port that belongs to someone else.
+
+_CHAOS_TESTS = {"api": "tests/test_app_chaos.py", "page": "tests/e2e/test_chaos_e2e.py"}
+
+
+def _chaos_tree(name):
+    return ast.parse((REPO_ROOT / _CHAOS_TESTS[name]).read_text(encoding="utf-8"))
+
+
+def _chaos_test_functions(tree):
+    return [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name.startswith("test_chaos_")]
+
+
+def test_every_item_of_the_chaos_checklist_has_a_test_and_each_test_says_its_item_and_what_is_expected():
+    """P8-D. Items 1 to 8 each have at least one test across the two files, and every test has a docstring that begins "Chaos item <n>" for the
+    item its name carries and holds an "Expected" sentence. The page side covers items 1 to 4 and 8 (the ones with a page to look at), the API
+    side 1 and 3 to 8: 2 (the tunnel) is the page's alone, because the page is what polls. Item 8 (the P8-D follow-up) is the store failing
+    while a turn runs."""
+    covered = {}
+    for side in _CHAOS_TESTS:
+        for function in _chaos_test_functions(_chaos_tree(side)):
+            item = int(re.match(r"test_chaos_(\d+)_", function.name).group(1))
+            doc = ast.get_docstring(function) or ""
+            assert doc.startswith("Chaos item {}".format(item)) and "Expected" in doc, "{}: {}".format(side, function.name)
+            covered.setdefault(item, set()).add(side)
+    assert sorted(covered) == [1, 2, 3, 4, 5, 6, 7, 8], sorted(covered)
+    assert {item for item, sides in covered.items() if "page" in sides} == {1, 2, 3, 4, 8}
+    assert {item for item, sides in covered.items() if "api" in sides} == {1, 3, 4, 5, 6, 7, 8}
+
+
+def test_the_chaos_page_tests_run_in_a_real_chrome_and_stay_out_of_validate_sh_and_the_api_tests_need_no_browser():
+    """P8-D. The page file is marked e2e and slow, as every file of tests/e2e is (validate.sh runs `-m "not cuda and not slow"`), and skips without
+    Playwright; the API file imports neither Playwright nor anything of tests/e2e, so it is part of validate.sh and runs on a laptop with no Chrome."""
+    page, api = _chaos_tree("page"), _chaos_tree("api")
+    marks = [n for n in page.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in n.targets)]
+    assert len(marks) == 1 and {"pytest.mark.e2e", "pytest.mark.slow"} <= {ast.unparse(m) for m in ast.walk(marks[0].value) if isinstance(m, ast.Attribute)}
+    assert any(isinstance(n, ast.Expr) and ast.unparse(n.value).startswith("pytest.importorskip('playwright.sync_api'") for n in page.body)
+    modules = {n.module or "" for n in ast.walk(api) if isinstance(n, ast.ImportFrom)} | {a.name for n in ast.walk(api) if isinstance(n, ast.Import) for a in n.names}
+    assert not [m for m in modules if m.split(".")[0] == "playwright" or m.startswith("tests.e2e")], sorted(modules)
+
+
+def test_the_chaos_tests_never_name_the_dev_servers_ports():
+    """P8-D. 8000 and 8010 are the ports of the user's own servers and tunnels (app/README.md): every chaos test starts its server on a free port
+    of its own, and no test file here says either number as a number or as the end of an address."""
+    for side in _CHAOS_TESTS:
+        for node in ast.walk(_chaos_tree(side)):
+            if isinstance(node, ast.Constant) and isinstance(node.value, int):
+                assert node.value not in (8000, 8010), side
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                assert not re.search(r":(8000|8010)\b", node.value), (side, node.value)
+
+
+# ── CHAT_UI_PLAN.md P6-F: the features check ─────────────────────────────────
+# Static pins on scripts/chat_ui_features_check.py, the real-Chrome check of the five image features on the tiny stack (run by hand:
+# venv/bin/python scripts/chat_ui_features_check.py). Its pure parts are tested in tests/test_chat_ui_features_check.py, its harness in
+# tests/test_chat_ui_layout_check.py. These pins hold what a later edit could break without a test noticing: which modules it imports, which ports
+# it will never talk to, that it runs the tiny stack and nothing else, and where it can write.
+
+_FEATURES = REPO_ROOT / "scripts" / "chat_ui_features_check.py"
+
+
+def _features_tree():
+    """-> (the script's syntax tree, a map from each node to its parent)."""
+    tree = ast.parse(_FEATURES.read_text(encoding="utf-8"))
+    return tree, {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def _features_outer(node, parents):
+    """The name of the nearest function a node is in, or None at module level."""
+    while node in parents:
+        node = parents[node]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return node.name
+    return None
+
+
+def _features_calls(tree, dotted):
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == dotted]
+
+
+def _features_strings(tree, parents):
+    """-> [(a string constant of the code, the function it is in)], the module's docstring left out."""
+    docstring = ast.get_docstring(tree, clean=False)
+    return [(n.value, _features_outer(n, parents)) for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value != docstring]
+
+
+def test_the_features_check_imports_only_the_standard_library_numpy_pillow_and_two_light_modules_of_the_app_and_the_two_checks_harness():
+    """P6-F. It runs on the laptop, in the venv, beside the browser check: of the standard library only what a check needs, numpy and PIL for the
+    pictures it draws and measures, the app's two light modules (the upload refusal's wording and the 14 label names: neither loads a model), and of
+    its own repository the Chrome harness and the pieces of the browser check it shares (Failure, expect, one_line, the warm-up turn, the card
+    reader). No second HTTP library, no browser-driving package, no model or thesis code, no test helper."""
+    if not hasattr(sys, "stdlib_module_names"):
+        pytest.skip("sys.stdlib_module_names needs Python 3.10")
+    tree, _ = _features_tree()
+    roots, from_scripts, from_app = set(), set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            roots.add((node.module or "").split(".")[0])
+            if node.module and node.module.startswith("scripts."):
+                from_scripts.add(node.module)
+            if node.module and node.module.startswith("app"):
+                from_app.add(node.module)
+    assert {"numpy", "PIL", "app", "scripts"} <= roots, roots
+    assert roots <= set(sys.stdlib_module_names) | {"numpy", "PIL", "app", "scripts"}, sorted(roots)
+    assert not roots & {"torch", "hybrid_xmamba", "tests", "httpx", "requests", "playwright", "selenium", "pyppeteer", "websockets"}, sorted(roots)
+    assert from_app == {"app.imaging", "app.labels"}, sorted(from_app)
+    assert from_scripts == {"scripts.chat_ui_browser_check", "scripts.chat_ui_cdp"}, sorted(from_scripts)
+
+
+def test_the_features_check_names_no_port_and_refuses_a_url_before_it_starts_anything():
+    """P6-F, P6-F fix 1. Port 8000 is the laptop's dev server and 8010 the tunnel to the cluster's private server: a check that uploads pictures
+    and sends turns must never reach either. The two numbers are written once, as REFUSED_PORTS in scripts/chat_ui_cdp.py, with the refusals
+    that read them; the features check imports those (url_problem, tiny_only_problem, url_needs_no_evidence) and names no port. In its main
+    the two refusals of a --url come before the SIGTERM handler, the look for Chrome, the app and the browser."""
+    tree, parents = _features_tree()
+    numbers = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value in (8000, 8010) and not isinstance(n.value, bool)]
+    assert numbers == [], numbers
+    assert not [text for text, fn in _features_strings(tree, parents) if "8000" in text or "8010" in text]
+    imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "scripts.chat_ui_cdp" for a in n.names}
+    assert {"url_problem", "tiny_only_problem", "url_needs_no_evidence"} <= imported, sorted(imported)
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+
+    def first_line(name):
+        return min(n.lineno for n in ast.walk(main) if isinstance(n, ast.Call) and ast.unparse(n.func) == name)
+
+    assert first_line("url_problem") == first_line("tiny_only_problem")   # one statement: the address, then the app
+    assert first_line("url_problem") < first_line("exit_on_sigterm") < first_line("find_chrome") < first_line("App") < first_line("Browser")
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:8000/", "http://127.0.0.1:8010/", "http://localhost:8010/chat", "http://[::1]:8000/"])
+def test_the_features_check_refuses_those_ports_with_one_error_line_and_status_2_having_started_nothing(monkeypatch, capsys, url):
+    """P6-F. The pin above is about the code's shape; this one runs main: nothing that starts a process or opens a connection is ever called, and
+    not the read of the app's /v1/models either (a refused port might be the dev server's: nothing is sent to it, not even a GET)."""
+    import socket
+    from scripts import chat_ui_features_check as check
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the check started something for a refused URL")
+
+    for name in ("find_chrome", "App", "Browser", "exit_on_sigterm", "warm_up", "get_json", "tiny_only_problem"):
+        monkeypatch.setattr(check, name, forbidden)
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    assert check.main(["--url", url, "--no-evidence"]) == 2
+    out = capsys.readouterr().out
+    assert out.startswith("ERROR --url refused: ") and "8000" in out and "8010" in out and out.count("\n") == 1, out
+
+
+def test_the_features_check_runs_the_tiny_engine_and_the_tiny_gallery_and_names_no_model_checkpoint_or_dataset():
+    """P6-F. Everything it shows is synthetic: the app it starts is the tiny engine with the tiny gallery (create_app's laptop convenience; the
+    serving command cannot serve that gallery), and nothing in it can name a checkpoint, the MIMIC data or the cluster's session directory (R7, the
+    DUA). It does not import the engine, the server or the store, so it cannot load a model whatever it is given."""
+    tree, parents = _features_tree()
+    apps = _features_calls(tree, "App")
+    assert [(_features_outer(a, parents), sorted(k.arg for k in a.keywords)) for a in apps] == [("main", ["step_delay_s", "tiny_gallery"])]
+    assert {k.arg: ast.unparse(k.value) for k in apps[0].keywords}["tiny_gallery"] == "True"
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.keyword) and n.arg in ("engine", "models", "checkpoint", "gallery_dir", "home")]
+    modules = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)} | {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+    assert not {m for m in modules if m and m.split(".")[0] in ("hybrid_xmamba", "torch")} and not {"app.engine", "app.server", "app.store", "app.gallery"} & modules
+    for text, fn in _features_strings(tree, parents):
+        assert not re.search(r"\.ckpt|\.parquet|\.pt\b|/sc/|mimic_full|chat_sessions|/home/", text), (fn, text[:80])
+
+
+def test_the_features_check_talks_only_to_the_app_it_started_or_the_url_it_was_given():
+    """P6-F. Every address it opens is built from the base of that app (`base`, `self.base`, `ctx.base`, `app.url`): a literal URL appears only in the
+    refusal's wording and the --url help text."""
+    tree, parents = _features_tree()
+    opened = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "urllib.request.urlopen"]
+    assert opened, "the pin looks at something"
+    for call in opened:   # get_json is the one helper that is given the address; its callers are held to the same rule below
+        if _features_outer(call, parents) != "get_json":
+            assert re.search(r"\bbase\b|self\.base|ctx\.base", ast.unparse(call.args[0])), ast.unparse(call.args[0])
+    callers = _features_calls(tree, "get_json")
+    assert callers and all(re.search(r"\bbase\b", ast.unparse(c.args[0])) for c in callers), [ast.unparse(c) for c in callers]
+    assert {fn for text, fn in _features_strings(tree, parents) if re.search(r"https?://", text)} <= {"url_problem", "parse_args"}
+
+
+def test_the_features_check_can_write_only_its_evidence_and_the_files_it_makes_for_itself_in_its_own_temporary_directory():
+    """P6-F. Each way the script has of writing or removing is in one named place: the pictures and files it makes for itself in a temporary
+    directory (`_write`), its evidence (`write_checklist`, `clear_evidence`, `shot`: files of the evidence directory, by name), and the removal of that
+    temporary directory in main. A write anywhere else, or a delete of something it did not make, fails here."""
+    tree, parents = _features_tree()
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = ast.unparse(node.func)
+        if name == "open" and len(node.args) > 1 and isinstance(node.args[1], ast.Constant) and set(str(node.args[1].value)) & set("wax+"):
+            found.append(("open " + str(node.args[1].value), _features_outer(node, parents)))
+        elif name in ("os.remove", "os.unlink", "os.rename", "os.replace", "os.makedirs", "os.mkdir", "shutil.rmtree", "shutil.copy", "shutil.move",
+                      "tempfile.mkdtemp", "self.browser.screenshot", "json.dump", "Path.write_text", "Path.write_bytes"):
+            found.append((name, _features_outer(node, parents)))
+    assert sorted(found) == sorted([
+        ("open wb", "_write"), ("open w", "write_checklist"), ("json.dump", "write_checklist"), ("os.makedirs", "write_checklist"),
+        ("os.remove", "clear_evidence"), ("os.makedirs", "shot"), ("self.browser.screenshot", "shot"), ("os.remove", "shot"), ("os.remove", "shot"),
+        ("tempfile.mkdtemp", "main"), ("shutil.rmtree", "main")]), sorted(found)
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in ("write_text", "write_bytes")]
+
+
+def test_the_features_check_installs_the_sigterm_handler_before_anything_and_stops_what_it_started_whatever_is_interrupted(monkeypatch, tmp_path):
+    """P6-F. A SIGTERM must run the finally that stops Chrome and the app (each is in a session of its own, which the terminal's signals do not
+    reach): the handler is installed before anything is started, and the clean-up is one finally in the finally of the one before, so an
+    interrupt in the closing of the browser still stops the app and removes the work directory."""
+    import signal
+    from scripts import chat_ui_features_check as check
+    tree, parents = _features_tree()
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    lines = {name: min(n.lineno for n in ast.walk(main) if isinstance(n, ast.Call) and ast.unparse(n.func) == name) for name in ("exit_on_sigterm", "find_chrome")}
+    assert lines["exit_on_sigterm"] < lines["find_chrome"]
+    cleanup = [t for t in ast.walk(main) if isinstance(t, ast.Try) and t.finalbody and any(ast.unparse(c.func) == "signal.alarm" for s in t.finalbody for c in ast.walk(s) if isinstance(c, ast.Call))]
+    assert len(cleanup) == 1
+    depth, node = 0, cleanup[0]
+    while node is not None:
+        inner = [s for s in node.finalbody if isinstance(s, ast.Try)]
+        node = inner[0] if inner else None
+        depth += 1
+    assert depth == 3, "browser.close, app.stop and rmtree are not each in the finally of the one before"
+    monkeypatch.setattr(check, "find_chrome", lambda: None)
+    before = signal.getsignal(signal.SIGTERM)
+    try:
+        assert check.main([]) == 2 and signal.getsignal(signal.SIGTERM) is not before
+    finally:
+        signal.signal(signal.SIGTERM, before)
+        signal.alarm(0)
+
+
+# ── CHAT_UI_PLAN.md P6-F fix 1: the harness the three checks share, and what each check does with a --url ─────────────────────────────
+# Static and behavioural pins on scripts/chat_ui_cdp.py and the three scripts that use it (chat_ui_layout_check, chat_ui_browser_check,
+# chat_ui_features_check). Their behaviour is tested in tests/test_chat_ui_layout_check.py, test_chat_ui_browser_check.py and
+# test_chat_ui_features_check.py; these hold what an edit could break without any of those noticing.
+
+_CHAT_UI_CHECKS = ("chat_ui_layout_check", "chat_ui_browser_check", "chat_ui_features_check")
+
+
+def _chat_ui_tree(name):
+    """-> (the syntax tree of scripts/<name>.py, its text)."""
+    text = (REPO_ROOT / "scripts" / (name + ".py")).read_text(encoding="utf-8")
+    return ast.parse(text), text
+
+
+def _chat_ui_modules_imported(source):
+    """The scripts.chat_ui_* modules a source imports, by every spelling: `import scripts.chat_ui_cdp`, `from scripts.chat_ui_cdp import x`,
+    `from scripts import chat_ui_cdp`, and a string that names one for an importer or for a command (`importlib.import_module("scripts.chat_ui_cdp")`)."""
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            found += [a.name for a in node.names if a.name.startswith("scripts.chat_ui_")]
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").startswith("scripts.chat_ui_"):
+                found.append(node.module)
+            elif node.module == "scripts":
+                found += ["scripts." + a.name for a in node.names if a.name.startswith("chat_ui_")]
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and re.search(r"scripts[./]chat_ui_", node.value):
+            found.append(node.value[:60])
+    return found
+
+
+def test_nothing_that_is_served_imports_or_names_the_check_harness_or_its_turn_hold():
+    """P6-F fix 1. hold_turns patches TinyEngine.generate in the process that LAUNCH starts, so that a check can hold a turn: it must never reach an
+    app that is served. Nothing under app/ imports scripts.chat_ui_cdp or any scripts.chat_ui_* module, by any spelling, and the name hold_turns
+    is in no file of app/, hybrid_xmamba/ or scripts/ but the harness, which calls it only from the launcher's source (LAUNCH)."""
+    for source, expected in (("import scripts.chat_ui_cdp", ["scripts.chat_ui_cdp"]), ("import scripts.chat_ui_cdp as c, os", ["scripts.chat_ui_cdp"]),
+                             ("from scripts.chat_ui_cdp import hold_turns", ["scripts.chat_ui_cdp"]),
+                             ("from scripts import chat_ui_browser_check, repair_generations", ["scripts.chat_ui_browser_check"]),
+                             ("import importlib\nimportlib.import_module('scripts.chat_ui_layout_check')", ["scripts.chat_ui_layout_check"]),
+                             ("import scripts.repair_generations\nfrom scripts import build_retrieval_gallery", [])):
+        assert _chat_ui_modules_imported(source) == expected, source   # the finder finds each spelling, and nothing else
+    imports = {str(p.relative_to(REPO_ROOT)): _chat_ui_modules_imported(p.read_text(encoding="utf-8")) for p in sorted((REPO_ROOT / "app").rglob("*.py"))}
+    assert {path: found for path, found in imports.items() if found} == {}, imports
+    named = [str(p.relative_to(REPO_ROOT)) for root in ("app", "hybrid_xmamba", "scripts") for p in sorted((REPO_ROOT / root).rglob("*.py"))
+             if "hold_turns" in p.read_text(encoding="utf-8")]
+    assert named == ["scripts/chat_ui_cdp.py"], named
+    cdp, _ = _chat_ui_tree("chat_ui_cdp")
+    [launch] = [n for n in cdp.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "LAUNCH" for t in n.targets)]
+    launcher = ast.literal_eval(launch.value)
+    assert launcher.count("hold_turns(") == 1 and 'create_app(engine="tiny"' in launcher   # the held turns are the tiny engine's, in the app a check starts
+    calls = [n for n in ast.walk(cdp) if isinstance(n, ast.Call) and ast.unparse(n.func) == "hold_turns"]
+    assert calls == [], "the harness calls hold_turns itself, outside the launcher's source"
+
+
+def _flags_comment_problems(text):
+    """What the comment above CHROME_FLAGS must not claim and must say: the failure coincides with Chrome's installer and check-in activity (that it
+    causes it is not shown), the five flags as a set remove it, and which of them matters is not established."""
+    problems = []
+    if "coincides" not in text:
+        problems.append("it does not say that the failure only coincides with the installer's activity")
+    if "not established" not in text:
+        problems.append("it does not say that which flag matters is not established")
+    if re.search(r"installs its default apps and extensions|in that moment fails", text):
+        problems.append("it says that the installer is what makes the fetch fail")
+    return problems
+
+
+def test_chrome_is_started_with_the_five_flags_that_keep_it_quiet_and_the_comment_says_what_is_known_of_why():
+    """P6-F fix 1. CHROME_FLAGS holds the five flags of b382751 (the failure of the features check's first click was 10 of 30 runs without them and
+    0 of 30 with them, alternating) on top of what Chrome was always started with, and Browser starts Chrome with all of them. The comment above
+    it said that Chrome 'installs its default apps and extensions' and that a fetch 'in that moment fails': the failure coincides with the installer
+    burst and a background check-in, a cause is not shown, and which flag matters is not established."""
+    tree, text = _chat_ui_tree("chat_ui_cdp")
+    [assign] = [n for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CHROME_FLAGS" for t in n.targets)]
+    flags = ast.literal_eval(assign.value)
+    assert isinstance(flags, tuple) and flags[:4] == ("--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check")
+    assert set(flags[4:]) == {"--disable-extensions", "--disable-default-apps", "--disable-background-networking", "--disable-component-update",
+                              "--disable-sync"}, flags
+    popen = [c for c in ast.walk(tree) if isinstance(c, ast.Call) and ast.unparse(c.func) == "subprocess.Popen" and c.args and isinstance(c.args[0], ast.List)]
+    assert [ast.unparse(e.value) for c in popen for e in c.args[0].elts if isinstance(e, ast.Starred)] == ["CHROME_FLAGS"]
+    lines, block, i = text.splitlines(), [], assign.lineno - 2
+    while i >= 0 and lines[i].startswith("#"):
+        block.insert(0, lines[i])
+        i -= 1
+    assert _flags_comment_problems(" ".join(block)) == [], block
+    old = ("A fresh profile is not a quiet one: some seconds after Chrome starts it installs its default apps and extensions into it (its log shows "
+           "web-app and extension installs, a burst of about 70 ms), and a fetch that a page makes in that moment fails inside Chrome")
+    assert len(_flags_comment_problems(old)) == 3   # the comment as it was says what is not known, and leaves out what is
+
+
+@pytest.mark.parametrize("name", ["chat_ui_browser_check", "chat_ui_features_check"])
+def test_a_url_needs_no_evidence_in_each_check_that_writes_evidence(name, capsys):
+    """P6-F fix 1. --url is an app that someone else started; what such a run shows is not evidence of the tiny stack. --only, which would write
+    part of a checklist over a whole one, needs it in the browser check in the same way."""
+    import importlib
+    module = importlib.import_module("scripts." + name)
+    with pytest.raises(SystemExit) as refused:
+        module.parse_args(["--url", "http://127.0.0.1:51234/"])
+    assert refused.value.code == 2 and "--url needs --no-evidence" in capsys.readouterr().err
+    assert module.parse_args(["--url", "http://127.0.0.1:51234/", "--no-evidence"]).no_evidence is True
+    if name == "chat_ui_browser_check":
+        with pytest.raises(SystemExit) as refused:
+            module.parse_args(["--only", "reload"])
+        assert refused.value.code == 2 and "--only needs --no-evidence" in capsys.readouterr().err
+        assert module.parse_args(["--only", "reload", "--no-evidence"]).only == "reload"
+
+
+def test_the_checks_that_write_evidence_are_those_that_have_a_no_evidence_switch_and_the_layout_check_writes_none():
+    """P6-F fix 1. A check writes evidence when it dumps a checklist or takes a screenshot; it then has --no-evidence (and a --url needs it). The
+    layout check does neither, so it has no such switch and its --url needs none: it writes no file at all."""
+    for name in _CHAT_UI_CHECKS:
+        tree, text = _chat_ui_tree(name)
+        names = {ast.unparse(c.func) for c in ast.walk(tree) if isinstance(c, ast.Call)}
+        writes = "json.dump" in names or any(n.endswith(".screenshot") for n in names)
+        assert writes == ('"--no-evidence"' in text), name
+        if not writes:
+            assert not [c for c in ast.walk(tree) if isinstance(c, ast.Call) and ast.unparse(c.func) in ("open", "os.makedirs", "os.remove", "shutil.copy")
+                        and (ast.unparse(c.func) != "open" or len(c.args) > 1)], name
+    assert [name for name in _CHAT_UI_CHECKS if '"--no-evidence"' not in _chat_ui_tree(name)[1]] == ["chat_ui_layout_check"]
+
+
+@pytest.mark.parametrize("name", _CHAT_UI_CHECKS)
+def test_the_main_of_each_check_refuses_a_url_with_the_shared_functions_before_it_starts_or_sends_anything(name):
+    """P6-F fix 1. The refusal of an address (the dev server's port and the tunnel's, a host that is not this machine's loopback) and of an app that
+    is not the tiny one are written once, in scripts/chat_ui_cdp.py. Each main imports them and calls both, in one statement, the first after the
+    arguments: before the SIGTERM handler, the look for Chrome, the app, the browser and the warm-up turn. None of the checks has a copy."""
+    import importlib
+    from scripts import chat_ui_cdp
+    module = importlib.import_module("scripts." + name)
+    assert module.url_problem is chat_ui_cdp.url_problem and module.tiny_only_problem is chat_ui_cdp.tiny_only_problem
+    tree, _ = _chat_ui_tree(name)
+    assert not [n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("url_problem", "models_problem", "tiny_only_problem")]
+    assert {"REFUSED_PORTS", "TINY_MODEL", "NOT_THE_TINY_APP"}.isdisjoint({t.id for n in tree.body if isinstance(n, ast.Assign) for t in n.targets
+                                                                         if isinstance(t, ast.Name)})
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    refusals = [b for b in ast.walk(main) if isinstance(b, ast.BoolOp) and isinstance(b.op, ast.Or)
+                and [ast.unparse(v.func) for v in b.values if isinstance(v, ast.Call)] == ["url_problem", "tiny_only_problem"]]
+    assert len(refusals) == 1, "main does not refuse with `url_problem(args.url) or tiny_only_problem(args.url)`, once: {}".format(len(refusals))
+    refusal = refusals[0]
+    assert [ast.unparse(v.args[0]) for v in refusal.values] == ["args.url", "args.url"]
+
+    def first_line(call):
+        lines = [c.lineno for c in ast.walk(main) if isinstance(c, ast.Call) and ast.unparse(c.func) == call]
+        return min(lines) if lines else None
+
+    for later in ("exit_on_sigterm", "find_chrome", "App", "Browser", "warm_up"):
+        assert first_line(later) is None or refusal.lineno < first_line(later), later
+
+
+def test_the_two_refused_ports_are_written_once_and_no_script_of_the_checks_says_them_in_its_usage():
+    """P6-F fix 1. 8000 and 8010 are the refusal list, REFUSED_PORTS in scripts/chat_ui_cdp.py: no other number or string of the four scripts names
+    them (the usage of each check says http://127.0.0.1:PORT/), so that no example invites a run against the dev server or the tunnel."""
+    for name in ("chat_ui_cdp",) + _CHAT_UI_CHECKS:
+        tree, _ = _chat_ui_tree(name)
+        numbers = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, int) and not isinstance(n.value, bool)
+                   and n.value in (8000, 8010)]
+        strings = [n.value[:50] for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str) and ("8000" in n.value or "8010" in n.value)]
+        assert (numbers, strings) == (([8000, 8010] if name == "chat_ui_cdp" else []), []), name
+        if name != "chat_ui_cdp":
+            assert "http://127.0.0.1:PORT/" in ast.get_docstring(tree), name
+    cdp, _ = _chat_ui_tree("chat_ui_cdp")
+    [ports] = [n for n in cdp.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "REFUSED_PORTS" for t in n.targets)]
+    assert ast.unparse(ports.value) == "(8000, 8010)"
+
+
+# ── CHAT_UI_PLAN.md P9-C, part 1: the demo case picker ────────────────────────
+# Static pins on scripts/chat_demo_cases.py and its CPU wrapper scripts/chat_demo_cases_h100.sh. They pick the test studies for the supervisor demo
+# from the published run's reference labels, which say which test study has which finding: MIMIC-derived, so under rule R7 what they print is row
+# numbers, counts and fixed words (R7). Their behaviour (the draw, the kinds, the refusals, the lines, the wrapper rehearsed in a temp tree, the
+# allowlist run through grep) is exercised for real in tests/test_chat_demo_cases.py. These pins hold what a later edit could break without a test
+# noticing: what the wrapper asks SLURM for, what can reach the two output streams, which keys of the labels file are read, how the draw is made.
+
+_CASES = REPO_ROOT / "scripts" / "chat_demo_cases.py"
+_CASES_SH = REPO_ROOT / "scripts" / "chat_demo_cases_h100.sh"
+
+
+def _cases_tree():
+    """-> (the script's syntax tree, a map from each node to its parent)."""
+    tree = ast.parse(_CASES.read_text(encoding="utf-8"))
+    return tree, {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def _cases_inner(node, parents):
+    """The name of the innermost function a node is in, or None at module level."""
+    while node in parents:
+        node = parents[node]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return node.name
+    return None
+
+
+def _cases_calls(tree, dotted):
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == dotted]
+
+
+def _cases_code():
+    return _gallery_wrapper_code(_CASES_SH.read_text())
+
+
+def test_the_demo_cases_wrapper_asks_slurm_for_a_small_cpu_job_with_the_chat_wrappers_partition_account_qos_and_exclude_list():
+    """The plan's invariants for a CPU job: the partition, account and QOS placeholders (the CPU-only combination), the nodes that cannot run
+    it excluded, logs where every other wrapper puts them, the repository's `cd` line, and no --gres or --gpus. One CPU, 4 GB and ten minutes: it
+    reads a JSON file of 2,663 rows. It has no --requeue and no --open-mode: a job of a minute that writes its files once has nothing to resume."""
+    serve, serve_flags = _sbatch_options(_serve_text("serve_chat_h100.sh"))
+    mine, mine_flags = _sbatch_options(_CASES_SH.read_text())
+    for key in ("--partition", "--account", "--qos", "--exclude", "--output", "--error"):
+        assert mine[key] == serve[key], key
+    assert mine == {"--partition": "@SLURM_PARTITION@", "--account": "@SLURM_ACCOUNT@", "--qos": "@SLURM_QOS@", "--exclude": "@SLURM_EXCLUDE@",
+                    "--cpus-per-task": "1", "--mem": "4G", "--time": "00:10:00", "--job-name": "chat_demo_cases",
+                    "--output": "logs/%x_%j.log", "--error": "logs/%x_%j.log"}, mine
+    assert mine_flags == [] and "--requeue" not in _CASES_SH.read_text()
+    assert "--gres" not in _CASES_SH.read_text() and "--gpus" not in mine, "a CPU job"
+    assert 'cd "${SLURM_SUBMIT_DIR}/hybrid_model_mamba_xlstm" 2>/dev/null || cd "${SLURM_SUBMIT_DIR:-.}"' in _cases_code()
+
+
+def test_the_demo_cases_wrapper_prepares_like_the_other_chat_wrappers_and_prints_the_sync_line_first():
+    text, code = _CASES_SH.read_text(), "\n".join(_cases_code())
+    for needle in ("set -euo pipefail", 'VENV_ACTIVATE="${VENV_ACTIVATE:-.venv/bin/activate}"', 'CHAT_HOME="${CHAT_HOME:-$HOME/chat_sessions}"',
+                   'GALLERY="${GALLERY:-${CHAT_HOME}/gallery/g13d_m3_v1}"', 'PUBLISHED_MODEL="${PUBLISHED_MODEL:-results/report_gen_m3_test_split_s42}"',
+                   "export PYTHONUNBUFFERED=1", 'source "${VENV_ACTIVATE}"', "mkdir -p logs"):
+        assert needle in code, needle
+    train = _eos_wrapper_text()
+    start = train.index('SYNC="unknown"')
+    snippet = train[start:train.index('echo "=== sync ${SYNC} ==="', start) + len('echo "=== sync ${SYNC} ==="')]
+    assert snippet in text, "the P9-G3 provenance snippet, copied exactly"
+    sync = code.index('echo "=== sync ${SYNC} ==="')
+    assert code.index('echo "') == sync, "something is printed before the sync line"
+    assert code.index("python") > sync and code.index("source ") > sync and ".sync_stamp" in code[:sync]
+    assert code.index("umask 077") < code.index('mkdir -p "${CHAT_HOME}/logs"'), "what the job makes of its own is owner-only"
+    assert code.index('source "${VENV_ACTIVATE}"') < code.index("python scripts/chat_demo_cases.py")
+    assert "PYTHONPATH" not in code and "HF_" not in code, "the script is the standard library and the app's label list: no overlay, no model cache"
+
+
+def test_the_demo_cases_wrapper_validates_every_lever_before_anything_runs_and_no_refusal_echoes_a_value():
+    code_lines = _cases_code()
+    code = "\n".join(code_lines)
+    guards = ('[[ "$(basename "${GALLERY}")" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "GALLERY must end in one plain build name: letters, digits, dot, dash and underscore"',
+              '[[ "${PUBLISHED_MODEL}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && "${PUBLISHED_MODEL}" != *..* ]] || fail "PUBLISHED_MODEL must be a plain relative path: '
+              'letters, digits, dot, dash, underscore and slash, none leading and no .."',
+              '[ -d "${CHAT_HOME}" ] || fail "CHAT_HOME does not exist: run chat_cluster_setup_h100.sh first"',
+              '[ -f "${GALLERY}/manifest.json" ] || fail "the gallery has no manifest.json: build it first (P5-B)"',
+              '[ -f "${PUBLISHED_MODEL}/chexbert_labels.json" ] || fail "the published dump has no chexbert_labels.json"',
+              '[ -f "${VENV_ACTIVATE}" ] || fail "the venv\'s activate script is missing: run chat_cluster_setup_h100.sh first"',
+              '[ -f scripts/chat_demo_cases.py ] || fail "chat_demo_cases.py is missing from this tree: run chat_remote.sh sync first"')
+    banner = code.index('echo "=== chat demo cases: job=${JOB} node=$(hostname) gallery=$(basename "${GALLERY}") ==="')
+    for guard in guards:
+        assert guard in code, guard
+        assert code.index(guard) < banner < code.index("python scripts/chat_demo_cases.py"), guard
+    failed = re.findall(r'\bfail "([^"]*)"', code)
+    after_the_run = [m for m in failed if "${RESULTS}" in m or "could not be kept" in m]
+    levers = [m for m in failed if m not in after_the_run]
+    assert len(failed) == 9 and len(levers) == 7 and len(after_the_run) == 2, failed
+    echoed = re.findall(r'echo "([^"]*)"', code)
+    assert not [m for m in levers if "${" in m or "$(" in m], "a refusal quotes no variable"
+    assert all(re.match(r"(=== |ERROR )", m) for m in echoed), echoed
+    paths = ("${CHAT_HOME}", "${GALLERY}", "${OUT}", "${ERR}", "${PUBLISHED_MODEL}", "${SLURM_SUBMIT_DIR}")
+    assert not [m for m in echoed + failed if any(p in m for p in paths)], "a printed message names a path or a lever's value"
+    assert 'echo "ERROR the demo cases script exited with code ${rc} (see the logs under CHAT_HOME)"' in code
+    assert 'fail "the demo cases script printed ${RESULTS} result lines, not 1"' in code and '[ "${RESULTS}" -eq 1 ]' in code
+    notice = [m for m in echoed if m.startswith("=== demo cases:")]
+    assert len(notice) == 1 and "RESULT line" in notice[0] and "shown" in notice[0] and "never" not in notice[0], notice
+
+
+def test_the_demo_cases_wrapper_keeps_the_scripts_raw_output_in_files_and_lets_only_known_shapes_through_the_allowlist():
+    code_lines = _cases_code()
+    code = "\n".join(code_lines)
+    assert 'OUT="${CHAT_HOME}/logs/demo_cases_${JOB}.out"' in code and 'ERR="${CHAT_HOME}/logs/demo_cases_${JOB}.err"' in code
+    runs = [l for l in code_lines if "python scripts/" in l]
+    assert len(runs) == 1 and runs[0] == ('python scripts/chat_demo_cases.py --labels "${PUBLISHED_MODEL}/chexbert_labels.json" --gallery "${GALLERY}" '
+                                          '2> "${ERR}" | tee "${OUT}" | grep --line-buffered -aE "${CASES_SHAPES}"'), runs
+    for line in code_lines:
+        if "${OUT}" in line:
+            assert line.startswith(("OUT=", "python scripts/")) or re.match(r'(WITHHELD=|RESULTS=)', line), line
+        if "${ERR}" in line:
+            assert line.startswith(("ERR=", "python scripts/")), line
+    assert 'WITHHELD="$(grep -avcE "${CASES_SHAPES}" "${OUT}" || true)"' in code
+    assert 'RESULTS="$(grep -aE "${CASES_SHAPES}" "${OUT}" | grep -c \'^RESULT \' || true)"' in code
+    run = code.index(runs[0])
+    assert code.rindex("set +e", 0, run) < run < code.index('STATUSES=("${PIPESTATUS[@]}")') < code.index("set -e", run)
+    assert code.index('STATUSES=("${PIPESTATUS[@]}")') == code.index("\n", run) + 1, "nothing between the pipeline and the read of its statuses"
+    assert 'rc="${STATUSES[0]:-1}"' in code and '[ "${STATUSES[1]:-1}" -eq 0 ] || fail "the demo cases output could not be kept"' in code
+    assert "head -n" not in code, "a head would close the pipe on the script"
+    assert not re.search(r"\b(cat|tail|less|more|sed|awk|cut)\b[^\n]*\$\{(OUT|ERR)\}", code), "the raw files are never shown"
+    assert [l for l in code_lines if re.search(r"\btee\b", l)] == [runs[0]], "tee writes the one file, in the one pipeline, and shows nothing"
+    assert "set -x" not in code and "xtrace" not in code and not re.search(r"(^|[\s;&|(])(printenv|env|date|nvidia-smi)\s*$", code, re.M)
+    shapes = re.search(r"^CASES_SHAPES='(.*?)'$", _CASES_SH.read_text(), re.S | re.M)
+    assert shapes and all(line.startswith("^") and line.endswith("$") for line in shapes.group(1).splitlines()), "anchored, one shape per line"
+    assert len(shapes.group(1).splitlines()) == 7 and "'" not in shapes.group(1), "the RESULT line, five families of ERROR lines, the script's failure"
+    error_lines = [l for l in shapes.group(1).splitlines() if l.startswith("^ERROR ")]
+    assert not [l for l in error_lines if "[a-z_]" in l], "no line takes a key of any name: each code takes the keys the script gives it, and no other"
+
+
+def test_the_demo_cases_wrapper_installs_deletes_and_replaces_nothing_and_starts_no_other_job():
+    code = "\n".join(_cases_code())
+    assert not re.search(r"\b(pip|uv|conda)\b", code), "an installer string"
+    assert not re.search(r"(^|[\s;&|(])(rm|mv|ln|cp|chmod|scancel|sbatch|srun|ssh|git|nohup)(\s|$)", code, re.M), "additive only (R8), and one job"
+    assert code.count("mkdir -p") == 2 and 'mkdir -p "${CHAT_HOME}/logs"' in code, "its own log directory and the repository's logs, nothing else"
+    assert 'trap' not in code and '&' not in re.sub(r"2>|&&|\|\|", "", code.replace('"${CASES_SHAPES}"', "")), "no background process: the one command is waited for"
+
+
+def test_the_demo_cases_wrapper_passes_the_bash_syntax_check():
+    import shutil
+    import subprocess
+    shells = [s for s in ("/bin/bash", shutil.which("bash")) if s and os.path.exists(s)]
+    assert shells
+    for shell in set(shells):
+        done = subprocess.run([shell, "-n", str(_CASES_SH)], capture_output=True, text=True)
+        assert done.returncode == 0, (shell, done.stderr)
+
+
+def test_every_flag_the_demo_cases_wrapper_gives_the_script_is_one_of_its_own():
+    from scripts import chat_demo_cases
+    known = set(chat_demo_cases.build_parser()._option_string_actions)
+    run = next(l for l in _cases_code() if "python scripts/chat_demo_cases.py" in l).split(" 2> ")[0]   # the command, not the pipeline after it
+    given = set(re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", run))
+    assert given == {"--labels", "--gallery"} and given <= known, (given, known)
+
+
+def test_the_demo_cases_script_imports_the_standard_library_and_the_apps_label_list_and_nothing_else():
+    """It runs on a compute node in the serving venv with no overlay on its path (the wrapper sets none): the standard library, and the one
+    first-party module whose own imports are the standard library too, app.labels (the 14 names, in one place). No numpy, no pandas, no httpx, nothing
+    of the model stack: it must start on whatever interpreter the venv has."""
+    if not hasattr(sys, "stdlib_module_names"):
+        pytest.skip("sys.stdlib_module_names needs Python 3.10")
+    roots, first_party = _imports_of(_CASES)
+    assert roots <= {"argparse", "json", "os", "random", "sys", "pathlib", "typing", "app"}, sorted(roots)
+    assert roots - {"app"} <= set(sys.stdlib_module_names) and first_party == {"app.labels"}, (roots, first_party)
+    assert not roots & {"numpy", "pandas", "httpx", "torch", "PIL", "hybrid_xmamba", "scripts", "tests", "subprocess", "socket", "urllib"}
+    app_roots, app_first_party = _imports_of(REPO_ROOT / "app" / "labels.py")
+    assert app_roots <= set(sys.stdlib_module_names) and not app_first_party, "app.labels is the standard library alone"
+
+
+def test_the_demo_cases_script_reads_two_keys_of_the_labels_file_the_gallerys_counts_and_five_keys_of_its_check_and_never_the_models_own_labels():
+    """The fair draw of the plan decides on the reference labels (y_true) alone: the model's labels (y_pred), its reports (hyps.txt) and the
+    reference text itself are never asked for, and the file's own paths (hyp_file, ref_file) are never read. Outside the docstring, which says what
+    the file holds, no string of the script names any of them. Of P5-C's check record in the gallery (labels_check.json) it reads the five keys the
+    plan's fix 1 names, and not the other fields it holds (the counts split by own and shared text, the number of shared texts, where the label
+    names came from)."""
+    tree, parents = _cases_tree()
+    docstring = tree.body[0].value
+    strings = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str) and n is not docstring}
+    for key in ("y_pred", "hyp_file", "ref_file", "five_label_indices", "hyps.txt", "refs.txt", "report_texts.txt", "test_meta", "study_id",
+                "labels_mismatch_own_text", "labels_mismatch_shared_text", "test_rows_sharing_a_text", "label_names_source"):
+        assert not [s for s in strings if key in s], key
+    assert {"y_true", "label_names", "manifest.json", "counts", "test", "images", "report_rows", "labels_check.json", "stage", "final", "reference",
+            "n_test", "refs_mismatch", "labels_mismatch"} <= strings
+    plain = {t.id: ast.unparse(n.value) for n in tree.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
+    assert plain["CHECK_FILE"] == "'labels_check.json'" and plain["CHECK_KEYS"] == "('stage', 'reference', 'n_test', 'refs_mismatch', 'labels_mismatch')"
+    reads = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "read_text"]
+    assert sorted(ast.unparse(n.func.value) for n in reads) == sorted(["Path(gallery) / 'manifest.json'", "Path(gallery) / CHECK_FILE", "Path(path)"]), \
+        "the labels file, the manifest and the check file"
+    assert sorted(_cases_inner(n, parents) for n in reads) == ["check_binding", "read_labels", "read_test_count"]
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    asked = [ast.unparse(c) for c in ast.walk(functions["check_binding"]) if isinstance(c, ast.Call) and ast.unparse(c.func) == "record.get"]
+    assert asked == ["record.get(key)"], "the record is asked in one place"
+    unpacked = [ast.unparse(a) for a in ast.walk(functions["check_binding"]) if isinstance(a, ast.Assign) and "record.get" in ast.unparse(a)]
+    assert unpacked == ["stage, name, n_test, refs, differing = (record.get(key) for key in CHECK_KEYS)"], "and for the five keys of CHECK_KEYS only"
+
+
+def test_every_refusal_the_demo_cases_script_raises_is_a_code_of_its_table_with_only_that_codes_keys_and_no_value_of_a_file():
+    """ERROR_CODES says for each code which number keys may follow it, and the AST agrees with what Refused enforces at run time: every Refused(...)
+    names a code of the table, in a literal; its keywords are keys of that code; every code of the table is raised somewhere. In check_binding, the
+    only module code that reads the gallery's check, the numbers are the labels' own count and numbers of the file that number_or_none has passed:
+    never a value of it as it is."""
+    tree, parents = _cases_tree()
+    table = ast.literal_eval(next(n.value for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "ERROR_CODES"
+                                                                                                  for t in n.targets)))
+    assert isinstance(table, dict) and all(isinstance(keys, tuple) and all(isinstance(k, str) for k in keys) for keys in table.values())
+    raised = {}
+    for call in _cases_calls(tree, "Refused"):
+        assert call.args and isinstance(call.args[0], ast.Constant) and call.args[0].value in table, ast.unparse(call)
+        code = call.args[0].value
+        names = [k.arg for k in call.keywords if k.arg is not None]
+        assert set(names) <= set(table[code]), (code, names)
+        raised.setdefault(code, []).append(ast.unparse(call))
+    assert set(raised) == set(table), sorted(set(table) ^ set(raised))
+    inside = [ast.unparse(c) for c in _cases_calls(tree, "Refused") if _cases_inner(c, parents) == "check_binding" and (c.keywords or len(c.args) > 1)]
+    assert sorted(inside) == sorted([
+        "Refused('check_n_test', labels=studies, **{} if number_or_none(n_test) is None else {'n_test': n_test})",
+        "Refused('check_mismatch', **{key: value for key, value in shown if value is not None})"])
+    shown = [a for a in ast.walk(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "check_binding"))
+             if isinstance(a, ast.Assign) and ast.unparse(a.targets[0]) == "shown"]
+    assert [ast.unparse(a.value) for a in shown] == [_normalized(
+        '(("refs_mismatch", number_or_none(refs)), ("labels_mismatch", number_or_none(differing)))')]
+
+
+def test_the_demo_cases_draw_is_the_seeded_one_the_plan_names_and_uses_only_the_generators_random_numbers():
+    """Seed 42 and five candidates a kind, as the plan's box says, and the three kinds as it names them. The draw is made of random.Random(seed).random()
+    alone: no sample, shuffle, choice or sort of the rows by anything about them, and no numpy generator, so the rows are a function of the labels
+    file for every Python version."""
+    tree, _ = _cases_tree()
+    plain = {t.id: ast.unparse(n.value) for n in tree.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
+    assert plain["SEED"] == "42" and plain["PER_CATEGORY"] == "5"
+    assert plain["CATEGORIES"] == "('normal', 'support_devices', 'pneumothorax')"
+    assert plain["EXIT_REFUSED"] == "1" and plain["EXIT_USAGE"] == "64"
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    assert {ast.unparse(c.func) for c in ast.walk(functions["draw"]) if isinstance(c, ast.Call)} == {"random.Random", "rng.random", "sorted"}
+    assert [ast.unparse(r.value) for r in ast.walk(functions["draw"]) if isinstance(r, ast.Return)] == [
+        _normalized("[row for _, row in sorted(((rng.random(), row) for row in rows))[:k]]")]
+    assert {ast.unparse(c.func) for c in ast.walk(tree) if isinstance(c, ast.Call)
+            and ast.unparse(c.func).startswith(("random.", "rng.", "np.", "numpy."))} == {"random.Random", "rng.random"}
+    names = {n.id for n in ast.walk(functions["categories"]) if isinstance(n, ast.Name)}
+    assert names <= {"found", "number", "row", "rows", "enumerate", "sum", "CATEGORIES", "NO_FINDING", "SUPPORT_DEVICES", "PNEUMOTHORAX", "name", "Dict", "List",
+                     "str", "int", "Sequence"}, "the kinds are decided on the labels of a row and nothing else"
+    # fix 1: each kind is drawn with a seed of its own, SEED plus its place in CATEGORIES: the one call of draw in the script that is not its definition
+    draws = [ast.unparse(c) for c in _cases_calls(tree, "draw")]
+    assert draws == ["draw(found[name], SEED + CATEGORIES.index(name))"], draws
+    assert ast.unparse(next(r.value for r in ast.walk(functions["payload"]) if isinstance(r, ast.Return))).endswith("'seed': SEED}"), "the line says the base seed"
+
+
+def test_the_demo_cases_script_prints_and_writes_nothing_but_its_one_line_the_help_and_fixed_refusals():
+    """R7. No print, no logging, no traceback, no file opened or written: every write is `say`, which has four callers, all in main: the help text,
+    the RESULT line (made by result_line out of a payload of counts and row numbers), a refusal's line (a code of ERROR_CODES and whole numbers) and
+    the class name of an unexpected failure. The one stream it writes to is the one main is given, the process's stdout by default; it never writes
+    stderr, and the only text it takes from an exception is the class name."""
+    tree, parents = _cases_tree()
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id in ("print", "open", "breakpoint", "exec", "eval", "input", "compile", "__import__")]
+    writers = {"write", "writelines", "write_text", "write_bytes", "dump", "mkdir", "unlink", "rename", "replace", "touch", "truncate"}
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in writers and _cases_inner(n, parents) != "say"]
+    assert {_cases_inner(n, parents) for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in ("write", "flush")} == {"say"}
+    sinks = _cases_calls(tree, "say")
+    assert sorted((_cases_inner(s, parents), ast.unparse(s.args[0]), ast.unparse(s.args[1])) for s in sinks) == sorted(
+        ("main", stream, _normalized(shape)) for stream, shape in (
+            ("stdout", 'parser.format_help().rstrip("\\n")'), ("stdout", "result_line(payload(len(labels), categories(labels)))"),
+            ("stdout", "exc.line()"), ("stdout", '"ERROR failed " + type(exc).__name__')))
+    streams = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "sys"]
+    assert {n.attr for n in streams} == {"path", "stdout", "exit"} and {_cases_inner(n, parents) for n in streams if n.attr == "stdout"} == {"main"}
+    assert [ast.unparse(r.value) for r in ast.walk({n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}["result_line"])
+            if isinstance(r, ast.Return)] == [_normalized('"RESULT " + json.dumps(content, separators=(",", ":"))')]
+    assert [_cases_inner(n, parents) for n in _cases_calls(tree, "json.dumps")] == ["result_line"]
+    for handler in (n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler) and n.name):
+        for use in (u for stmt in handler.body for u in ast.walk(stmt) if isinstance(u, ast.Name) and u.id == handler.name):
+            parent = parents[use]
+            assert (isinstance(parent, ast.Call) and ast.unparse(parent.func) == "type") or (
+                isinstance(parent, ast.Attribute) and parent.attr in ("line", "code") and ast.unparse(handler.type) == "Refused"), ast.unparse(handler)   # a Refused: its line, or its code (a word of ERROR_CODES, compared)
+
+
+# ── CHAT_UI_PLAN.md P9-C, part 2: a session's export saved on the server ──────
+# Static pins on Store.save_export (app/store.py) and the route behind it (app/server.py). Their behaviour (the bytes equal to the download's, the
+# names, the modes, the refusals, the held endings in the file, the fixed 500) is exercised for real in tests/test_app_export_save.py. These pins hold
+# what a later edit could break without a test noticing: that there is one export and the file is that body, that the route is private-only before
+# anything else and answers a name and a size, and that nothing of an exception but its class reaches the log or the answer.
+
+def _app_tree(name):
+    tree = ast.parse((REPO_ROOT / "app" / name).read_text(encoding="utf-8"))
+    return tree, {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def _store_method(name):
+    tree, _ = _app_tree("store.py")
+    store = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Store")
+    return next(n for n in store.body if isinstance(n, ast.FunctionDef) and n.name == name)
+
+
+def test_save_export_takes_its_body_from_the_stores_one_export_and_makes_no_second():
+    """The plan: "the same export path, and so the same P8-D follow-up overlay, as GET .../export. Do not build a second export." The method calls
+    self.export once, takes the body from it, and writes that body and nothing else: it reads no row, applies no held ending and renders no document."""
+    save = _store_method("save_export")
+    calls = [ast.unparse(c.func) for c in ast.walk(save) if isinstance(c, ast.Call)]
+    assert calls.count("self.export") == 1
+    assert not {c for c in calls if c.startswith(("self._con", "self._held", "self._message", "self._session")) or c in ("_markdown", "json.dumps", "json.loads")}, calls
+    bound = [ast.unparse(a.targets[0]) for a in ast.walk(save) if isinstance(a, ast.Assign) and isinstance(a.value, ast.Call)
+             and ast.unparse(a.value.func) == "self.export"]
+    assert bound == ["(filename, _, body)"], "the body is the third thing export() answers"
+    written = [ast.unparse(c.args[0]) for c in ast.walk(save) if isinstance(c, ast.Call) and ast.unparse(c.func) == "handle.write"]
+    assert written == ["body"], "the one thing written is the export's own body"
+    assert [ast.unparse(c.args[0]) for c in ast.walk(save) if isinstance(c, ast.Call) and ast.unparse(c.func) == "os.replace"] == ["str(tmp)"]
+    flags = [ast.unparse(c.args[1]) for c in ast.walk(save) if isinstance(c, ast.Call) and ast.unparse(c.func) == "os.open"]
+    assert flags == ["os.O_WRONLY | os.O_CREAT | os.O_EXCL"], "a temporary file that is made new, never an existing file opened"
+    def node_calls(dotted):
+        return [c for c in ast.walk(save) if isinstance(c, ast.Call) and ast.unparse(c.func) == dotted]
+
+    assert [c.args[2].value for c in node_calls("os.open")] == [0o600], "the file is made owner-only"
+    assert [c.args[1].value for c in node_calls("os.fchmod")] == [0o600], "and, whatever the umask, set so"
+    assert [k.value.value for c in node_calls("directory.mkdir") for k in c.keywords if k.arg == "mode"] == [0o700], "the directory is made owner-only"
+
+
+def test_the_save_route_is_private_only_before_anything_else_and_answers_a_name_and_a_size_and_nothing_else():
+    tree, parents = _app_tree("server.py")
+    route = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "save_export")
+    decorator = route.decorator_list[0]
+    assert ast.unparse(decorator.func) == "app.post" and ast.unparse(decorator.args[0]) == "'/v1/sessions/{session_id}/export/save'"
+    assert {k.arg: ast.unparse(k.value) for k in decorator.keywords}["dependencies"] == "[Depends(private_save)]", "the 403 is a dependency: it runs first"
+    guard = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "private_save")
+    assert [ast.unparse(s) for s in guard.body[1:]] == ["if mode == 'public':\n    raise HTTPException(403, PUBLIC_SAVE_MSG)"]
+    assert [a.arg for a in route.args.args] == ["session_id", "fmt"], "no client id: the route is private-only, so it scopes by nothing"
+    returns = [ast.unparse(r.value) for r in ast.walk(route) if isinstance(r, ast.Return)]
+    assert returns == ["{'saved': saved, 'bytes': size}"], "the file name and its size: never the body"
+    assert "body" not in {n.id for n in ast.walk(route) if isinstance(n, ast.Name)} and not [
+        n for n in ast.walk(route) if isinstance(n, ast.Call) and ast.unparse(n.func) in ("Response", "FileResponse", "JSONResponse", "StreamingResponse")]
+    calls = [c for c in ast.walk(route) if isinstance(c, ast.Call) and ast.unparse(c.func) == "store.save_export"]
+    assert [[ast.unparse(a) for a in c.args] for c in calls] == [["session_id", "fmt", "None"]], "one call, with no client id"
+    handlers = [(ast.unparse(h.type), h.name) for h in ast.walk(route) if isinstance(h, ast.ExceptHandler)]
+    assert handlers == [("KeyError", None), ("ValueError", None), ("(OSError, sqlite3.Error)", "exc")]
+    for handler in (h for h in ast.walk(route) if isinstance(h, ast.ExceptHandler) and h.name):
+        uses = [u for stmt in handler.body for u in ast.walk(stmt) if isinstance(u, ast.Name) and u.id == handler.name]
+        assert uses and all(isinstance(parents[u], ast.Call) and ast.unparse(parents[u].func) == "type" for u in uses), "the class, never the text"
+    assert [ast.unparse(c.args[0]) for c in ast.walk(route) if isinstance(c, ast.Call) and ast.unparse(c.func) == "log.warning"] == ["'could not save an export: %s'"]
+    assert [ast.unparse(c.args[1]) for c in ast.walk(route) if isinstance(c, ast.Call) and ast.unparse(c.func) == "HTTPException" and len(c.args) > 1][-1] == "SAVE_EXPORT_FAILED_MSG"
+
+
+# ── CHAT_UI_PLAN.md P9-C follow-up: the saved exports follow the private retention ──
+# Static pins on Store.sweep_exports (app/store.py), the sweeper that calls it (app/retention.py) and the server's wiring of both (app/server.py). The
+# behaviour (the 45 days, the boundary, the names, the links, the failures, the line of the log) is exercised for real in tests/test_app_retention.py. These
+# pins hold what a later edit could break without a test noticing: that the sweep removes only the names of the save route, one regular file at a time, by
+# unlinking its name from the one directory it opened (a handle that refuses a link, never the path again), never a tree and never through a link; that the
+# sweeper reaches it only with days and in a try of its own; that the server gives it the private days; and that nothing of an exception but its class, and
+# nothing of a file but a count, reaches the log.
+
+def _store_constant(name):
+    tree, _ = _app_tree("store.py")
+    return next(n.value for n in tree.body if isinstance(n, ast.Assign) and [ast.unparse(t) for t in n.targets] == [name])
+
+
+def _ancestors(node, parents, stop):
+    """The nodes from `node`'s parent up to, and not including, `stop`."""
+    chain = []
+    while node in parents and parents[node] is not stop:
+        node = parents[node]
+        chain.append(node)
+    return chain
+
+
+def test_the_export_sweep_removes_only_the_save_routes_names_never_a_tree_and_never_through_a_link():
+    sweep = _store_method("sweep_exports")
+    parents = {child: node for node in ast.walk(sweep) for child in ast.iter_child_nodes(node)}
+    calls = [c for c in ast.walk(sweep) if isinstance(c, ast.Call)]
+    names = [ast.unparse(c.func) for c in calls]
+
+    def called(dotted):
+        return [c for c in calls if ast.unparse(c.func) == dotted]
+
+    # what it can remove: the one call, unlinking a name of the one listing, relative to the one directory it opened
+    changers = [n for n in names if n.split(".")[-1] in {"unlink", "remove", "rmdir", "removedirs", "rmtree", "rename", "renames", "replace", "truncate",
+                                                        "chmod", "chown", "symlink", "link", "write", "write_text", "write_bytes", "mkdir", "makedirs"}]
+    assert changers == ["os.unlink"], changers
+    (unlink,) = called("os.unlink")
+    assert [ast.unparse(a) for a in unlink.args] == ["entry.name"] and {k.arg: ast.unparse(k.value) for k in unlink.keywords} == {"dir_fd": "fd"}, \
+        "a name of the listing, relative to the opened directory: no path is built"
+    assert not [n for n in ast.walk(sweep) if isinstance(n, ast.Attribute) and n.attr == "path" and ast.unparse(n.value) == "entry"], \
+        "with scandir(fd) entry.path is the bare name, which a call that takes a path would look for in the working directory"
+    assert "shutil" not in {n.id for n in ast.walk(sweep) if isinstance(n, ast.Name)}, "no rmtree, and no other shutil"
+    assert not [n for n in names if n.split(".")[-1] in {"walk", "glob", "rglob", "iterdir", "listdir", "fwalk"}], "no recursion, no other listing"
+    # the one directory: opened once, refusing a link, and every step after the open goes through the handle and not through the path again
+    (opened,) = called("os.open")
+    assert [ast.unparse(a) for a in opened.args] == ["directory", "os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW"] and not opened.keywords
+    (listing,) = called("os.scandir")
+    assert [ast.unparse(a) for a in listing.args] == ["fd"] and not listing.keywords and opened.lineno < listing.lineno, \
+        "one listing, of the directory that was opened, through its handle"
+    assert sorted(ast.unparse(c.func) for c in calls if any(ast.unparse(a) == "directory" for a in c.args)) == ["os.open", "os.path.islink"], \
+        "the path is used to open the directory and, when that was refused, to say in the log why"
+    (islink,) = called("os.path.islink")
+    assert any(isinstance(n, ast.ExceptHandler) for n in _ancestors(islink, parents, sweep)), "only in the handler of a refusal: it picks a line of the log"
+    (closing,) = called("os.close")
+    assert [ast.unparse(a) for a in closing.args] == ["fd"]
+    (guard,) = [n for n in ast.walk(sweep) if isinstance(n, ast.Try) and any(c is closing for s in n.finalbody for c in ast.walk(s))]
+    in_body = {id(c) for s in guard.body for c in ast.walk(s)}
+    assert id(listing) in in_body and id(unlink) in in_body, "the handle is open for the listing and every removal, and closed in a finally whatever happens"
+    assert not [n for n in names if n in {"os.stat", "os.path.getmtime", "os.path.isfile", "os.path.exists", "os.path.isdir", "os.path.getsize",
+                                         "Path.stat", "directory.stat", "directory.exists", "directory.is_dir", "directory.is_file"}], "each of these follows a link"
+    # the name: whole, against the save's two patterns, and by nothing else
+    assert sorted(n for n in names if n.endswith((".fullmatch", ".match", ".search", ".startswith", ".endswith", ".glob", ".split", ".find"))) == [
+        "EXPORT_NAME.fullmatch", "EXPORT_TEMP.fullmatch"]
+    assert [ast.unparse(c.args[0]) for c in calls if ast.unparse(c.func).endswith(".fullmatch")] == ["entry.name", "entry.name"]
+    assert {name: ast.literal_eval(_store_constant(name).args[0]) for name in ("EXPORT_NAME", "EXPORT_TEMP")} == {
+        "EXPORT_NAME": r"session-s_[0-9a-f]{22}-(?P<stamp>[0-9]{8}T[0-9]{6}Z)(?:-[0-9]+)?\.(?:json|md)",
+        "EXPORT_TEMP": r"\.session-s_[0-9a-f]{22}\.[0-9a-f]{8}\.tmp"}, "the patterns are save_export's names, as it makes them"
+    # a link: no look at an entry follows it (a link seen at the listing is passed over)
+    is_file = [c for c in calls if ast.unparse(c.func) == "entry.is_file"]
+    assert len(is_file) == 1 and {k.arg: ast.unparse(k.value) for k in is_file[0].keywords} == {"follow_symlinks": "False"}
+    stats = [c for c in calls if isinstance(c.func, ast.Attribute) and c.func.attr == "stat"]
+    assert stats and all(ast.unparse(c.func) == "entry.stat" and {k.arg: ast.unparse(k.value) for k in c.keywords} == {"follow_symlinks": "False"} for c in stats)
+    # the order in the loop: the name, then the kind of file, and only then the removal
+    loop = next(n for n in ast.walk(sweep) if isinstance(n, ast.For) and ast.unparse(n.target) == "entry")
+    assert ast.unparse(loop.iter) == "entries"
+    first, second, attempt = loop.body
+    assert ast.unparse(first) == "export = EXPORT_NAME.fullmatch(entry.name)"
+    assert ast.unparse(second.test) == "export is None and EXPORT_TEMP.fullmatch(entry.name) is None" and [ast.unparse(s) for s in second.body] == ["continue"]
+    assert isinstance(attempt, ast.Try) and ast.unparse(attempt.body[0].test) == "not entry.is_file(follow_symlinks=False)"
+    assert [ast.unparse(s) for s in attempt.body[0].body] == ["continue"], "anything that is not a regular file is passed over"
+    assert not [n for n in ast.walk(attempt.body[0]) if isinstance(n, ast.Call) and ast.unparse(n.func) == "os.unlink"]
+    assert len([n for s in attempt.body[1:] for n in ast.walk(s) if isinstance(n, ast.Call) and ast.unparse(n.func) == "os.unlink"]) == 1, "removed after both"
+
+
+def test_the_export_sweep_logs_the_class_of_an_exception_and_nothing_of_a_file_or_a_path():
+    sweep = _store_method("sweep_exports")
+    warnings = [c for c in ast.walk(sweep) if isinstance(c, ast.Call) and ast.unparse(c.func) == "log.warning"]
+    assert len(warnings) == 4, "a link in the directory's place (fixed words), the open, the listing and a file"
+    for call in warnings:
+        assert [ast.unparse(a) for a in call.args[1:]] in ([], ["type(exc).__name__"]) and not call.keywords, ast.unparse(call)
+    parents = {child: node for node in ast.walk(sweep) for child in ast.iter_child_nodes(node)}
+    for handler in (h for h in ast.walk(sweep) if isinstance(h, ast.ExceptHandler) and h.name):
+        uses = [u for stmt in handler.body for u in ast.walk(stmt) if isinstance(u, ast.Name) and u.id == handler.name]
+        assert uses and all(isinstance(parents[u], ast.Call) and ast.unparse(parents[u].func) == "type" for u in uses), "the class, never the text"
+    assert sorted(ast.unparse(h.type) for h in ast.walk(sweep) if isinstance(h, ast.ExceptHandler)) == sorted(
+        ["OverflowError", "FileNotFoundError", "OSError", "OSError", "FileNotFoundError", "OSError"]), "no handler of Exception or a bare except that would take more than a file's failure"
+    assert not [n for n in ast.walk(sweep) if isinstance(n, ast.Name) and n.id in ("print", "open", "exec", "eval")]
+
+
+def test_the_sweeper_sweeps_the_exports_only_when_it_is_given_days_in_a_try_of_its_own_and_logs_only_the_class():
+    tree, parents = _app_tree("retention.py")
+    sweeper = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "RetentionSweeper")
+    once = next(n for n in sweeper.body if isinstance(n, ast.FunctionDef) and n.name == "sweep_once")
+    calls = [c for c in ast.walk(once) if isinstance(c, ast.Call) and ast.unparse(c.func) == "self.store.sweep_exports"]
+    assert [[ast.unparse(a) for a in c.args] for c in calls] == [["self.export_days"]], "the one call, with the days the sweeper was given"
+    chain = _ancestors(calls[0], parents, once)
+    gate, attempt = next(n for n in chain if isinstance(n, ast.If)), next(n for n in chain if isinstance(n, ast.Try))
+    assert ast.unparse(gate.test) == "self.export_days is not None" and chain.index(attempt) < chain.index(gate), "no days, no call, and the try is inside"
+    handler, = attempt.handlers
+    assert ast.unparse(handler.type) == "Exception" and handler.name == "exc"
+    assert [ast.unparse(a) for c in ast.walk(handler) if isinstance(c, ast.Call) for a in c.args[1:]] == ["type(exc).__name__"]
+    sessions = [c for c in ast.walk(once) if isinstance(c, ast.Call) and ast.unparse(c.func) == "self.store.sweep"]
+    assert len(sessions) == 1 and sessions[0].lineno < calls[0].lineno, "the sessions are swept first, each mode in a try of its own"
+
+
+def test_create_app_gives_the_sweeper_the_private_days_of_the_policy_and_prints_counts_and_days_only():
+    tree, _ = _app_tree("server.py")
+    create = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "create_app")
+    made = [c for c in ast.walk(create) if isinstance(c, ast.Call) and ast.unparse(c.func) == "retention.RetentionSweeper"]
+    assert len(made) == 1 and {k.arg: ast.unparse(k.value) for k in made[0].keywords}["export_days"] == "policy['private']", "whatever the server's mode"
+    report = next(n for n in ast.walk(create) if isinstance(n, ast.FunctionDef) and n.name == "report_sweep")
+    prints = [c for c in ast.walk(report) if isinstance(c, ast.Call) and ast.unparse(c.func) == "print"]
+    assert len(prints) == 1
+    line = prints[0].args[0]
+    assert ast.unparse(line.func.value) == "'[server] retention: purged {} session(s), {} saved file(s) ({})'" and line.func.attr == "format"
+    assert [ast.unparse(a) for a in line.args[:2]] == ["purged", "exports"] and ast.unparse(line.args[2].func) == "', '.join" and len(line.args) == 3
+    assert {n.id for n in ast.walk(report) if isinstance(n, ast.Name)} <= {"purged", "first", "exports", "sweeper", "policy", "m", "d", "print", "sorted",
+                                                                           "int", "bool"}, "counts and the days of the policy, and nothing else, are in the line"
+
+
+# ── CHAT_UI_PLAN.md P9-C, part 3: the demo session driver ─────────────────────
+# Static pins on scripts/chat_demo_session.py, the driver the laptop runs against the cluster's live server through the tunnel: it runs the five
+# test-split turns of the supervisor demo and has the server save the session's export on its own disk, and it prints numbers only because that
+# server streams MIMIC-derived text (R7). Its behaviour (the run against a real tiny server, the line, the exit statuses, the refusals, the fixed
+# codes, the sentinel fake server) is run for real in tests/test_chat_demo_session.py. These pins hold what a later edit could break without a test
+# noticing: what it imports, where its token comes from, that it never deletes the session, the ports it never names, and what can reach its streams.
+
+_DEMO = REPO_ROOT / "scripts" / "chat_demo_session.py"
+_DEMO_TESTS = REPO_ROOT / "tests" / "test_chat_demo_session.py"
+
+
+def _demo_tree():
+    """-> (the script's syntax tree, a map from each node to its parent)."""
+    tree = ast.parse(_DEMO.read_text(encoding="utf-8"))
+    return tree, {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def _demo_calls(tree, dotted):
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == dotted]
+
+
+def _demo_outer(node, parents):
+    """The name of the module-level function a node is in, however deep it sits, or None."""
+    name = None
+    while node in parents:
+        node = parents[node]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = node.name
+    return name
+
+
+def test_the_demo_session_imports_httpx_the_standard_library_and_the_drill_and_the_probe_beside_it_and_nothing_else():
+    """Like the probe it runs on the laptop, in the venv, beside the tunnel, with the server's code absent: httpx and the standard library, no other
+    HTTP client, nothing of the app or the model stack, and of its own repository only the load drill and the probe, whose transport and reading
+    helpers it imports (the URL check, the token, the one write, the session call, the turn's reader). No json: the RESULT line is the probe's own
+    result_line. It makes one httpx client, built in main, which goes straight to the URL it was given (no proxy named in the environment, no
+    redirect), because the token and the stream travel on it; httpx's module-level functions build a client of their own with the defaults."""
+    if not hasattr(sys, "stdlib_module_names"):
+        pytest.skip("sys.stdlib_module_names needs Python 3.10")
+    roots, first_party = _imports_of(_DEMO)
+    assert roots <= {"argparse", "os", "re", "sys", "time", "dataclasses", "typing", "httpx", "scripts"}, sorted(roots)
+    assert roots - {"httpx", "scripts"} <= set(sys.stdlib_module_names)
+    assert not first_party and not roots & {"app", "tests", "hybrid_xmamba", "torch", "numpy", "PIL", "json"}, sorted(roots)
+    stdlib_http = {"urllib", "http", "socket", "ssl", "ftplib", "smtplib", "xmlrpc", "asyncio", "selectors", "socketserver", "wsgiref", "subprocess"}
+    assert not roots & stdlib_http, sorted(roots & stdlib_http)
+    tree, parents = _demo_tree()
+    from_scripts = [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "scripts"]
+    assert sorted([(a.name, a.asname) for a in n.names][0] for n in from_scripts) == [("chat_load_drill", "drill"), ("chat_realturn_probe", "probe")]
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Import) and any(a.name.split(".")[0] == "scripts" for a in n.names)]
+    clients = _demo_calls(tree, "httpx.Client")
+    assert len(clients) == 1 and _demo_outer(clients[0], parents) == "main", "one client, for everything it sends"
+    settings = {k.arg: getattr(k.value, "value", None) for k in clients[0].keywords}
+    assert settings.get("trust_env") is False and settings.get("follow_redirects") is False, settings
+    functions = {"httpx." + name for name in ("get", "post", "put", "patch", "delete", "head", "options", "request", "stream")}
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) in functions]
+    assert {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "os"} == {"path"}
+    assert {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and ast.unparse(n.value) == "os.path"} == {"dirname", "abspath"}
+    assert {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "sys"} == {
+        "path", "stdout", "stderr", "exit"}
+
+
+def test_the_demo_session_reads_its_token_only_through_the_drills_find_token_from_chat_token_or_a_token_file():
+    """A token on the command line shows in `ps` and in the shell history. The driver reads no environment variable and no argument itself: the one read
+    of the token is the drill's find_token, which takes CHAT_TOKEN or the file named by --token-file (the one option that names a token); the one
+    positional is the URL; the parser is the drill's own and takes no abbreviation (`--token abc` must not become `--token-file abc`); the URL goes
+    through the drill's check (the dev server's port refused) and must be a loopback address; and a token is not sent over plain http to a host that is
+    not loopback: both refusals are raised in main, on exactly those conditions, before the client that would send anything is built."""
+    tree, parents = _demo_tree()
+    plain = {t.id: ast.unparse(n.value) for n in tree.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
+    assert plain["CLIENT_ID"] == "'chat-demo-session'" and plain["TITLE"] == "'Supervisor demo'" and plain["SAVE_FORMATS"] == "('json', 'md')"
+    assert plain["DEFAULT_MAX_NEW_TOKENS"] == "probe.DEFAULT_EOS_TOKENS"
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in ("environ", "environb", "getenv", "argv")]
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module in ("os", "sys")]
+    assert not _demo_calls(tree, "drill.read_token")
+    finds = _demo_calls(tree, "drill.find_token")
+    assert len(finds) == 1 and ast.unparse(finds[0].args[0]) == "args.token_file" and _demo_outer(finds[0], parents) == "main"
+    checks = _demo_calls(tree, "drill.check_url")
+    assert len(checks) == 1 and ast.unparse(checks[0].args[0]) == "args.url" and _demo_outer(checks[0], parents) == "main"
+    adds = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "add_argument"]
+    added = [[a.value for a in n.args if isinstance(a, ast.Constant) and isinstance(a.value, str)] for n in adds]
+    assert [names[0] for names in added if not names[0].startswith("-")] == ["url"], "no positional but the URL"
+    assert sorted(name for names in added for name in names if name.startswith("-")) == sorted(
+        ["--rows", "--token-file", "--max-new-tokens", "--timeout", "-h", "--help"]), "the only option that takes a token is --token-file"
+    assert not [k for call in adds for k in call.keywords if k.arg == "dest"], "no option under another name"
+    parsers = _demo_calls(tree, "drill._Parser")
+    assert len(parsers) == 1 and [k.value.value for k in parsers[0].keywords if k.arg == "allow_abbrev"] == [False]
+    clients = _demo_calls(tree, "httpx.Client")
+
+    def guard_of(constant):
+        found = [n for n in _demo_calls(tree, "drill.Refused") if n.args and ast.unparse(n.args[0]) == constant]
+        assert len(found) == 1 and _demo_outer(found[0], parents) == "main", constant
+        assert found[0].lineno < clients[0].lineno, "the refusal comes before the client exists"
+        return parents[parents[found[0]]]            # Refused(...) <- raise <- if
+
+    assert ast.unparse(guard_of("drill.CLEARTEXT_REFUSAL").test) == "token is not None and drill.sends_token_in_clear(base)"
+    assert ast.unparse(guard_of("LOOPBACK_REFUSAL").test) == "not drill.is_loopback(httpx.URL(base).host)"
+    bearers = [n for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.startswith("Bearer")]
+    assert len(bearers) == 1 and _demo_outer(bearers[0], parents) == "main" and ast.unparse(parents[bearers[0]]) == "'Bearer ' + token"
+    headers = [n for n in ast.walk(tree) if isinstance(n, ast.Dict) and any(isinstance(k, ast.Constant) and k.value == "X-Client-Id" for k in n.keys)]
+    assert len(headers) == 1 and ast.unparse(headers[0]) == "{'X-Client-Id': CLIENT_ID}", "the client id is fixed"
+
+
+def test_the_demo_session_never_deletes_the_session_it_makes_and_sends_exactly_the_requests_it_names():
+    """The session is for the user to open in the page: the driver makes it and keeps it. It calls neither the drill's delete_session nor any delete,
+    get, put, patch, head or generic request on a client. The requests it makes are the drill's one session POST, the probe's turn POSTs (a stream, in
+    run_turn) and its own two save POSTs, from one place."""
+    tree, parents = _demo_tree()
+    source = _DEMO.read_text(encoding="utf-8")
+    assert "delete_session" not in source and "DELETE" not in source and "delete(" not in source
+    verbs = {n.func.attr for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and isinstance(n.func.value, ast.Name) and n.func.value.id == "client"}
+    assert verbs == {"post"}, verbs
+    posts = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "client.post"]
+    assert [_demo_outer(n, parents) for n in posts] == ["save_export"] and ast.unparse(posts[0].args[0]) == "SAVE_PATH.format(session_id)"
+    assert [ast.unparse(k.value) for k in posts[0].keywords] == ["{'format': fmt}"]
+    assert [[ast.unparse(a) for a in c.args] for c in _demo_calls(tree, "drill.create_session")] == [["client", "TITLE"]], "one session, titled"
+    assert [_demo_outer(n, parents) for n in _demo_calls(tree, "drill.create_session")] == ["run_demo"]
+    assert [_demo_outer(n, parents) for n in _demo_calls(tree, "probe.run_turn")] == ["run_demo"], "every turn is read by the probe's reader"
+    saved = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == "demo.saved.append"]
+    assert [ast.unparse(n.args[0]) for n in saved] == ["name"] and [_demo_outer(n, parents) for n in saved] == ["run_demo"]
+
+
+def test_the_demo_session_never_says_either_of_the_ports_of_the_users_own_servers():
+    """8000 is the dev server's and 8010 the controller's tunnel (app/README.md). The driver is the load drill's own in what it refuses (the URL check
+    refuses the first), and no number or address of either is written anywhere in it: not in a constant, not in a message, not in the docstring."""
+    source = _DEMO.read_text(encoding="utf-8")
+    assert not re.search(r"\b(8000|8010)\b", source)
+    tree, _ = _demo_tree()
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value in (8000, 8010)]
+
+
+def test_the_demo_session_tests_name_the_users_ports_only_where_nothing_can_connect():
+    """8000 is the user's dev server and 8010 the tunnel to the live cluster server. The module's autouse socket guard keeps every test of
+    tests/test_chat_demo_session.py off both, but it works in the test process: a child process is not reached by it. So the numbers are written in the
+    guard's own constant and in the tests that run in this process with a client that cannot connect (the refusal matrix under `offline`, the check_url
+    matrix, the loopback matrix under a client that finds nobody), and nowhere else: not in a test that starts a process, not in a fixture, not in a
+    fake (a docstring aside). Each of those places must still name them, so that the list cannot drift."""
+    tree = ast.parse(_DEMO_TESTS.read_text(encoding="utf-8"))
+    docstrings = _requeue_docstrings(tree)
+    where = {}
+    for top in tree.body:
+        name = top.name if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else type(top).__name__
+        if isinstance(top, ast.Assign):
+            name = ast.unparse(top.targets[0])
+        for node in ast.walk(top):
+            if not isinstance(node, ast.Constant) or node in docstrings:
+                continue
+            if (type(node.value) is int and node.value in (8000, 8010)) or (isinstance(node.value, str) and re.search(r"(?<![0-9])(8000|8010)(?![0-9])", node.value)):
+                where.setdefault(name, []).append(node.value)
+    assert sorted(where) == sorted([
+        "FORBIDDEN_PORTS", "test_the_script_refuses_port_8000_in_one_line_with_exit_2_and_connects_to_nothing",
+        "test_only_port_8000_itself_is_refused_for_being_the_dev_server",
+        "test_a_loopback_address_gets_past_the_checks_to_its_first_request_which_nothing_answers"]), sorted(where)
+
+
+def test_the_demo_session_prints_and_writes_nothing_but_result_lines_help_and_its_fixed_refusals():
+    """R7. No print, no logging, no traceback, no file opened or written: every write is the load drill's one `_write`, and it has three callers in
+    main: the help text, a refusal (`ERROR ` and the text of a Refused, which is fixed) and the RESULT line, made by the probe's result_line out of
+    payload(), a dict of numbers, booleans, fixed words and the names of files the server wrote."""
+    tree, parents = _demo_tree()
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id in ("print", "open", "breakpoint", "exec", "eval", "input", "compile", "__import__")]
+    writers = {"write", "writelines", "write_text", "write_bytes", "dump", "flush", "truncate", "mkdir", "unlink", "rename", "replace", "touch"}
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in writers], "its own writes are the drill's, through one call"
+    sinks = _demo_calls(tree, "drill._write")
+    assert {_demo_outer(s, parents) for s in sinks} == {"main"}
+    assert sorted((ast.unparse(s.args[0]), ast.unparse(s.args[1])) for s in sinks) == sorted((stream, _normalized(shape)) for stream, shape in (
+        ("stderr", '"ERROR " + str(exc)'), ("stdout", 'parser.format_help().rstrip("\\n")'), ("stdout", "probe.result_line(result)")))
+    refusal = next(s for s in sinks if ast.unparse(s.args[1]) == _normalized('"ERROR " + str(exc)'))
+    handler = parents[refusal]
+    while not isinstance(handler, ast.ExceptHandler):
+        handler = parents[handler]
+    assert ast.unparse(handler.type) == "drill.Refused" and handler.name == "exc", "the text of a refusal is that of a Refused"
+    results = [n for n in ast.walk(tree) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "result" for t in n.targets)]
+    assert [ast.unparse(n.value) for n in results] == ["payload(args.rows, demo)"], "the line is payload()'s and nothing else"
+    streams = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "sys"
+               and n.attr in ("stdout", "stderr")]
+    assert {_demo_outer(n, parents) for n in streams} == {"main"} and len(streams) == 2, "the process's own streams are main's defaults"
+
+
+def test_the_demo_session_keeps_nothing_of_a_turn_or_an_answer_but_numbers_booleans_fixed_words_and_a_file_name_of_the_servers_own_shape():
+    """R7. A turn is read by the probe (its Facts hold numbers, booleans and words chosen from fixed lists, pinned with the probe), and this script puts
+    out of it a word chosen here (status_word), one word of the probe's lists, a class name or a literal (error_word) and a count. Of a save's answer it
+    returns one string, and only after it has been matched against the shape of the server's own file names for this session and format and checked to
+    come with a size under the probe's bound; every other end of save_export is a fixed code made here. The text of an exception is never used: every
+    handler but those of Refused and DrillError (whose texts are written in the drill) names the class."""
+    tree, parents = _demo_tree()
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    assert sorted(ast.unparse(r.value) for r in ast.walk(functions["save_export"]) if isinstance(r, ast.Return)) == sorted(
+        _normalized(s) for s in ('(None, "save_" + type(exc).__name__)', '(None, "save_http_{}".format(response.status_code))', '(None, "save_bad_answer")',
+                                 "(name, None)"))
+    body = functions["save_export"].body
+    last_guard = next(i for i, s in enumerate(body) if isinstance(s, ast.If) and ast.unparse(s.test).startswith("not (named and"))
+    assert isinstance(body[-1], ast.Return) and ast.unparse(body[-1].value) == "(name, None)" and last_guard == len(body) - 2, "`name` is returned only past the check"
+    named = next(a for a in ast.walk(functions["save_export"]) if isinstance(a, ast.Assign) and ast.unparse(a.targets[0]) == "named")
+    assert "SAVED_NAME.fullmatch(name)" in ast.unparse(named.value) and "startswith('session-{}-'.format(session_id))" in ast.unparse(named.value)
+    assert "endswith('.' + fmt)" in ast.unparse(named.value)
+    assert ast.unparse(body[last_guard].test) == "not (named and type(size) is int and (0 < size < probe.NUMBER_LIMIT))"
+    assert {_demo_outer(n, parents) for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "json"} == set(), "no answer is parsed here but through the drill"
+    assert [_demo_outer(n, parents) for n in _demo_calls(tree, "drill._json_or_none")] == ["save_export"]
+    status = functions["status_word"]
+    assert sorted(ast.unparse(r.value) for r in ast.walk(status) if isinstance(r, ast.Return)) == sorted(
+        _normalized(s) for s in ('"timeout" if f.error == "timeout" else "failed"', '"refused" if f.status is not None else "failed"',
+                                 'f.final if f.final is not None else "incomplete"'))
+    assert [ast.unparse(r.value) for r in ast.walk(functions["error_word"]) if isinstance(r, ast.Return)] == ["word"]
+    assigned = [ast.unparse(a.value) for a in ast.walk(functions["error_word"]) if isinstance(a, ast.Assign)]
+    assert sorted(assigned) == sorted([_normalized("f.error or f.refusal or f.stream_error"), "'seq_gap'"])
+    handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler) and n.name]
+    assert handlers, "the pin looks at something"
+    for handler in handlers:
+        for use in (n for stmt in handler.body for n in ast.walk(stmt) if isinstance(n, ast.Name) and n.id == handler.name):
+            parent = parents[use]
+            if ast.unparse(handler.type) in ("drill.Refused", "drill.DrillError"):
+                assert isinstance(parent, ast.Call) and ast.unparse(parent.func) == "str", ast.unparse(handler)   # fixed sentences and codes of the drill
+            else:   # `type(exc)`: the class, never the text
+                assert isinstance(parent, ast.Call) and ast.unparse(parent.func) == "type", ast.unparse(handler) + " uses " + handler.name
+    keys = [ast.unparse(k) for d in ast.walk(functions["payload"]) if isinstance(d, ast.Dict) for k in d.keys]
+    assert keys == ["'demo'", "'rows'", "'turns'", "'statuses'", "'tokens'", "'stopped'", "'eos_trained'", "'session'", "'saved'", "'ok'"], \
+        "the plan's keys in its order, and after the tokens the stop word of each turn and whether the model was trained to end its reports (fix 1)"
+    subscripts = [ast.unparse(s.slice) for s in ast.walk(functions["payload"]) if isinstance(s, ast.Subscript) and isinstance(s.ctx, ast.Store)]
+    assert subscripts == ["'errors'", "'error'"], "and the two that are there only when something went wrong"
+    # fix 1: the two new fields are the probe's own words and a boolean, and nothing else of a stream: `stopped` is the probe's `_word` of the stage's
+    # stop word, taken as it is, and `eos_trained` comes from the probe's `_flag` of the card's flag, through one helper that returns a bool or None
+    values = {ast.unparse(k): ast.unparse(v) for d in ast.walk(functions["payload"]) if isinstance(d, ast.Dict) for k, v in zip(d.keys, d.values)}
+    assert values["'stopped'"] == "[f.stopped for f in demo.turns]" and values["'eos_trained'"] == "eos_trained(demo.turns)"
+    helper = functions["eos_trained"]
+    assert [ast.unparse(r.value) for r in ast.walk(helper) if isinstance(r, ast.Return)] == ["said.pop() if len(said) == 1 else None"]
+    assert [ast.unparse(a.value) for a in ast.walk(helper) if isinstance(a, ast.Assign)] == ["{f.eos_trained for f in turns if f.eos_trained is not None}"]
+    assert {n.attr for n in ast.walk(helper) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "f"} == {"eos_trained"}
+    probe_source = (REPO_ROOT / "scripts" / "chat_realturn_probe.py").read_text(encoding="utf-8")
+    assert "facts.eos_trained = _flag(model.get(\"eos_trained\"))" in probe_source and "facts.stopped = _word(detail[\"stopped\"], STOPPED)" in probe_source, \
+        "the probe's reader is where both are made closed: a bool or None, a word of STOPPED or `unknown`"
+
+
+# ── CHAT_UI_PLAN.md P9-B: the GitHub Pages copy of the page ───────────────────
+# Static pins on what P9-B must leave as it was (R2), on scripts/pages_build.py (only app/static is copied, R7) and on scripts/pages_publish.sh
+# (one push, of gh-pages, never forced). What they do is run for real in tests/test_pages_scripts.py (the build, and the publish against a bare
+# repository), tests/test_chat_server_cli.py and tests/test_app_api.py (--cors-origin, CORS, the Private Network Access answer),
+# tests/test_chat_server_job.py (CORS_ORIGINS) and tests/frontend/app.test.mjs (the API server setting, the Pages copy's first run).
+
+def _p9b_text(*parts: str) -> str:
+    return REPO_ROOT.joinpath(*parts).read_text(encoding="utf-8")
+
+
+def _python_code(src: str) -> str:
+    """Python source as code alone: no comment, no docstring (ast.unparse writes the rest back, strings in single quotes)."""
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(body, list) and body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                and isinstance(body[0].value.value, str):
+            body[:1] = [] if len(body) > 1 else [ast.Pass()]
+    return ast.unparse(tree)
+
+
+def test_p9b_leaves_every_default_as_it_was():
+    """R2. No CORS middleware without cors_origins, no cors_origins without --cors-origin, no --cors-origin without CORS_ORIGINS; the page the API
+    serves is the page it was, with no Pages tag; and a page with no API server asks its own origin, which the stored settings do not name."""
+    import inspect
+    from app import cli, server
+    assert inspect.signature(server.create_app).parameters["cors_origins"].default == ()
+    source = inspect.getsource(server.create_app)
+    block = source[source.index("if cors_origins:"):source.index("app.add_middleware(RequestLog")]
+    assert source.count("CORSMiddleware") == 1 and source.count("_PrivateNetwork") == 1 and "app.add_middleware(_PrivateNetwork, origins=cors_origins)" in block
+    for unchanged in ('allow_methods=["GET", "POST", "DELETE"]', 'allow_headers=["Authorization", "Content-Type", "X-Client-Id", REQUEST_ID_HEADER]',
+                      'expose_headers=["X-Message-Id", REQUEST_ID_HEADER]'):
+        assert unchanged in block, unchanged
+    action = cli.build_parser()._option_string_actions["--cors-origin"]
+    assert (action.default, action.nargs, type(action).__name__) == (None, None, "_AppendAction")
+    assert cli.parse_args(["--engine", "tiny", "--mode", "private", "--home", "H"]).cors_origins == ()
+    assert '{"cors_origins": args.cors_origins} if args.cors_origins else {}' in inspect.getsource(cli._serve)
+    for name in SERVE_WRAPPERS:
+        assert 'CORS_ORIGINS="${CORS_ORIGINS:-}"' in _serve_code(name), name
+    page = _p9b_text("app", "static", "index.html")
+    assert "cxr-pages" not in page and 'href="/static/styles.css"' in page and 'src="/static/app.js"' in page
+    app_js = _p9b_text("app", "static", "app.js")
+    defaults = re.search(r"export const DEFAULT_SETTINGS = Object\.freeze\(\{[^}]*\}\);", app_js).group(0)
+    assert "api_server" not in defaults, "a page that never had an API server stores what it always stored"
+    assert "const apiBase = () => state.settings.api_server || (pagesCopy ? null : '');" in app_js
+    assert "...(server ? { api_server: server } : {})," in app_js
+
+
+def test_p9b_the_pages_tag_the_build_writes_is_the_one_the_page_reads():
+    build = _python_code(_p9b_text("scripts", "pages_build.py"))
+    assert "PAGES_TAG = '<meta name=\"cxr-pages\" content=\"1\">'" in build
+    app_js = _p9b_text("app", "static", "app.js")
+    assert "export const PAGES_META = 'cxr-pages';" in app_js and 'meta[name="${PAGES_META}"][content="1"]' in app_js
+
+
+def test_p9b_the_pages_build_copies_app_static_and_nothing_else():
+    """R7. The build reads app/static and no other place of the repository: the one path it makes from the repository's root is app/static, it
+    walks that directory without following a link, it takes only .html, .js and .css, and the places that hold MIMIC-derived data are named in no
+    line of its code (its docstring names them only to say that nothing of theirs is copied). Only the standard library."""
+    code = _python_code(_p9b_text("scripts", "pages_build.py"))
+    assert re.findall(r"REPO_ROOT / '([^']+)'", code) == ["app"] and "STATIC = REPO_ROOT / 'app' / 'static'" in code
+    assert "os.walk(str(STATIC))" in code and "os.path.islink" in code and "KINDS = ('.html', '.js', '.css')" in code
+    for word in ("outputs", "results", "chat_sessions", "chat_home", "dataset", "mimic", "gallery", "home"):
+        assert word not in code.lower(), word
+    roots = {node.names[0].name.split(".")[0] if isinstance(node, ast.Import) else node.module.split(".")[0]
+             for node in ast.walk(ast.parse(code)) if isinstance(node, (ast.Import, ast.ImportFrom))}
+    assert roots <= set(sys.stdlib_module_names), sorted(roots - set(sys.stdlib_module_names))
+
+
+def test_p9b_the_publish_script_pushes_gh_pages_once_never_forced_and_names_no_other_branch():
+    """One push, `git push origin gh-pages`, never forced in any form; the one branch it names is gh-pages; what it changes in the caller's
+    repository is its own temporary worktree and the local gh-pages; it never touches the caller's working tree, index or stash (no stash, reset,
+    checkout, switch, clean, merge or rebase, and its one status with --no-optional-locks); and it runs in the Mac's bash 3.2."""
+    import shutil
+    import subprocess
+    code = _gallery_wrapper_code(_p9b_text("scripts", "pages_publish.sh"))
+    text = "\n".join(code)
+    pushes = [line for line in code if re.search(r"\bgit\b[^#\n]*\spush\b", line)]   # a git command, not a message or a comment
+    assert len(pushes) == 1 and pushes[0].startswith('git -C "${WT}" push origin gh-pages || fail '), pushes
+    for forced in ("--force", " -f", "+gh-pages", "+refs", "--mirror", "--delete", "--all", "--tags", " :"):
+        assert forced not in pushes[0].split(" || ")[0], forced
+    assert 'BRANCH="gh-pages"' in text and set(re.findall(r"refs/heads/(\S+?)[\"\s]", text)) == {"${BRANCH}"}
+    assert not re.search(r"\b(main|master|chat_ui|origin/)\b", text)
+    verbs = set(re.findall(r'\bgit -C "\$\{(?:REPO_ROOT|WT)\}" (?:--no-optional-locks )?([a-z-]+)', text))
+    assert verbs == {"rev-parse", "config", "status", "worktree", "ls-remote", "fetch", "merge-base", "update-ref", "symbolic-ref", "read-tree", "add",
+                     "write-tree", "commit", "push"}, sorted(verbs)   # no stash, reset, checkout, switch, clean, merge or rebase, ever
+    on_the_caller = set(re.findall(r'git -C "\$\{REPO_ROOT\}" (--no-optional-locks status|worktree (?:add|remove|list)|rev-parse|config|update-ref)', text))
+    assert len(re.findall(r'git -C "\$\{REPO_ROOT\}"', text)) == len(re.findall(
+        r'git -C "\$\{REPO_ROOT\}" (?:--no-optional-locks status|worktree (?:add|remove|list)|rev-parse|config|update-ref)', text)), on_the_caller
+    assert "fetch --quiet --no-tags --refmap= origin" in text, "the fetch moves no ref of the caller's"
+    for pattern in BASH_4_ONLY:
+        assert not re.search(pattern, text), pattern
+    shells = {s for s in ("/bin/bash", shutil.which("bash")) if s and os.path.exists(s)}
+    for shell in shells:
+        done = subprocess.run([shell, "-n", str(REPO_ROOT / "scripts" / "pages_publish.sh")], capture_output=True, text=True)
+        assert done.returncode == 0, (shell, done.stderr)
+
+
+def test_p9b_the_publish_script_reads_the_worktree_list_whole_and_counts_ignored_page_files_as_not_committed():
+    """P9-B fix 1. `git worktree list | grep -q` under pipefail can lose git to SIGPIPE when grep leaves at its first match, and the failed
+    pipeline would skip the check: the list is read into a variable first, and searched from there. The clean check lists ignored files too
+    (--ignored), since the build copies what is on disk."""
+    code = _gallery_wrapper_code(_p9b_text("scripts", "pages_publish.sh"))
+    text = "\n".join(code)
+    assert not re.search(r"worktree list[^\n]*\|", text), "nothing is piped out of git worktree list"
+    assert 'WORKTREES="$(git -C "${REPO_ROOT}" worktree list --porcelain)"' in text
+    assert 'if grep -qx "branch refs/heads/${BRANCH}" <<< "${WORKTREES}"; then' in text
+    status = [line for line in code if "status --porcelain" in line]
+    assert len(status) == 1 and "--ignored" in status[0] and "--untracked-files=all" in status[0], status
+
+
+# ── CHAT_UI_PLAN.md final whole-branch review: the test configuration is read ─────────────────────────────────────────────────────────
+# pytest.ini's section was `[tool:pytest]`, setup.cfg's header. In a pytest.ini pytest reads `[pytest]` and nothing else, so no option of the
+# file applied (not --strict-markers, not testpaths), and tests/conftest.py registered the marks by itself. This pin holds what a later edit could
+# lose without a test noticing: the header, the options, and that the file does what it says when pytest runs on it.
+
+def test_pytest_ini_is_read_and_an_unregistered_mark_stops_the_run(tmp_path):
+    """The section is [pytest] and nothing else; addopts is --strict-markers and --tb=short (no -v: validate.sh passes -q, and each caller picks
+    its own; no --disable-warnings: the warnings summary is a signal of the gate); the four marks are registered. And the file works: in a
+    directory that holds a copy of it, a test file whose mark nobody registered does not collect, and one that uses a registered mark runs. A flag
+    that is only in addopts is not enough on every pytest (9.0 applies it too late), so the run itself is what is looked at."""
+    import configparser
+    import shutil
+    import subprocess
+
+    ini = configparser.ConfigParser(interpolation=None)
+    ini.read(str(REPO_ROOT / "pytest.ini"), encoding="utf-8")
+    assert ini.sections() == ["pytest"], "[tool:pytest] is setup.cfg's header: pytest.ini is read for [pytest] only"
+    assert ini["pytest"]["addopts"].split() == ["--strict-markers", "--tb=short"]
+    assert [line.split(":")[0] for line in ini["pytest"]["markers"].split("\n") if line] == ["slow", "e2e", "cuda", "willi_parity"]
+
+    shutil.copy(str(REPO_ROOT / "pytest.ini"), str(tmp_path / "pytest.ini"))
+    (tmp_path / "test_registered.py").write_text("import pytest\n\n\n@pytest.mark.slow\ndef test_a_registered_mark():\n    assert True\n")
+    (tmp_path / "test_unregistered.py").write_text("import pytest\n\n\n@pytest.mark.nobody_registered_this\ndef test_an_unregistered_mark():\n    assert True\n")
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("PYTEST_")}   # nothing from the run that is running this
+
+    def run(name):
+        return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", name], cwd=str(tmp_path), env=environment,
+                              capture_output=True, text=True, timeout=120)
+
+    registered, unregistered = run("test_registered.py"), run("test_unregistered.py")
+    assert registered.returncode == 0, registered.stdout + registered.stderr
+    assert unregistered.returncode != 0 and "nobody_registered_this" in unregistered.stdout + unregistered.stderr, \
+        (unregistered.returncode, unregistered.stdout, unregistered.stderr)

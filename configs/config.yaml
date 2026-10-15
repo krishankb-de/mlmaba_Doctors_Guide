@@ -1,0 +1,61 @@
+# Main configuration file - Hydra entry point
+# Override with: python train.py model=hybrid_7b dataset=c4
+
+defaults:
+  - model: hybrid_350m
+  - dataset: wikitext
+  - trainer: single_gpu
+  - callbacks: default
+  - distill: null   # optional; override with distill=stage0_biomedlm or distill=stage1_pubmedbert
+  - _self_
+
+# Global settings
+seed: 42
+debug: false
+
+# Phase 15B-3 (2026-09-14) — how many "best" checkpoints ModelCheckpoint keeps
+# ALONGSIDE last.ckpt. This was hardcoded to 3, so every report-generation run
+# wrote 4 x 2.4 GB = 9.6 GB. NOTHING in this project has ever evaluated a
+# top-k checkpoint: every CHECKPOINT= in H100_SCALING_PLAN.md, every eval
+# command, and every headline number points at last.ckpt. The other three were
+# pure overhead, and they are what exhausted the 200 GiB home quota mid-campaign
+# and killed 3 of the 4 Phase-15B seed arms.
+#
+# Default stays 3 so no existing recipe changes behaviour. Set 0 for any arm
+# whose only consumer is last.ckpt -- i.e. all of them -- to cut 7.2 GB per run.
+save_top_k: 3
+project_name: "hybrid-xmamba"
+experiment_name: "default"
+
+# Weights & Biases logging
+wandb:
+  enabled: false
+  entity: null  # Set your W&B entity
+  project: ${project_name}
+  name: ${experiment_name}
+  tags: []
+
+# Paths
+data_dir: "./data"
+output_dir: "./outputs/${experiment_name}"
+checkpoint_dir: "${output_dir}/checkpoints"
+log_dir: "${output_dir}/logs"
+
+# Contrastive training mode: "simcse" (Stage 1) or "clip" (Stage 2)
+contrastive_mode: simcse
+
+# Phase 10E — decoder init checkpoint for report-generation training
+# (scripts/train_report_generation.py). Same declared-key requirement as
+# config_70m.yaml's lm_checkpoint: Hydra's strict-struct mode rejects a CLI
+# override for an undeclared key (caught live 2026-08-23, job 2478635).
+decoder_checkpoint: null
+
+# Phase 13 — optional fine-tuned image-tower checkpoint for report-generation
+# training (ReportGenerationLightningModule.load_image_encoder()). null keeps
+# stock BiomedCLIP weights (unchanged default behaviour). Declared here for
+# the same reason as decoder_checkpoint above.
+image_encoder_checkpoint: null
+
+# Reproducibility
+deterministic: false
+benchmark: true

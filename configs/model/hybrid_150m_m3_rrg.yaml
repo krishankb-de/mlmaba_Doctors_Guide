@@ -1,0 +1,122 @@
+# 150M Mamba-3 — report-generation (RRG) decoder variant (MAMBA3_PLAN_V2.md V1-B).
+# hybrid_150m_m3.yaml plus EXACTLY the hybrid_150m_v2 -> hybrid_150m_v2_rrg delta (image-prefix
+# keys, image-tower unfreeze, decoder/head LRs, the Phase-15C aux keys at 0.0), the same way
+# transformer_150m_baseline_rrg mirrors it. A parity test pins the delta, so the decoder
+# comparison against both incumbents differs in ONE thing: the sequence-mixing backbone.
+# Loaded from the Mamba-3 Stage-0 checkpoint (V3-A) with the 13D image tower reused unchanged
+# (V3-B) -- the 14A-4 protocol.
+
+model_type: "hybrid_lm"
+
+# Architecture
+vocab_size: 50257
+dim: 768
+num_layers: 12
+layer_pattern: ["mamba3", "mamba3", "mamba3", "mamba3", "mlstm", "mlstm", "mlstm", "mamba3", "mamba3", "mamba3", "mamba3", "mamba3"]
+
+# Mamba-1 parameters — retained so this config still resolves against HybridConfig, but unused:
+# no `mamba` layers remain in the pattern above.
+state_size: 16
+conv_size: 4
+expand_factor: 2
+dt_rank: null
+use_fast_path: true
+
+# Operator selection (MAMBA3_PLAN_V2.md V1-E). Declared explicitly in every model yaml so no
+# config inherits the dataclass default silently: "legacy" reproduces every checkpoint trained
+# before 2026-09 byte-for-byte (including the divide-and-clamp defect, analysis/scan_error_bound.md);
+# "exact" is the division-free fix (M1-E / M1-H). The M7 screen and every published number ran legacy.
+scan_impl: "legacy"
+# V2-D (2026-09-17, array 2552165): A2x advanced -- the Stage-0 backbone this decoder loads is trained
+# with the mLSTM recurrence corrected (val PPL 15.566 / 15.788 vs A2's 16.708 / 16.376). This flag has no
+# parameters, so a legacy decoder would load that checkpoint with Missing keys: 0 and silently run a
+# different operator. Deliberately differs from hybrid_150m_m3.yaml, which still defines the M7 arms.
+# Parity test: test_v3_decoder_config_runs_the_operator_its_stage0_arm_trained_with.
+tfla_impl: "exact"
+
+# Mamba-3 parameters. Every flag here is the Mamba-2 reduction; the ablation arms override them.
+mamba3_d_state: 128        # 8x the Mamba-1 setting, +1.4% params (B/C shared across heads)
+mamba3_head_dim: 64        # -> nheads = 1536 / 64 = 24
+mamba3_ngroups: 1          # multi-value attention: one B/C for all heads
+mamba3_chunk_size: 64
+mamba3_use_conv: true      # dropped as an arm at M5, not by default
+mamba3_conv_size: 4
+mamba3_use_trapezoid: false   # M3 arm
+mamba3_use_rope: false        # M4 arm
+mamba3_rope_fraction: 0.5
+mamba3_theta_max: 1.0      # per-token angular rate cap; see the M7-B rope collapse
+mamba3_dt_min: 1.0e-3      # Delta ~ logU[dt_min, dt_max] at init
+mamba3_dt_max: 1.0e-1
+mamba3_dt_init_floor: 1.0e-4
+mamba3_bc_bias: "none"        # M5 arm ("one_init" is the paper's setting)
+mamba3_mimo_rank: 1           # plumbed, never run (decision 3)
+mamba3_a_mode: "static"       # "data_dependent" is Mamba-3's own default
+mamba3_a_floor: 1.0e-4
+mamba3_dt_limit: 1.0          # replaces the RMSNorm that used to bound Delta by accident
+mamba3_use_outproj_norm: false
+
+# mLSTM parameters
+head_dim: 64           # keep 64 (matrix state ∝ head_dim²); num_heads scales instead
+num_heads: 12          # 768 / 64 = 12
+use_tfla: true
+proj_factor: 2
+
+# sLSTM parameters (unused by this pattern; kept for config completeness)
+slstm_hidden_dim: 768
+slstm_num_heads: 4
+use_exponential_gate: true
+
+# Shared parameters
+norm_type: "rms"
+use_mlp: true
+mlp_ratio: 4.0
+
+# Training parameters
+max_position_embeddings: 1024
+dropout: 0.1
+initializer_range: 0.02
+
+# Generation parameters
+use_cache: true
+tie_word_embeddings: false
+
+use_gradient_checkpointing: false
+proj_head_dropout: 0.1
+norm_topology: hybrid
+pooling_strategy: attention
+
+# Phase 10B — image prefix
+image_patch_dim: 768
+prefix_k: 32
+
+# Phase 10C — image-tower unfreeze (0 = frozen, the default until a Phase-9
+# best contrastive checkpoint exists). Read via ReportGenerationLightningModule
+# .load_image_encoder(); must be declared here (not just via cfg.model.get(...)
+# defaults in train_report_generation.py) since train_report_generation_h100.sh
+# sets both via a Hydra CLI override, which fails under strict-struct mode
+# against an undeclared key -- caught live 2026-08-23, job 2478622, smoke run.
+vit_unfreeze_blocks: 0
+vit_lr: 1.0e-6
+
+# Optimization — separate decoder/head LRs (see ReportGenerationLightningModule).
+# 150M is spike-fragile (H100_SCALING_PLAN.md): gradient_clip_val=0.5, not 1.0.
+decoder_lr: 1.0e-5
+head_lr: 3.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+max_steps: 10000
+gradient_clip_val: 0.5
+
+distill: null
+
+# Phase 15C — auxiliary multi-label CheXpert loss (supervisor item 2 of
+# 2026-09-13). aux_lambda scales a BCEWithLogitsLoss on a 14-way head over the
+# MEAN-POOLED image prefix; the head is discarded at decode time (loaded
+# strict=False, lands in `unexpected`), so the evaluated network stays
+# parameter-identical to 13D. 0.0 = the head is never constructed, which
+# keeps both the state dict and the RNG stream identical to every arm in
+# 15B-4's seed band. Declared here (not only as a cfg.model.get default)
+# because train_report_generation_h100.sh sets both via Hydra CLI override,
+# and strict-struct mode rejects an undeclared key.
+aux_lambda: 0.0
+aux_pos_weight_cap: 10.0

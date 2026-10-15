@@ -1,0 +1,97 @@
+# 150M hybrid v2 — report-generation (RRG) decoder variant (Phase 10, H100_SCALING_PLAN.md).
+# Identical architecture to hybrid_150m_v2.yaml (same decoder, checkpoint-loadable
+# against a Stage-0/contrastive-trained 150M v2 backbone per Phase 10D) plus the
+# image-prefix keys ReportGenerationLightningModule reads:
+#   image_patch_dim — ViT patch embedding dim (768 for BiomedCLIP ViT-B/16)
+#   prefix_k        — number of image-prefix tokens (ImagePrefixMapper's k);
+#                      the depth-analogue lever Phase 10B sweeps {8, 32, 64} over.
+# pooling_strategy/proj_head_dropout are HybridTextEncoder-only keys, irrelevant
+# to bare HybridLanguageModel generation — kept for schema parity, harmless.
+
+model_type: "hybrid_lm"
+
+# Architecture — identical to hybrid_150m_v2.yaml
+vocab_size: 50257
+dim: 768
+num_layers: 12
+layer_pattern: ["mamba", "mamba", "mamba", "mamba", "mlstm", "mlstm", "mlstm", "mamba", "mamba", "mamba", "mamba", "mamba"]
+
+# Mamba parameters
+state_size: 16
+conv_size: 4
+expand_factor: 2
+dt_rank: null
+use_fast_path: true
+
+# Operator selection (MAMBA3_PLAN_V2.md V1-E). Declared explicitly in every model yaml so no
+# config inherits the dataclass default silently: "legacy" reproduces every checkpoint trained
+# before 2026-09 byte-for-byte (including the divide-and-clamp defect, analysis/scan_error_bound.md);
+# "exact" is the division-free fix (M1-E / M1-H). The M7 screen and every published number ran legacy.
+scan_impl: "legacy"
+tfla_impl: "legacy"
+
+# mLSTM parameters
+head_dim: 64
+num_heads: 12
+use_tfla: true
+proj_factor: 2
+
+# sLSTM parameters (unused by this pattern; kept for config completeness)
+slstm_hidden_dim: 768
+slstm_num_heads: 4
+use_exponential_gate: true
+
+# Shared parameters
+norm_type: "rms"
+use_mlp: true
+mlp_ratio: 4.0
+
+# Training parameters
+max_position_embeddings: 1024
+dropout: 0.1
+initializer_range: 0.02
+
+# Generation parameters
+use_cache: true
+tie_word_embeddings: false
+
+use_gradient_checkpointing: false
+proj_head_dropout: 0.1
+norm_topology: hybrid
+pooling_strategy: attention
+
+# Phase 10B — image prefix
+image_patch_dim: 768
+prefix_k: 32
+
+# Phase 10C — image-tower unfreeze (0 = frozen, the default until a Phase-9
+# best contrastive checkpoint exists). Read via ReportGenerationLightningModule
+# .load_image_encoder(); must be declared here (not just via cfg.model.get(...)
+# defaults in train_report_generation.py) since train_report_generation_h100.sh
+# sets both via a Hydra CLI override, which fails under strict-struct mode
+# against an undeclared key -- caught live 2026-08-23, job 2478622, smoke run.
+vit_unfreeze_blocks: 0
+vit_lr: 1.0e-6
+
+# Optimization — separate decoder/head LRs (see ReportGenerationLightningModule).
+# 150M is spike-fragile (H100_SCALING_PLAN.md): gradient_clip_val=0.5, not 1.0.
+decoder_lr: 1.0e-5
+head_lr: 3.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+max_steps: 10000
+gradient_clip_val: 0.5
+
+distill: null
+
+# Phase 15C — auxiliary multi-label CheXpert loss (supervisor item 2 of
+# 2026-09-13). aux_lambda scales a BCEWithLogitsLoss on a 14-way head over the
+# MEAN-POOLED image prefix; the head is discarded at decode time (loaded
+# strict=False, lands in `unexpected`), so the evaluated network stays
+# parameter-identical to 13D. 0.0 = the head is never constructed, which
+# keeps both the state dict and the RNG stream identical to every arm in
+# 15B-4's seed band. Declared here (not only as a cfg.model.get default)
+# because train_report_generation_h100.sh sets both via Hydra CLI override,
+# and strict-struct mode rejects an undeclared key.
+aux_lambda: 0.0
+aux_pos_weight_cap: 10.0

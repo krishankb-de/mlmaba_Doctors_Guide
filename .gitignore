@@ -1,0 +1,110 @@
+# .gitignore for hybrid-xmamba project
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+# *.ipynb  # Allow tracking of important Colab setup notebooks
+# !Colab_Setup.ipynb  # Keep setup notebook tracked
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+
+# Data
+data/cache/
+data/processed/
+data/*.json
+data/*.txt
+*.hdf5
+*.h5
+
+# Outputs
+outputs/
+checkpoints/
+logs/
+wandb/
+lightning_logs/
+
+output_willi_server/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Hydra
+.hydra/
+multirun/
+
+# Compiled CUDA
+*.o
+*.cu.o
+
+# Documentation: markdown is ignored unless it is listed here
+*.md
+!README.md
+!app/README.md
+!CLAUDE.md
+
+# Local only, never committed: notes and plans kept beside the checkout, and Claude Code's personal memory file
+/.local/
+/.staging/
+/CLAUDE.local.md
+
+# The local PhysioNet MIMIC-CXR-JPG build. DUA-
+# credentialed data — must never be committed/pushed/published, regardless
+# of whether it lands inside the repo tree by accident (it should live under
+# /sc/home/$USER/dataset/, outside it, but this guard is belt-and-suspenders).
+dataset/mimic_full/
+mimic_full/
+*.parquet
+mimic-cxr-reports.zip
+mimic-cxr-2.0.0-*.csv.gz
+IMAGE_FILENAMES
+legacy_gallery_hashes.txt
+.physionet_session
+*.physionet_session
+
+# The per-user cluster settings, and the stamp `chat_remote.sh sync` writes before each rsync.
+scripts/chat_cluster.env
+.sync_stamp

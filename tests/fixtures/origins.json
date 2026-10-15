@@ -1,0 +1,30 @@
+{
+ "_comment": "CHAT_UI_PLAN.md P9-B: the one rule for an origin, which the page's API server setting (app/static/app.js normalizeApiServer) and the server's --cors-origin flag (app/cli.py normalize_origin) both follow: https://host[:port] for any host, http://localhost, 127.0.0.1 or [::1] (with an optional port) for this computer only, and nothing after the port but an optional /. An accepted value comes back as a browser sends it in an Origin header: lower case, no default port, no trailing slash. tests/test_chat_server_cli.py and tests/frontend/app.test.mjs read this file. An empty value is not here: to the page it is its own origin, to the flag it is refused. Every host is synthetic (.example, documentation addresses) but the GitHub Pages one.",
+ "accepted": [
+  ["http://localhost", "http://localhost"],
+  ["http://localhost:8000", "http://localhost:8000"],
+  ["http://localhost:8010/", "http://localhost:8010"],
+  ["HTTP://LocalHost:8000", "http://localhost:8000"],
+  ["http://127.0.0.1:8000", "http://127.0.0.1:8000"],
+  ["http://[::1]:8000", "http://[::1]:8000"],
+  ["http://localhost:80", "http://localhost"],
+  ["https://krishankb-de.github.io", "https://krishankb-de.github.io"],
+  ["https://KrishanKB-de.GitHub.io/", "https://krishankb-de.github.io"],
+  ["https://pages.example:8443", "https://pages.example:8443"],
+  ["https://pages.example:443", "https://pages.example"],
+  ["https://localhost:8000", "https://localhost:8000"],
+  ["https://203.0.113.7", "https://203.0.113.7"],
+  ["https://xn--bcher-kva.example", "https://xn--bcher-kva.example"],
+  [" https://pages.example\t", "https://pages.example"]
+ ],
+ "refused": [
+  "http://pages.example", "http://192.168.1.10:8000", "http://127.0.0.2", "http://0.0.0.0:8000", "http://localhost.:8000",
+  "https://pages.example/repo", "https://pages.example//", "https://pages.example/?q=1", "https://pages.example?q", "https://pages.example#top",
+  "https://user@pages.example", "https://user:pw@pages.example", "ftp://pages.example", "ws://localhost:8000", "localhost:8000",
+  "//localhost:8000", "http:/localhost", "http:localhost:8000", "https://", "https://:8000", "https://pages.example:0",
+  "https://pages.example:65536", "https://pages.example:08000", "https://pages.example:", "https://pa ges.example", "https://*.github.io",
+  "https://pages.example\\", "https://pages_x.example", "https://-pages.example", "https://pages-.example", "https://127.1", "https://1.2.3",
+  "https://256.1.1.1", "https://010.0.0.1", "https://[::2]", "http://[0:0:0:0:0:0:0:1]", "https://bücher.example", "https://pages.example%2f",
+  "javascript:alert(1)", "data:,x", "https://pages.example.", "null", "https://pages.example:8000:8000", "https://pages.exampleK"
+ ]
+}

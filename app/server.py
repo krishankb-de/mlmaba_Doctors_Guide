@@ -1,0 +1,1375 @@
+"""The chat app's HTTP API (CHAT_UI_PLAN.md P3-D): the app factory, routes, auth, scoping and the SSE bridge.
+
+One process, one worker thread: a turn is checked, queued on the Worker (app/pipeline.py) and streamed back as
+Server-Sent Events. Every check that can refuse a turn runs before the stream opens and answers with error_body; once
+the stream is open, a failure is an error event. A client that disconnects only stops the forwarding: the turn keeps
+running and storing its events, and GET /v1/messages/{id}?after=<seq> picks them up (D7).
+
+Every route carries its own OpenAPI summary, description and refusals (P3-E), so /docs is the API reference.
+
+Serving: `python -m app.server` (P7-B; the command line is app/cli.py, the cluster jobs are scripts/serve_chat_h100.sh and its GPU twin).
+Development: venv/bin/uvicorn --factory app.server:create_app
+"""
+import asyncio
+import hashlib
+import hmac
+import html
+import io
+import ipaddress
+import json
+import logging
+import os
+import re
+import sqlite3
+from contextlib import asynccontextmanager, redirect_stdout
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, AsyncIterator, Callable, Dict, List, Literal, Optional, Sequence, Tuple
+
+from fastapi import Depends, FastAPI, File, Form, Header, Query, UploadFile
+from fastapi import Path as PathParam
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from PIL import Image
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.exceptions import HTTPException
+from starlette.requests import Request
+
+from app import retention
+from app.commands import COMMAND_HELP, is_question, parse_command
+from app.engine import REPO_ROOT, Engine, build_engine
+from app.gallery import Gallery, GalleryMismatch
+from app.hardening import (FREE_NOTE_MAX_CHARS, FREE_TURN, NO_RESPONSE, RATE_CAPACITY, RATE_LIMITED, RATE_WINDOW_S, REQUEST_ID_HEADER, TURN_PATH,
+                           RequestLog, TurnLimiter, TurnRateLimit, configure_request_log)
+from app.imaging import (MAX_UPLOAD_BYTES, MIN_SIDE, TOO_LARGE_MSG, UploadError, load_upload, model_input_image, sniff_format,
+                         thumbnail_jpeg)
+from app.labels import LabelerClient, LabelerUnavailable, RuleLabeler
+from app.pipeline import (TEST_IMAGE_MSG, Pipeline, PublishedDumps, TurnJob, Worker, compare_available, compare_partner, image_urls,
+                          named_labels)
+from app.redact import redact_card, redact_event
+from app.schemas import DISCLAIMER, Options, error_body
+from app.store import Store
+
+log = logging.getLogger("app.server")
+
+MODEL_CHECKPOINTS = {   # resolved against the repo root (ruling 1): the published models, each named after its model config
+    "hybrid_150m_m3_rrg": "outputs/h100_report_gen_m3_tower13d_s42/checkpoints/last.ckpt",
+    "hybrid_150m_v2_rrg": "outputs/h100_report_gen_full_ext_4gpu_tower13d/checkpoints/last.ckpt",
+}
+# P9-G5a: the model trained to end its reports (P9-G3) keeps its files in the app's own home, not in the thesis checkout (R8): `checkpoint` is
+# resolved against CHAT_HOME, `config` is the model config it was trained with (so the name is the registry's, not the config's), and `note` is
+# one static line about how it measured, which its card carries. The note is aggregate numbers, so it is no Class R data and a public card keeps
+# it. Whether the model is `eos_trained` is read from its run's own metadata, as for every model: the registry never says it. What it does say,
+# with `eos`, is what the entry IS, an EOS model, and a start whose card does not agree is refused (fix 1): served without its stop, such an
+# entry would carry the note above and decode like a published model.
+# P9-G5b: `drift_note` is the entry's own drift sentence, which its card and its generate stage carry in place of the server's --drift-note. That
+# flag is the P1-D measurement (CPU decode against the published GPU decode, 20/20 probe studies), made for the published models, so only their
+# cards carry it (_engines); this model was never probed, and says so, on a CPU server: on `--device cuda` there is no CPU decode to say it of,
+# and its card carries none, as a published card carries none when the flag is empty (P9-G5b fix 1).
+EOS_MODEL_NOTE = ("EOS-trained: at a 200-token budget, 2,662 of 2,663 test reports end by themselves (44.2 words on average). Against the "
+                  "published model: ROUGE-L 0.1948 vs 0.1920, CheXbert-14 micro F1 0.4464 vs 0.4661; BLEU and all four CheXbert F1 scores are "
+                  "significantly lower.")
+EOS_DRIFT_NOTE = "This model's CPU decode was not probed against a GPU decode."
+HOME_MODELS = {
+    "hybrid_150m_m3_rrg_eos": {"config": "hybrid_150m_m3_rrg", "checkpoint": "models/report_gen_m3_eos_s42/checkpoints/last.ckpt",
+                               "note": EOS_MODEL_NOTE, "drift_note": EOS_DRIFT_NOTE, "eos": True},
+}
+MODEL_NAMES = tuple(MODEL_CHECKPOINTS) + tuple(HOME_MODELS)   # every model a server can be asked for; the first one asked for is its default
+STATIC_DIR = Path(__file__).resolve().parent / "static"   # the page; P4 builds it
+MAX_REQUEST_BYTES = MAX_UPLOAD_BYTES + 1024 * 1024        # the image and room for the form's other fields
+PING_S = 15.0                                             # a keep-alive comment while no event comes
+CLIENT_ID = re.compile(r"[\x21-\x7e]{1,128}")             # visible ASCII: it scopes by equality only
+ERROR_KINDS = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
+               404: "not_found_error", 405: "invalid_request_error", 413: "validation_error", 422: "validation_error",
+               429: "overloaded_error", 500: "internal_error", 503: "unavailable_error"}   # 413 as P8-A's test expects; 403 as every public
+                                                                  # test-split refusal (fix-1); 503 when the gallery or the labeller is not there
+SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+NO_CACHE = {"Cache-Control": "no-cache"}   # the page and its files: revalidate (ETag, Last-Modified) after a redeploy
+INTERNAL_ERROR_MSG = "Internal server error."   # all a 500 says: no exception text, no trace (the server log has them); the id is in X-Request-Id
+NO_IMAGE_MSG = "Attach an X-ray first."
+NO_CACHE_MSG = "{} has no O(1) decode cache; set cached_decode=false."   # the engine's own wording (P2-D)
+NO_COMPARE_MSG = "Compare needs a Mamba-3 model and the 13D model on this server."   # P9-F: options.compare with no partner served
+NO_TOKEN_MSG = "This server has no token; connect through loopback."
+BUSY_MSG = "The server is busy with {} turns; try again shortly."
+PUBLIC_TEST_SPLIT_MSG = "Test-split studies are not available in public mode."
+NO_GALLERY_MSG = "Test-split studies need the gallery, which this server has not loaded."
+NO_RETRIEVAL_MSG = "Retrieval needs the gallery, which this server has not loaded."
+NO_LABELER_MSG = "Labels need a CheXbert labeller, which this server does not have."
+LABELER_DOWN_MSG = "The CheXbert labeller did not answer; try again shortly."
+BOTH_IMAGES_MSG = "Send an image or a test row, not both."
+TEXT_MAX_CHARS = 20100   # a turn's text: the `reference` option's 20,000 characters (app/schemas.py) and room for the command word ("reference: ")
+TEXT_TOO_LONG_MSG = "The text is too long: at most {:,} characters.".format(TEXT_MAX_CHARS)   # a 422, in either mode, before anything is stored
+RETRIEVE_FAILED_MSG = "The retrieval could not be run."
+NO_TURN_IMAGE_MSG = "This turn has no image."
+IMAGE_GONE_MSG = "This turn's image is no longer stored."
+PUBLIC_ORIGINAL_MSG = "Public mode serves an upload's thumbnail and model input, not its original."
+PUBLIC_GALLERY_MSG = "Gallery images are not available in public mode."
+PUBLIC_SAVE_MSG = "Saving an export on the server is not available in public mode."   # P9-C
+SAVE_EXPORT_FAILED_MSG = "Could not save the export."   # all a 500 of the save route says: no path, no exception text (the log has the class)
+NO_GALLERY_ROW_MSG = "No such gallery image."
+GALLERY_IMAGE_MSG = "Could not read the gallery image."
+UPLOAD_CACHE = {"Cache-Control": "private, max-age=3600"}   # a user's own upload, back to that user: a reload need not fetch it again
+NO_STORE = {"Cache-Control": "no-store"}                     # an image of the dataset (MIMIC): never kept by a browser or a proxy (R1)
+IMAGE_TYPES = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}   # sniff_format's names
+UPLOAD_TYPES = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}   # the stored files' extensions (original.<ext>)
+MAX_LABEL_CHARS = 20000   # what the labeller service takes in one request (app/labeler.py answers 422 above it)
+TINY_GALLERY_REFERENCE = "phase6_mimic_20260101T000000Z.json"   # the reference result that decides the tiny gallery's gate
+PLACEHOLDER = ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>CXR Report Chat</title></head>"
+               "<body><p>{}</p><p>The chat page is not built yet. The API is under <code>/v1/</code>, and its "
+               "reference is at <a href=\"/docs\">/docs</a>.</p></body></html>")
+
+# ---- the OpenAPI reference (P3-E): what /docs and /openapi.json say. Metadata only: no route reads any of it. ------
+UPLOAD_MB = MAX_UPLOAD_BYTES // (1024 * 1024)
+REQUEST_MB = MAX_REQUEST_BYTES // (1024 * 1024)
+# What a request over the cap is told (P8 follow-up). A route that takes an image (the turn route and /v1/retrieve) says the image is too large,
+# which is what a request that size is there; any other route takes no image, so it says the request is (a 22 MB JSON body for /v1/label was
+# told "Image is larger than 20 MB."). The reference's 413 example for each route is the message it really sends.
+TOO_LARGE_REQUEST_MSG = "The request is larger than {} MB.".format(REQUEST_MB)
+RETRIEVE_PATH = "/v1/retrieve"   # the other route that takes an image; the turn route's path is hardening.TURN_PATH
+# The published protocol as the options form field's string. FastAPI drops Form(openapi_examples=...) from the spec (a
+# form's fields become one body model), so it is the field's own `examples`; P8-E's README walkthrough copies it.
+OPTIONS_EXAMPLE = ('{"decode": "beam", "beam_size": 3, "max_new_tokens": 100, "cached_decode": true, "compile": false, '
+                   '"k_images": 4, "k_reports": 3, "label": true, "reference": null, "display_repair": false, '
+                   '"stop_on_repeat": false}')
+# GET /v1/models as /docs shows it (test_app_openapi pins its keys to the real answer): `features` says which stages this server
+# runs, so a client can tell a skipped stage from one it switched off.
+MODELS_EXAMPLE = {"default_model": "hybrid_150m_m3_rrg", "mode": "private", "allow_compile": False,
+                  "features": {"retrieval": False, "labels": False},
+                  "models": [{"name": "hybrid_150m_m3_rrg", "prefix_k": 32, "cached_decode_available": True, "eos_trained": False,
+                              "device": "cpu", "features": {"retrieval": False, "labels": False}}]}
+# GET /healthz as /docs shows it (test_app_openapi pins its keys to the real answer). code_version and started_at (P4-H A2) tell a server
+# that runs older code than the checkout: the dev server of 2026-10-09 had, and its turns ended "Internal error (ImportError)". retention_days
+# (P8-B) is how long a session is kept: the page's banner says it. The public-demo tests of tests/test_chat_tunnel.py read this dict (its `mode`).
+HEALTHZ_EXAMPLE = {"status": "ok", "mode": "private", "default_model": "hybrid_150m_m3_rrg", "turns_in_flight": 0, "queue_cap": 4,
+                   "retention_days": 45, "code_version": "a8e7efe", "started_at": "2026-10-09T14:24:00+00:00"}
+
+
+def _option_ranges() -> str:
+    """"beam_size 1-8, max_new_tokens 16-200, ...", read from Options so the reference cannot drift from it. A field
+    with one bound only reads "up to N" or "from N"; one with none is left out."""
+    ranges = []
+    for name, p in Options.model_json_schema()["properties"].items():
+        low, high = p.get("minimum"), p.get("maximum")
+        if low is not None and high is not None:
+            ranges.append("{} {}-{}".format(name, low, high))
+        elif high is not None:
+            ranges.append("{} up to {}".format(name, high))
+        elif low is not None:
+            ranges.append("{} from {}".format(name, low))
+    return ", ".join(ranges)
+
+
+API_DESCRIPTION = (
+    DISCLAIMER + " Attach a chest X-ray to a session: the turn streams its stages and the generated report as "
+    "Server-Sent Events, and sessions are stored, replayed and exported.\n\n"
+    "**Access.** When the server has a token, every `/v1` route needs `Authorization: Bearer <token>` (401 without "
+    "it); `/healthz` stays open. A server with no token answers loopback connections only (403 from anywhere else). "
+    "In public mode the session and message routes also need an `X-Client-Id` header (400 without it) and show only "
+    "that client's data.\n\n"
+    "**Errors.** A refusal is JSON, `{\"type\": \"error\", \"error\": {\"type\": kind, \"message\": text}}`, with the "
+    "kind of its status: " + ", ".join("{} {}".format(status, kind) for status, kind in ERROR_KINDS.items()) + ". An unknown "
+    "route, a wrong method and a failure of the server are refused the same way, and a 422 never repeats a value that was sent "
+    "(it names the key that was wrong, never what the key held), and a 500 never says what went wrong inside.\n\n"
+    "**Limits.** A request over {cap} MB is refused with 413 before it is read (an image is capped at {image} MB). The text of a "
+    "turn is at most {text:,} characters: a longer one is refused with 422. In public "
+    "mode a client (`X-Client-Id`) may start {turns} turns per {minutes} minutes: the next is a 429 `{kind}` with `Retry-After`, "
+    "in whole seconds. A turn that is refused for any other reason costs the client nothing, and so does a note that runs no "
+    "model and is at most {free:,} characters (text with no image that is no command: the answer is a warning and no stage runs); "
+    "a longer note counts as a turn.\n\n"
+    "**Request ids.** Every response, errors included, carries `X-Request-Id`: the caller's own when it is 1 to 64 letters, "
+    "digits, `.`, `_` or `-`, else a new one. The server logs one JSON line per request (time, id, method, path, status, "
+    "milliseconds, client) with no query string, no body and no header but `X-Client-Id`.".format(
+        cap=REQUEST_MB, image=UPLOAD_MB, text=TEXT_MAX_CHARS, free=FREE_NOTE_MAX_CHARS, turns=RATE_CAPACITY, minutes=int(RATE_WINDOW_S // 60),
+        kind=RATE_LIMITED))
+CLIENT_ID_DOC = ("Public mode only: names the caller, 1 to 128 visible ASCII characters, and scopes its sessions and "
+                 "messages. A private server ignores it.")
+XRAY_DOC = "The chest X-ray: PNG, JPEG or WEBP, at most {} MB, each side at least {} px.".format(UPLOAD_MB, MIN_SIDE)
+IMAGE_DOC = XRAY_DOC + (" Leave it out to reuse the session's latest image; a session with no image yet answers 422.")
+TEXT_DOC = ("A command that changes this turn's options, or a note kept with the turn. " + COMMAND_HELP + " Sent "
+            "without an image, a command (or no text) runs the session's latest image again, and any other text is "
+            "answered with the command list and no model runs; a session with no image yet answers a text-only turn "
+            "with a 422. The text is at most {:,} characters (room for a `reference:` command with the longest reference "
+            "the options take): a longer one is a 422, in either mode, before anything is stored.".format(TEXT_MAX_CHARS))
+OPTIONS_DOC = ("The turn's options as a JSON object with the keys " + ", ".join(Options.model_fields) + ". A key left "
+               "out takes its default, the published protocol; the ranges are " + _option_ranges() + ". An unknown "
+               "key or a value out of range is a 422, and anything that is not a JSON object a 400. `stop_on_repeat` ends "
+               "decoding at the first sentence that repeats an earlier one word for word (case and spacing aside): the "
+               "generate stage then reports `stopped: repeat`, and `truncated_mid_sentence` is false even when the raw "
+               "`report` ends in the start of the next sentence; left out, the whole `max_new_tokens` is decoded, as in "
+               "the published protocol. A model whose card says `eos_trained: true` was trained to end its reports: its "
+               "decoding also stops where it does, whatever `stop_on_repeat` says, and the generate stage then reports "
+               "`stopped: eos`. If `stop_on_repeat` ends the search after a report has already ended, that report is the "
+               "answer and the stop is `eos` too. `compare` decodes the X-ray a second time, with the partner of the turn's model and "
+               "the same options, after the first: a Mamba-3 model's partner is the 13D model, and the 13D model's is the server's "
+               "default when that is a Mamba-3 model, else the EOS-trained one, else the published one. The second report streams as "
+               "content block `index` 1, and its stage facts, labels and ending come under `compare` in the encode, generate and label "
+               "details and in `message_start` and `message_stop`; retrieval and the score stay the first report's. For a turn that runs "
+               "a model, a server that does not serve a Mamba-3 model and the 13D model answers 422 (\"" + NO_COMPARE_MSG + "\"), and "
+               "so does one whose partner cannot decode as asked (the decode cache); a question or a note runs no model and is answered "
+               "as usual. `reference` and `test_row` work in private mode only. A command in `text` "
+               "is applied on top.")
+REFUSALS = {   # what a status means in the reference; a route that can answer it declares it with _refusals()
+    400: "The request is malformed: `options` is not a JSON object, or in public mode `X-Client-Id` is missing or "
+         "invalid.",
+    403: "A test-split study, a gallery image or an upload's original was asked for in public mode, or an export was to be saved on the server.",
+    404: "The session, message, image or gallery row does not exist or was deleted, or in public mode it belongs to another client.",
+    413: "The image is over the {} MB upload limit, or the whole request is over {} MB, which is refused before it is read.".format(
+        UPLOAD_MB, REQUEST_MB),
+    422: "The request failed validation: a parameter, an option, the model or the image cannot be used, or there is "
+         "no image to run.",
+    429: "The server is busy: its queue of accepted turns is full.",
+    500: "The server could not store the image, read a test-split or gallery image, run the retrieval, or save an export.",
+    503: "What the route needs is not on this server or does not answer: the retrieval gallery or the CheXbert labeller.",
+}
+STREAM_RESPONSE = {200: {   # the turn is Server-Sent Events, not JSON
+    "description": "The turn's events, one frame each: `event: <name>`, then `data: <one-line JSON>` with a `seq` that "
+                   "counts 1, 2, ... without gaps. The names are `message_start`, `stage_start`, `stage_end`, "
+                   "`content_block_start`, `content_block_delta`, `content_block_stop`, `warning`, `error` and "
+                   "`message_stop`. The stream ends with a `message_stop` whose `status` is `done`, `error` or "
+                   "`aborted` (a cancelled turn). A failure after this 200 has opened is no HTTP status: it arrives as "
+                   "an `error` event followed by a `message_stop` with status `error`. A compare turn (`compare`) streams a "
+                   "second report as content block `index` 1, after the first one's `content_block_stop` and inside the same "
+                   "`generate` stage. A `: ping` comment goes out every {:g} s while no event comes.".format(PING_S),
+    "headers": {"X-Message-Id": {"description": "The new message's id, sent before the first event.",
+                                 "schema": {"type": "string"}}},
+    "content": {"text/event-stream": {"schema": {"type": "string"}}}}}
+VARIANT_DOC = ("Which picture: `original` (the bytes as uploaded), `thumb` (a JPEG at most 512 px on its long side) or `model_input` "
+               "(the 224x224 PNG the model saw).")
+IMAGE_RESPONSE = {200: {   # an image, not JSON
+    "description": "The image: PNG, JPEG or WEBP, as its content type says.",
+    "headers": {"Cache-Control": {"description": "`private, max-age=3600` for a user's own upload; `no-store` for an image of the "
+                                                 "dataset (a test-split study or a gallery image).", "schema": {"type": "string"}}},
+    "content": {kind: {"schema": {"type": "string", "format": "binary"}} for kind in IMAGE_TYPES.values()}}}
+EXPORT_RESPONSE = {200: {   # JSON is FastAPI's default; Markdown is the other format
+    "description": "The session as a file: JSON (the default) or Markdown.",
+    "headers": {"Content-Disposition": {"description": "An attachment named session-<id>.json or session-<id>.md.",
+                                        "schema": {"type": "string"}}},
+    "content": {"text/markdown": {"schema": {"type": "string"}}}}}
+# POST /v1/sessions/{id}/export/save as /docs shows it (P9-C; test_app_export_save pins its keys to the real answer): the file the export was written to,
+# and never the export.
+SAVE_EXPORT_EXAMPLE = {"saved": "session-s_0198a4f1c2b3d4e5f60718-20261013T181530Z.json", "bytes": 48213}
+SAVE_EXPORT_RESPONSE = {200: {
+    "description": "The file the export was written to, under exports/ in the server's home: its name, which the server chose, and its size in bytes.",
+    "content": {"application/json": {"example": SAVE_EXPORT_EXAMPLE}}}}
+
+
+def _refusals(messages: Dict[int, str], token: bool = True, client_id: bool = True) -> Dict[Any, Dict[str, Any]]:
+    """responses= for a route: each status it refuses with, as the error envelope carrying the message it really sends,
+    and a default for what is answered before the route runs. That is 403 for a tokenless server reached off loopback
+    (every route), 401 for a missing token (token: every /v1 route) and 400 for a missing client id in public mode
+    (client_id: the session and message routes, not /v1/models). A route with a default is not given FastAPI's own
+    422, whose HTTPValidationError body this API never sends. Every route also declares 413 (P8-A): the cap on a request's
+    body is answered before routing, so any route can say it, with the message the middleware sends (_too_large: that the
+    request is too large, TOO_LARGE_REQUEST_MSG, unless the route takes an image); a route that takes an image gives that
+    status itself, with the image message."""
+    messages = dict(messages)
+    messages.setdefault(413, TOO_LARGE_REQUEST_MSG)
+    out: Dict[Any, Dict[str, Any]] = {
+        status: {"description": "{}: {}".format(ERROR_KINDS[status], REFUSALS[status]),
+                 "content": {"application/json": {"example": error_body(ERROR_KINDS[status], message)}}}
+        for status, message in sorted(messages.items())}
+    guards = []
+    if token:
+        guards.append("401 when the server has a token and the request lacks it")
+    if client_id:
+        guards.append("400 in public mode without a valid `X-Client-Id`")
+    guards.append("403 from a tokenless server to a connection that is not loopback")
+    example = (error_body(ERROR_KINDS[401], "Missing or wrong token: send Authorization: Bearer <token>.") if token
+               else error_body(ERROR_KINDS[403], NO_TOKEN_MSG))
+    out["default"] = {"description": "Any other refusal, in the same envelope: " + ", ".join(guards) + ".",
+                      "content": {"application/json": {"example": example}}}
+    return out
+
+
+def _with_rate_limit(responses: Dict[Any, Dict[str, Any]]) -> Dict[Any, Dict[str, Any]]:
+    """The turn route's 429 is two refusals (P8-A): a full queue, which is its example, and in public mode this client's own rate limit,
+    which sends Retry-After."""
+    refusal = responses[429]
+    refusal["description"] += (" Or, in public mode, `{}`: the client has started its {} turns of the last {} minutes, and `Retry-After` "
+                               "says when the next is allowed.").format(RATE_LIMITED, RATE_CAPACITY, int(RATE_WINDOW_S // 60))
+    refusal["headers"] = {"Retry-After": {"description": "Whole seconds until the client's next turn is allowed; sent with `{}` only.".format(
+        RATE_LIMITED), "schema": {"type": "string"}}}
+    return responses
+
+
+def _with_text_cap(responses: Dict[Any, Dict[str, Any]]) -> Dict[Any, Dict[str, Any]]:
+    """The turn route's 422 is many refusals, and its example is the options' one. This one is the text's (final review, Important 1): a text
+    over TEXT_MAX_CHARS is refused whole, in either mode, before anything is stored."""
+    responses[422]["description"] += ' A text over {:,} characters is refused in either mode with "{}"'.format(TEXT_MAX_CHARS, TEXT_TOO_LONG_MSG)
+    return responses
+
+
+class NewSession(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = ""
+
+
+class LabelText(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1, max_length=MAX_LABEL_CHARS,
+                      description="The report to label, 1 to {:,} characters.".format(MAX_LABEL_CHARS))
+
+
+def sse(event: str, data: Dict[str, Any]) -> str:
+    return "event: {}\ndata: {}\n\n".format(event, json.dumps(data, separators=(",", ":"), ensure_ascii=False))
+
+
+async def _frames(queue: "asyncio.Queue[Optional[str]]") -> AsyncIterator[str]:
+    """The response body of a turn. A client that disconnects only stops this generator: the worker keeps running
+    and storing events, and GET /v1/messages/{id}?after=<seq> picks them up (D7)."""
+    while True:
+        try:
+            frame = await asyncio.wait_for(queue.get(), timeout=PING_S)
+        except asyncio.TimeoutError:
+            yield ": ping\n\n"
+            continue
+        if frame is None:          # the worker finished the turn
+            return
+        yield frame
+
+
+def _push(loop: asyncio.AbstractEventLoop, queue: "asyncio.Queue[Optional[str]]", item: Optional[str]) -> None:
+    """Hand a frame, or the end-of-turn None, from the worker thread to the request's event loop."""
+    try:
+        loop.call_soon_threadsafe(queue.put_nowait, item)
+    except RuntimeError:   # the loop is closed: the event is stored already, and a poll picks it up
+        pass
+
+
+def _error(status: int, message: str, headers: Optional[Dict[str, str]] = None) -> JSONResponse:
+    return JSONResponse(error_body(ERROR_KINDS.get(status, "invalid_request_error"), message), status_code=status,
+                        headers=headers)
+
+
+def _error_for(request: Request, status: int, message: str, headers: Optional[Dict[str, str]] = None) -> JSONResponse:
+    """_error for the exception handlers, carrying the request's id. RequestLog gives every response its id, but the answer to an unhandled
+    exception is sent by Starlette's own error middleware, outside it, so a handler puts the id on its response itself."""
+    response = _error(status, message, headers)
+    request_id = getattr(request.state, "request_id", None)
+    if request_id:
+        response.headers[REQUEST_ID_HEADER] = request_id
+    return response
+
+
+def _declared_length(headers: Headers) -> Optional[int]:
+    """The request's Content-Length; None when it has none, or none that is a number (the server's HTTP layer judges that). A length with more
+    digits than int() reads from a string (4300 on Python 3.11 and later) is no real length: it is over any cap, so it is the cap plus one."""
+    length = headers.get("content-length", "")
+    if not (length.isascii() and length.isdigit()):
+        return None
+    try:
+        return int(length)
+    except ValueError:
+        return MAX_REQUEST_BYTES + 1
+
+
+def _too_large(scope: Dict[str, Any]) -> str:
+    """What a request over the cap is told, by the route it is for: a POST to a route that takes an image (the turn route, /v1/retrieve) is
+    told the image is too large, any other request that the request is (P8 follow-up)."""
+    path = scope.get("path", "")
+    uploads = scope.get("method") == "POST" and (TURN_PATH.fullmatch(path) is not None or path == RETRIEVE_PATH)
+    return TOO_LARGE_MSG if uploads else TOO_LARGE_REQUEST_MSG
+
+
+def _capped(receive: Callable, message: str = TOO_LARGE_MSG) -> Callable:
+    """receive(), refusing a body once more than MAX_REQUEST_BYTES of it have arrived (one sent without a length), with `message`."""
+    seen = 0
+
+    async def capped() -> Dict[str, Any]:
+        nonlocal seen
+        event = await receive()
+        if event["type"] == "http.request":
+            seen += len(event.get("body", b""))
+            if seen > MAX_REQUEST_BYTES:
+                raise HTTPException(413, message)
+        return event
+
+    return capped
+
+
+class _Guard:
+    """ASGI middleware ahead of routing and of any body parsing (FastAPI parses a form before its dependencies).
+
+    R6: with no token, only a connection that arrived on a loopback address is served, whatever host the process was
+    bound to (`uvicorn --factory --host 0.0.0.0` never tells create_app). D23: with a token set, every /v1 path needs
+    Authorization: Bearer <token>. Ruling 4: a request whose Content-Length exceeds MAX_REQUEST_BYTES is refused
+    unread, and a body sent without a length is cut off as it arrives; either way with the message of _too_large (the image
+    is too large for the two routes that take one, the request for every other).
+    """
+
+    def __init__(self, app: Callable, token: Optional[str]):
+        self.app, self.token = app, (token or "").encode()
+
+    async def __call__(self, scope: Dict[str, Any], receive: Callable, send: Callable) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        path = scope["path"]
+        declared = _declared_length(headers)
+        if not self.token and _arrived_off_loopback(scope):
+            response = _error(403, NO_TOKEN_MSG)
+        elif self.token and (path == "/v1" or path.startswith("/v1/")) and not self._authorized(headers):
+            response = _error(401, "Missing or wrong token: send Authorization: Bearer <token>.",
+                              {"WWW-Authenticate": "Bearer"})
+        elif declared is not None and declared > MAX_REQUEST_BYTES:
+            response = _error(413, _too_large(scope))
+        else:
+            await self.app(scope, _capped(receive, _too_large(scope)), send)
+            return
+        await response(scope, receive, send)
+
+    def _authorized(self, headers: Headers) -> bool:
+        scheme, _, given = headers.get("authorization", "").partition(" ")
+        return scheme.lower() == "bearer" and hmac.compare_digest(given.strip().encode(), self.token)
+
+
+class _PrivateNetwork:
+    """ASGI middleware outside the CORS middleware, there only when create_app has cors_origins (P9-B: the GitHub Pages copy of the page).
+
+    Chrome sends the preflight of a public https page that calls a local address (the Pages copy calling the tunnel on http://localhost) with
+    Access-Control-Request-Private-Network: true, and goes on only when the answer says Access-Control-Allow-Private-Network: true. A preflight
+    from an allowed origin that asks with the value true gets that header in its answer; nothing else does. The request header is taken off
+    every preflight before the CORS middleware sees it, so that the preflight is judged on its origin, method and headers as before, whatever
+    Starlette runs (a newer one refuses a preflight that asks, unless allow_private_network, which grants it to every origin's; an older one
+    ignores the header). Newer Chrome versions ask the user instead (local network access), once.
+    """
+
+    ASKS = "access-control-request-private-network"
+
+    def __init__(self, app: Callable, origins: Sequence[str]):
+        self.app, self.origins = app, frozenset(origins)
+
+    async def __call__(self, scope: Dict[str, Any], receive: Callable, send: Callable) -> None:
+        if scope["type"] != "http" or scope["method"] != "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        if "origin" not in headers or "access-control-request-method" not in headers or self.ASKS not in headers:
+            await self.app(scope, receive, send)   # no preflight, or one that does not ask
+            return
+        grant = headers["origin"] in self.origins and headers[self.ASKS].strip().lower() == "true"
+        inner = dict(scope, headers=[(k, v) for k, v in scope["headers"] if k.lower() != self.ASKS.encode()])
+
+        async def answer(message: Dict[str, Any]) -> None:
+            if grant and message["type"] == "http.response.start":
+                message.setdefault("headers", [])
+                MutableHeaders(scope=message).append("Access-Control-Allow-Private-Network", "true")
+            await send(message)
+
+        await self.app(inner, receive, answer)
+
+
+class _StaticFiles(StaticFiles):
+    """app/static/ arrives with P4. Until it exists every /static/ path is a 404, where StaticFiles would answer 500.
+    Every file goes out with Cache-Control: no-cache, so a browser asks again after an rsync redeploy and the ETag
+    answers 304 when nothing changed."""
+
+    async def check_config(self) -> None:
+        return None
+
+    async def get_response(self, path: str, scope: Dict[str, Any]) -> Response:
+        response = await super().get_response(path, scope)
+        response.headers.update(NO_CACHE)
+        return response
+
+
+def _loopback_ip(ip: Any) -> bool:
+    """Loopback, an IPv4-mapped one included (::ffff:127.0.0.1 is not loopback to Python 3.11's ipaddress)."""
+    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return _loopback_ip(ipaddress.ip_address(host))
+    except ValueError:   # a host name: it can resolve to anything
+        return False
+
+
+def _arrived_off_loopback(scope: Dict[str, Any]) -> bool:
+    """The connection came in on a numeric address that is not loopback (uvicorn reports the socket's own address).
+    A host name, a unix socket or no address at all is not judged: only a test client sends a name."""
+    server = scope.get("server") or (None,)
+    try:
+        ip = ipaddress.ip_address(server[0])
+    except (TypeError, ValueError):
+        return False
+    return not _loopback_ip(ip)
+
+
+def _chat_home(home: Optional[str]) -> Path:
+    """CHAT_HOME: the argument, else $CHAT_HOME, else ~/chat_sessions. Never inside this repository, nor inside any
+    other checkout of this project (a .git beside hybrid_xmamba/), symlinks resolved first: on the cluster, outputs/
+    and results/ link into the thesis checkout (DUA). A home directory that is only a git repository (dotfiles) is
+    fine."""
+    path = Path(home or os.environ.get("CHAT_HOME") or Path.home() / "chat_sessions").expanduser().resolve()
+    if path == REPO_ROOT or REPO_ROOT in path.parents:
+        raise RuntimeError("CHAT_HOME must be outside the repository, got {}".format(path))
+    for directory in (path,) + tuple(path.parents):
+        if (directory / ".git").exists() and (directory / "hybrid_xmamba").is_dir():   # .git: a dir or a file
+            raise RuntimeError("CHAT_HOME must be outside any checkout of this project, but {} is one; got {}".format(
+                directory, path))
+    return path
+
+
+class ModelUnavailable(RuntimeError):
+    """A model that was asked for cannot be served as it is: it has no checkpoint where the server keeps it, or an EOS entry's run does not
+    say it was trained to end its reports. The message names the model and no path: it is a line of a job log, and a path under CHAT_HOME
+    holds the user name."""
+
+
+def _require_checkpoints(models: Sequence[str], home: Path) -> None:
+    """P9-G5a: every model kept under CHAT_HOME (HOME_MODELS) that was asked for is there, and its run finished (the DONE marker the training
+    job writes only for a run that did, which the decode job asks for too), before the database is opened or an engine is built. A published
+    model's checkpoint is not looked for here: the thesis loader's own error says so, as it always has."""
+    for name in models:
+        spec = HOME_MODELS.get(name)
+        if spec is None:
+            continue
+        checkpoint = home / spec["checkpoint"]
+        if not checkpoint.is_file() or not (checkpoint.parent.parent / "DONE").is_file():
+            raise ModelUnavailable("{} has no checkpoint in CHAT_HOME: train it first, or serve without it.".format(name))
+
+
+def _require_eos_entries_marked(engines: Dict[str, Engine]) -> None:
+    """P9-G5a fix 1: an entry of HOME_MODELS marked `eos` is an EOS model, so its card must say `eos_trained`, which the engine reads from the
+    run's own metadata (the flag is not written here, only checked against what the entry is). A missing or damaged run_metadata.json, or one
+    without dataset.report_eos_target true, gives a card that says otherwise: served, that model would decode with the published search and
+    never stop at its own end, under a card that carries the EOS note, and under MODELS=m3eos,m3 it would be the deployment's default."""
+    for name, engine in engines.items():
+        if (HOME_MODELS.get(name) or {}).get("eos") and not engine.card().get("eos_trained"):
+            raise ModelUnavailable("{} is not marked as trained to end its reports in its run metadata: serve the run it came from.".format(name))
+
+
+def _engines(kind: str, models: Sequence[str], tiny_step_delay_s: float, drift_note: str, device: str = "cpu",
+             threads: Optional[int] = None, home: Optional[Path] = None, tiny_models: Optional[Sequence[str]] = None) -> Dict[str, Engine]:
+    """Ruling 1: tiny is one engine and ignores models, device and threads; real is one engine per model on `device` (a CPU one by
+    default), the first the default. Without a thread count the engine keeps its own default. A published model is built from the repo root
+    under its config's name, and carries `drift_note`, the server's --drift-note: that sentence was measured for the published models. A model
+    of HOME_MODELS (P9-G5a) is built from CHAT_HOME (`home`), under its own name, with its note and its own drift sentence (P9-G5b), which on
+    a GPU server it has not: the sentence says a CPU decode was not probed, and there is none there to speak of (P9-G5b fix 1). tiny_models
+    (P9-F, tiny only) serves the tiny engine under each of those names instead, the first with seed 0, the next with seed 1, and so on."""
+    if kind == "tiny" and tiny_models:
+        return {name: build_engine("tiny", step_delay_s=tiny_step_delay_s, seed=seed, name=name) for seed, name in enumerate(tiny_models)}
+    if kind == "tiny":
+        return {"tiny": build_engine("tiny", step_delay_s=tiny_step_delay_s)}
+    extra = {} if threads is None else {"threads": threads}
+    engines = {}
+    for name in models:
+        if name in HOME_MODELS:
+            spec = HOME_MODELS[name]
+            engines[name] = build_engine("real", checkpoint=str(Path(home) / spec["checkpoint"]), model_config=spec["config"], name=name,
+                                         evaluation_note=spec["note"], device=device, **extra,
+                                         drift_note=spec["drift_note"] if device == "cpu" else "")
+        else:
+            engines[name] = build_engine("real", checkpoint=str(REPO_ROOT / MODEL_CHECKPOINTS[name]), model_config=name,
+                                         device=device, drift_note=drift_note, **extra)
+    return engines
+
+
+def _readable(errors: Sequence[Any]) -> str:
+    """Pydantic errors on one line, "field: problem; ...", without the values that were sent."""
+    parts = []
+    for e in errors:
+        loc = ".".join(str(p) for p in e.get("loc", ()) if p not in ("body", "query", "path", "header"))
+        parts.append("{}: {}".format(loc, e.get("msg")) if loc else str(e.get("msg")))
+    return "; ".join(parts)
+
+
+def _turn_options(raw: str, text: str) -> Options:
+    """The drawer's options with a text command on top (spec §4): malformed JSON is a 400, invalid options a 422."""
+    try:
+        drawer = json.loads(raw or "{}")
+    except (ValueError, RecursionError):   # deep nesting overflows the decoder (fix-1 M1)
+        drawer = None
+    if not isinstance(drawer, dict):
+        raise HTTPException(400, "options must be a JSON object.")
+    try:
+        return Options.model_validate(dict(drawer, **(parse_command(text) or {})))
+    except ValidationError as exc:
+        raise HTTPException(422, "Invalid options: " + _readable(exc.errors(include_url=False, include_input=False)))
+
+
+def _checked_upload(data: bytes) -> Tuple[Image.Image, str, str]:
+    """load_upload before the stream opens (ruling 4); -> (the image, its file extension, the upload's sha256).
+    Its messages are written for users."""
+    try:
+        img, facts = load_upload(data)
+    except UploadError as exc:
+        raise HTTPException(422, str(exc)) from None
+    return img, facts["format"].lower(), hashlib.sha256(data).hexdigest()
+
+
+def _save_upload(store: Store, session_id: str, sha256: str, data: bytes, img: Image.Image, ext: str) -> bool:
+    """The bytes as sent, the thumbnail and the 224x224 model input, stored before any record names the image: a
+    turn stopped while queued never reaches preprocess, and its image must still exist (fix-1 I1). -> True when this
+    call wrote the copy, False when one of the same bytes stood already (Store.save_upload)."""
+    png = io.BytesIO()
+    model_input_image(img).save(png, "PNG")   # exactly Prepared.model_input
+    return store.save_upload(session_id, sha256, data, ext, thumbnail_jpeg(img), png.getvalue())
+
+
+def _test_count(gallery: Gallery) -> int:
+    """The test split's size: the gallery's report rows are its train reports, then its test reports."""
+    facts = gallery.facts()
+    return facts["report_rows"] - facts["images"]
+
+
+def _test_image_sha256(gallery: Gallery, row: int) -> str:
+    """A test study's image, read and checked as an upload is before the stream opens; -> its sha256. It is never copied:
+    preprocess reads it again from the dataset."""
+    try:
+        data = Path(gallery.test_study(row)["image"]).read_bytes()
+    except OSError:
+        log.warning("a test-split image could not be read")
+        raise HTTPException(500, TEST_IMAGE_MSG) from None
+    return _checked_upload(data)[2]
+
+
+def _can_read(path: Path) -> bool:
+    return path.is_file() and os.access(str(path), os.R_OK)
+
+
+def _previous_image(store: Store, session: Dict[str, Any], gallery: Optional[Gallery] = None) -> Optional[Dict[str, Any]]:
+    """The newest image of the session that can still run: an upload whose original is on disk, or a test study the gallery
+    still has (pass the gallery in private mode only; a public session stores no test row). What a text-only turn reruns."""
+    for message in reversed(session["messages"]):
+        sha256, row = message["image_sha256"], message.get("test_row")
+        if message["role"] != "user" or not sha256:
+            continue
+        if row is not None:   # a test image that cannot be read now is no image, as an upload gone from disk is (M1)
+            if gallery is not None and row < _test_count(gallery) and _can_read(Path(gallery.test_study(row)["image"])):
+                return {"sha256": sha256, "filename": message["image_filename"], "test_row": row}
+        elif store.upload_path(session["id"], sha256, "original") is not None:
+            return {"sha256": sha256, "filename": message["image_filename"]}
+    return None
+
+
+def _wire_gallery(given: Optional[Gallery], gallery_dir: Optional[str], tiny_gallery: bool, home: Path,
+                  engines: Dict[str, Engine], default_model: str) -> Tuple[Optional[Gallery], Optional[List[str]]]:
+    """The gallery the pipeline queries: the one passed in; else gallery_dir, opened against the default engine's tower hash
+    (P5-D), and served only to the engines whose tower is that one; else, with tiny_gallery, a synthetic one; else none. A
+    gallery_dir that cannot be served leaves the server running without retrieval, and says why (counts and file names only,
+    R7). -> (the gallery, the engines it serves; None for every engine)."""
+    if given is not None:
+        return given, None
+    if gallery_dir:
+        towers = {name: e.tower_sha256() for name, e in engines.items()}
+        try:
+            gallery = Gallery.open(Path(gallery_dir).expanduser(), expect_tower_sha256=towers[default_model])
+        except GalleryMismatch as exc:
+            print("[server] gallery unavailable: {}".format(exc), flush=True)
+            return None, None
+        served = [name for name, tower in towers.items() if tower == towers[default_model]]
+        facts = gallery.facts()
+        print("[server] gallery: {} images, {} report rows, labels {}".format(
+            facts["images"], facts["report_rows"], "pending" if gallery.labels is None else "done"), flush=True)
+        if len(served) < len(towers):
+            print("[server] gallery: no retrieval for {}: another image tower".format(
+                ", ".join(name for name in towers if name not in served)), flush=True)
+        return gallery, served
+    if tiny_gallery:
+        return _tiny_gallery(home), None
+    return None, None
+
+
+def _tiny_gallery(home: Path) -> Gallery:
+    """A laptop convenience (tiny_gallery=True): the synthetic gallery of scripts/build_retrieval_gallery.py --tiny under
+    <home>/gallery/tiny, built once and kept. Its vectors are 16-d, the tiny engine's pooled width, so a tiny turn's query meets
+    them. Its R@k gate is decided as the cluster decides it (a reference result equal to the build's own, then compare_rk), and
+    it opens without a tower check: its tower hash is a fixed text's, no engine's. Nothing in it is MIMIC-derived."""
+    from scripts.build_retrieval_gallery import build_tiny, compare_rk
+    root = Path(home) / "gallery" / "tiny"
+    if not (root / "manifest.json").is_file():
+        build_tiny(root)
+    gate = json.loads((root / "manifest.json").read_text()).get("gate_rk")
+    if not (isinstance(gate, dict) and gate.get("equal") is True):
+        (root / "reference_rk").mkdir(exist_ok=True)
+        app_rk = json.loads((root / "gate_rk.json").read_text())["app"]
+        (root / "reference_rk" / TINY_GALLERY_REFERENCE).write_text(json.dumps({"metrics": app_rk}))
+        with redirect_stdout(io.StringIO()):   # its RESULT line is for a job log
+            compare_rk(root)
+    return Gallery.open(root, expect_tower_sha256=None)
+
+
+def _wire_labeler(given: Any, labeler_url: Optional[str], tiny_gallery: bool) -> Any:
+    """The labeller: the one passed in (anything with label and healthy), else the service at labeler_url, else, with
+    tiny_gallery, the keyword RuleLabeler; else none."""
+    if given is not None:
+        return given
+    if labeler_url:
+        return LabelerClient(labeler_url)
+    return RuleLabeler() if tiny_gallery else None
+
+
+def _wire_published(dirs: Optional[Dict[str, str]], gallery: Optional[Gallery]) -> Optional[PublishedDumps]:
+    """The published dumps (D18), from {"model": dir, "floor": dir}; None on the laptop. Dumps that cannot be read, or whose
+    lines are not one per test study of the gallery, are not used: a line would sit beside the wrong study."""
+    if not dirs:
+        return None
+    try:
+        dumps = PublishedDumps.load(Path(dirs["model"]), Path(dirs["floor"]))
+    except (OSError, KeyError, UnicodeDecodeError) as exc:
+        print("[server] published dumps unavailable ({})".format(type(exc).__name__), flush=True)
+        return None
+    if gallery is not None and not len(dumps.model_hyps) == len(dumps.floor_hyps) == _test_count(gallery):
+        print("[server] published dumps unavailable: {} and {} lines for {} test studies".format(
+            len(dumps.model_hyps), len(dumps.floor_hyps), _test_count(gallery)), flush=True)
+        return None
+    return dumps
+
+
+def _image_urls(message: Dict[str, Any], mode: str) -> Optional[Dict[str, str]]:
+    """A user message's image variants as its turn's message_start.image.urls has them (P6-B), so a reload shows the thumbnail again.
+    They pass the one public policy (app/redact.py): a public turn's have no original, as its message_start has none. None for a turn
+    with no image (a question)."""
+    if not message.get("image_sha256"):
+        return None
+    turn_mode = "public" if "public" in (mode, message.get("mode")) else "private"
+    return redact_event("message_start", {"image": {"urls": image_urls(message["id"])}}, turn_mode)["image"]["urls"]
+
+
+def _clean_filename(name: Optional[str]) -> Optional[str]:
+    """The upload's own name: no directory a browser put in front, one line, at most 200 characters."""
+    return " ".join(os.path.basename((name or "").replace("\\", "/")).split())[:200] or None
+
+
+def create_app(engine: str = "tiny", mode: str = "private", home: Optional[str] = None, host: str = "127.0.0.1",
+               token: Optional[str] = None, queue_cap: int = 4, gallery_dir: Optional[str] = None,
+               labeler_url: Optional[str] = None, models: Sequence[str] = ("hybrid_150m_m3_rrg",),
+               allow_compile: bool = False, cors_origins: Sequence[str] = (),
+               published_dirs: Optional[Dict[str, str]] = None, tiny_step_delay_s: float = 0.0,
+               drift_note: str = "", gallery: Optional[Gallery] = None, labeler: Any = None,
+               tiny_gallery: bool = False, device: str = "cpu", threads: Optional[int] = None,
+               retention_days: Optional[int] = None, tiny_models: Optional[Sequence[str]] = None) -> FastAPI:
+    """The app. It refuses to exist without a token on a non-loopback address or in public mode (R6, D9).
+
+    Sessions are deleted `retention_days` days after they were created (P8-B, app/retention.py): that argument, else RETENTION_DAYS from the
+    environment, else 45 days in private mode and 7 in public. Only a whole number from 1 to 3650 will do: anything else, 0 included (it would
+    delete every session at start-up), is a ValueError before anything is opened. A thread sweeps once when the server starts serving, after
+    the restart recovery below, and every 24 hours, for both modes: this mode's days for its own sessions, the default days for the other's. The
+    exports that the save route wrote (P9-C) go in the same sweep, after the private days: this server's own when it is private, else 45.
+
+    The retrieve, label and score stages (P5-E) get their gallery from `gallery` (an opened Gallery), else from gallery_dir
+    (opened against the default engine's tower hash), and their labeller from `labeler` (anything with label and healthy),
+    else from labeler_url (a LabelerClient). tiny_gallery is a laptop convenience: with neither given, a synthetic gallery is
+    built under <home>/gallery/tiny and the keyword RuleLabeler labels, so the tiny server runs every stage. published_dirs
+    ({"model": dir, "floor": dir}, each holding a hyps.txt) puts the published lines beside a test study's score. All of them
+    are on app.state, with gallery_dir, labeler_url and published_dirs as given. device ("cpu" or "cuda") and threads are for the
+    real engines (P7-B: the serving command line, app/cli.py, passes them); the tiny engine ignores both.
+
+    `models` (real engines only) are names of MODEL_NAMES, the first the default; without it the published Mamba-3 model is served alone. A
+    model of HOME_MODELS (P9-G5a, the EOS-trained one) is loaded from `home`, and a start that asks for one whose checkpoint, or whose run's DONE
+    marker, is not there is refused with ModelUnavailable, before the database is opened. An entry marked `eos` whose engine's card does not
+    say eos_trained (its run metadata is missing, damaged or lacks the flag) is refused the same way once the engines are built, the store
+    closed: it would otherwise be served without its stop.
+
+    The engines are built, and their towers hashed for the gallery, on the worker's thread, the one that runs every turn (P8-F part 3): no
+    other thread of the process runs a torch op. A start refused once the database is open closes it and ends that thread.
+
+    tiny_models (P9-F, the tiny engine only) serves the tiny engine under each of these names, the first the default, each with weights of its
+    own seed, so that compare mode's tests have two models whose reports differ (a name of the published models makes compare's pair rule
+    apply). The real engines refuse it: production loading is the registry above, unchanged.
+    """
+    if mode not in ("private", "public"):
+        raise ValueError("mode must be 'private' or 'public', got {!r}".format(mode))
+    if device not in ("cpu", "cuda"):
+        raise ValueError("device must be 'cpu' or 'cuda', got {!r}".format(device))
+    if threads is not None and threads < 1:
+        raise ValueError("threads must be at least 1, got {}".format(threads))
+    if not token and not _is_loopback(host):
+        raise RuntimeError("Refusing to serve on {} without a token (R6).".format(host))
+    if not token and mode == "public":
+        raise RuntimeError("Public mode needs a token (R6).")
+    if engine not in ("tiny", "real"):
+        raise ValueError("engine must be 'tiny' or 'real', got {!r}".format(engine))
+    if engine == "real" and (not models or any(m not in MODEL_NAMES for m in models)):
+        raise ValueError("models must be among {}, got {}".format(sorted(MODEL_NAMES), list(models)))
+    if tiny_models is not None:
+        if engine != "tiny":
+            raise ValueError("tiny_models is for the tiny engine only")
+        names = list(tiny_models)
+        if not names or len(set(names)) != len(names) or not all(isinstance(n, str) and n for n in names):
+            raise ValueError("tiny_models must name one or more models, each once")
+    if queue_cap < 1:
+        raise ValueError("queue_cap must be at least 1, got {}".format(queue_cap))
+    days = retention.resolve_days(mode, retention_days)   # a bad value stops the server here, before the database is opened
+    policy = retention.retention_policy(mode, days)
+    chat_home = _chat_home(home)
+    if engine == "real":
+        _require_checkpoints(models, chat_home)   # P9-G5a: a model kept under CHAT_HOME must be there, or the start is refused here
+    store = Store(chat_home)
+    print("[server] sqlite journal_mode={}".format(store.journal_mode), flush=True)
+    print("[server] recovered {} running turn(s)".format(store.recover_after_restart()), flush=True)
+
+    def report_sweep(purged: int, first: bool) -> None:
+        """The job log's line for a sweep (R7: counts and days only, no name and no path): the first one always, the daily ones when they purged a
+        session or removed a saved export. The export count is the sweeper's, of the sweep this is called for. The line says "saved file(s)" and not
+        "export(s)": the timing job's log holds this line, and its leak check (tests/test_chat_decode_timing.py) takes that word for a mount path."""
+        exports = sweeper.exports_purged
+        if first or purged or exports:
+            print("[server] retention: purged {} session(s), {} saved file(s) ({})".format(
+                purged, exports, ", ".join("{} {} d".format(m, d) for m, d in sorted(policy.items()))), flush=True)
+
+    # The saved exports (P9-C) are private-mode data and go after the private days of the policy, whatever this server's mode (a public one saves none).
+    sweeper = retention.RetentionSweeper(store, policy, report=report_sweep, export_days=policy["private"])   # started with the server, in the lifespan
+    # P8-F part 3: the worker is made before the engines and builds them, so the thread that runs every turn is the one thread of this process
+    # that runs a torch op. libgomp gives each thread that enters a parallel region a pool of its own for the thread's life: engines built on
+    # the main thread gave it a pool beside the worker's, and with twice as many OpenMP threads as CPUs a decode ran about 3 times slower.
+    worker = Worker(None, queue_cap)
+
+    def start_up(given: Optional[Gallery]) -> Tuple[Dict[str, Engine], str, Optional[Gallery], Optional[List[str]]]:
+        """The start's torch work, on the worker thread: the engines are built and loaded, and the gallery's tower check hashes their weights.
+        -> (the engines, the default model, the gallery, the engines it serves)."""
+        built = _engines(engine, models, tiny_step_delay_s, drift_note, device, threads, store.home, tiny_models)
+        if engine == "real":   # P9-G5a fix 1: inside the start's try below, so that a refusal closes the store. A run's metadata says it, and the
+            _require_eos_entries_marked(built)   # tiny engine has no run: one served under the EOS entry's name (P9-F tiny_models) is a stand-in
+        default = next(iter(built))
+        wired, served = _wire_gallery(given, gallery_dir, tiny_gallery, store.home, built, default)
+        return built, default, wired, served
+
+    try:
+        engines, default_model, gallery, retrieval_models = worker.call(start_up, gallery)
+        labeler = _wire_labeler(labeler, labeler_url, tiny_gallery)
+        published = _wire_published(published_dirs, gallery)
+    except BaseException:
+        try:
+            worker.shutdown()   # a refused start leaves no thread behind
+        finally:
+            store.close()
+        raise
+    worker.pipeline = Pipeline(engines, default_model, store, mode, gallery=gallery, labeler=labeler, published=published,
+                               drift_note=drift_note, retrieval_models=retrieval_models)
+    static_dir = STATIC_DIR
+    # Read once, here: the code this process runs is what it imported at the start, whatever the checkout says later (P4-H A2). The card's
+    # provenance: the checkout's HEAD, else the .sync_stamp; "-dirty" when that tree had changes its commit does not hold. /healthz needs
+    # no token, so a public server names no commit to whoever asks.
+    started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    provenance = engines[default_model].card()
+    git_sha = provenance.get("git_sha")
+    code_version = None
+    if mode == "private" and isinstance(git_sha, str) and git_sha:
+        code_version = git_sha[:7] + ("-dirty" if provenance.get("git_dirty") is True else "")
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        # P8-B: after the restart recovery above (a turn the last server died in is over, so its session can go), and before the first request:
+        # start-up waits for the first sweep, for FIRST_SWEEP_WAIT_S at most (a long backlog goes on in the background).
+        sweeper.start()
+        await run_in_threadpool(sweeper.wait_first, retention.FIRST_SWEEP_WAIT_S)
+        yield
+        # Queued and running turns stop at their next step and end as a server restart. The wait runs off the event
+        # loop. uvicorn reaches this only once open connections close: the serving command line (app/cli.py, P7-B)
+        # stops the turns as the shutdown begins, so their streams end, and sets timeout_graceful_shutdown.
+        await run_in_threadpool(sweeper.stop)   # before the store closes under it; its Event wait ends at once
+        await run_in_threadpool(worker.shutdown)
+        store.close()
+
+    app = FastAPI(title="CXR report chat", description=API_DESCRIPTION, lifespan=lifespan)
+    app.state.store, app.state.engines, app.state.worker = store, engines, worker
+    app.state.mode, app.state.default_model = mode, default_model
+    app.state.retention_days, app.state.sweeper = days, sweeper
+    app.state.gallery_dir, app.state.labeler_url, app.state.published_dirs = gallery_dir, labeler_url, published_dirs
+    app.state.gallery, app.state.labeler, app.state.published = gallery, labeler, published
+    configure_request_log()
+    limiter = TurnLimiter() if mode == "public" else None   # 6 turns per client per 10 minutes, in public mode only (app/hardening.py)
+    app.state.rate_limiter = limiter
+    if limiter is not None:   # inside the guard, which is added next: a request without the token never reaches it
+        app.add_middleware(TurnRateLimit, limiter=limiter, client_id=CLIENT_ID)
+    app.add_middleware(_Guard, token=token)
+    if cors_origins:   # a preflight is answered before the token check
+        app.add_middleware(CORSMiddleware, allow_origins=list(cors_origins), allow_methods=["GET", "POST", "DELETE"],
+                           allow_headers=["Authorization", "Content-Type", "X-Client-Id", REQUEST_ID_HEADER],
+                           expose_headers=["X-Message-Id", REQUEST_ID_HEADER])
+        app.add_middleware(_PrivateNetwork, origins=cors_origins)   # P9-B: outside it, so that it sees a preflight first
+    app.add_middleware(RequestLog, client_id=CLIENT_ID)   # added last, so it is the outermost: every answer has an id and a line of the log
+
+    @app.exception_handler(HTTPException)
+    async def http_error(request: Request, exc: HTTPException) -> JSONResponse:   # an unknown route (404), a wrong method (405), every raise below
+        return _error_for(request, exc.status_code, str(exc.detail), exc.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
+        return _error_for(request, 422, "Invalid request: " + _readable(exc.errors()))   # field and problem; never what was sent (no `input`)
+
+    @app.exception_handler(Exception)
+    async def unhandled(request: Request, exc: Exception) -> JSONResponse:
+        """A 500 in the envelope: no exception text and no trace in the body. Starlette sends it from outside the middlewares and then re-raises
+        the exception for the server to log, so the trace is in the server log and nowhere else."""
+        return _error_for(request, 500, INTERNAL_ERROR_MSG)
+
+    def client_scope(x_client_id: Optional[str] = Header(None, description=CLIENT_ID_DOC)) -> Optional[str]:
+        """D8: the X-Client-Id that scopes sessions and messages in public mode; None (every session) in private."""
+        if mode == "private":
+            return None
+        if not x_client_id or CLIENT_ID.fullmatch(x_client_id) is None:
+            raise HTTPException(400, "Public mode needs an X-Client-Id header (1 to 128 visible characters).")
+        return x_client_id
+
+    def visible_session(session_id: str, client_id: Optional[str]) -> Dict[str, Any]:
+        session = store.get_session(session_id, client_id)
+        if session is None:   # unknown and not visible look the same
+            raise HTTPException(404, "Session not found.")
+        return session
+
+    def visible_message(message_id: str, client_id: Optional[str]) -> Dict[str, Any]:
+        message = store.get_message(message_id, client_id)
+        if message is None:
+            raise HTTPException(404, "Message not found.")
+        return message
+
+    static_files = _StaticFiles(directory=str(static_dir), check_dir=False)
+
+    @app.get("/", include_in_schema=False)
+    async def index(request: Request) -> Response:
+        if (static_dir / "index.html").is_file():   # through the files' own path: its ETag and Last-Modified answer a conditional request with a 304
+            return await static_files.get_response("index.html", request.scope)
+        return HTMLResponse(PLACEHOLDER.format(html.escape(DISCLAIMER)), headers=NO_CACHE)
+
+    app.mount("/static", static_files, name="static")
+
+    @app.get("/healthz", summary="Check the server",
+             responses={200: {"description": "The server is up.", "content": {"application/json": {"example": HEALTHZ_EXAMPLE}}},
+                        **_refusals({}, token=False, client_id=False)},
+             description="The server's mode, default model, turns in flight and queue cap, with `retention_days` (how many days a "
+                         "session is kept before the server deletes it: `RETENTION_DAYS` when that is set, else 45 in private mode and 7 "
+                         "in public mode), `code_version` (the short git sha "
+                         "of the code it started from, which it runs until it restarts, with `-dirty` when that tree had changes; "
+                         "null when it cannot tell, and in public mode) and `started_at` (ISO 8601, UTC). It needs no token.")
+    def healthz():
+        return {"status": "ok", "mode": mode, "default_model": default_model, "turns_in_flight": worker.in_flight,
+                "queue_cap": queue_cap, "retention_days": days, "code_version": code_version, "started_at": started_at}
+
+    @app.get("/v1/models", summary="List models",
+             responses={200: {"description": "The models, the default, and the stages this server runs.",
+                              "content": {"application/json": {"example": MODELS_EXAMPLE}}},
+                        **_refusals({}, client_id=False)},
+             description="The models this server can run, each with its card (checkpoint, device, architecture "
+                         "settings, whether decoding can be cached, and `eos_trained`: whether it was trained to end its "
+                         "reports, in which case decoding stops where it does and the generate stage reports "
+                         "`stopped: eos`; a model that has one also carries an `evaluation_note`, a line on how it measured), "
+                         "and the default model, the mode, whether "
+                         "`compile` is allowed and, in `features`, whether it runs the retrieval and labels stages for the "
+                         "default model (each card's own `features` says so for that model), and, only on a server that serves a "
+                         "Mamba-3 model and the 13D model, `features.compare` true (the `compare` option can run) with each card's "
+                         "`compare_with` naming the model a compare turn of it decodes beside it. "
+                         "In public mode a card names its checkpoint by file name only.")
+    def list_models():
+        pipeline = worker.pipeline   # its gallery serves only the models of its tower; its labeller every model
+
+        def features(name: str) -> Dict[str, bool]:
+            return {"retrieval": pipeline.retrieval_ready(name), "labels": pipeline.labeler is not None}
+
+        # P9-F: compare is said where it is offered and nowhere else, so a server that cannot compare answers exactly as it always did
+        offered = compare_available(list(engines))
+        server_features = dict(features(default_model), compare=True) if offered else features(default_model)
+
+        def listed(name: str, served: Engine) -> Dict[str, Any]:
+            card = dict(redact_card(served.card(), mode), features=features(name))
+            if offered:
+                card["compare_with"] = compare_partner(name, list(engines), default_model)
+            return card
+
+        return {"default_model": default_model, "mode": mode, "allow_compile": allow_compile, "features": server_features,
+                "models": [listed(name, e) for name, e in engines.items()]}
+
+    @app.post("/v1/sessions", summary="Create a session",
+              description="Starts an empty session in the server's mode; `title` is optional, and an untitled session "
+                          "is named by its first turn. Answers 422 for an unknown body field.",
+              responses=_refusals({422: "Invalid request: nope: Extra inputs are not permitted"}))
+    def create_session(body: Optional[NewSession] = None, client_id: Optional[str] = Depends(client_scope)):
+        return store.create_session(mode, client_id, body.title if body else "")
+
+    @app.get("/v1/sessions", summary="List sessions",
+             description="The sessions you can see, newest first, `limit` at a time (1 to 200, default 50): pass a "
+                         "page's `next_cursor` as `cursor` to get the next page, and a null `next_cursor` ends the "
+                         "list. Answers 422 for a `limit` outside 1 to 200.",
+             responses=_refusals({422: "Invalid request: limit: Input should be greater than or equal to 1"}))
+    def list_sessions(limit: int = Query(50, ge=1, le=200), cursor: Optional[str] = None,
+                      client_id: Optional[str] = Depends(client_scope)):
+        sessions, next_cursor = store.list_sessions(client_id, limit, cursor)
+        return {"sessions": sessions, "next_cursor": next_cursor}
+
+    @app.get("/v1/sessions/{session_id}", summary="Get a session",
+             description="One session with its messages in order, user and assistant turns alike, each user message with the "
+                         "`image_urls` of its image (null when it had none); a message's events come from "
+                         "`GET /v1/messages/{message_id}`. Answers 404 for an unknown or deleted session, or in public mode another "
+                         "client's.",
+             responses=_refusals({404: "Session not found."}))
+    def get_session(session_id: str, client_id: Optional[str] = Depends(client_scope)):
+        session = visible_session(session_id, client_id)
+        for message in session["messages"]:
+            if message["role"] == "user":   # P6-B: what a reload shows the turn's image from
+                message["image_urls"] = _image_urls(message, mode)
+        return session
+
+    @app.delete("/v1/sessions/{session_id}", status_code=204, summary="Delete a session",
+                description="Hides the session from every route and removes its uploaded images at once; its stored "
+                            "rows stay until the retention sweep purges them. Answers 204, or 404 for an unknown, "
+                            "already deleted or (public mode) another client's session.",
+                responses=_refusals({404: "Session not found."}))
+    def delete_session(session_id: str, client_id: Optional[str] = Depends(client_scope)) -> Response:
+        if not store.delete_session(session_id, client_id):
+            raise HTTPException(404, "Session not found.")
+        return Response(status_code=204)
+
+    @app.post("/v1/sessions/{session_id}/messages", summary="Run a turn (streamed)", response_class=StreamingResponse,
+              description="Runs one turn on the attached X-ray, or on the session's latest image when none is "
+                          "attached, and streams it as Server-Sent Events (`text/event-stream`), from "
+                          "`message_start` to `message_stop`. The `X-Message-Id` response header carries the new "
+                          "message's id before the first event, so a client can cancel the turn or poll `GET "
+                          "/v1/messages/{message_id}` at once; every refusal (400, 403, 404, 413, 422, 429, 500) "
+                          "comes before the stream opens, as a JSON error envelope.",
+              responses={**STREAM_RESPONSE, **_with_text_cap(_with_rate_limit(_refusals({
+                  400: "options must be a JSON object.", 403: PUBLIC_TEST_SPLIT_MSG,
+                  404: "Session not found.", 413: TOO_LARGE_MSG,
+                  422: "Invalid options: beam_size: Input should be less than or equal to 8",
+                  429: BUSY_MSG.format(queue_cap),
+                  500: "Could not store the image."})))})
+    async def post_message(request: Request, session_id: str, image: Optional[UploadFile] = File(None, description=IMAGE_DOC),
+                           text: str = Form("", description=TEXT_DOC),
+                           options: str = Form("{}", description=OPTIONS_DOC, examples=[OPTIONS_EXAMPLE]),
+                           client_id: Optional[str] = Depends(client_scope)) -> Response:
+        """One turn, streamed as Server-Sent Events. Every refusal comes before the stream opens (ruling 3)."""
+        session = await run_in_threadpool(visible_session, session_id, client_id)
+        if len(text) > TEXT_MAX_CHARS:   # final review, Important 1: a note is stored whole, so its size is bounded before anything reads or stores it
+            raise HTTPException(422, TEXT_TOO_LONG_MSG)
+        opts = _turn_options(options, text)
+        model = opts.model or default_model
+        if model not in engines:
+            raise HTTPException(422, "Unknown model; this server has {}.".format(", ".join(engines)))
+        if opts.cached_decode and not engines[model].card().get("cached_decode_available", False):
+            raise HTTPException(422, NO_CACHE_MSG.format(engines[model].name))
+        if opts.compile and not allow_compile:
+            raise HTTPException(422, "compile is not enabled on this server.")
+        # P9-F: block 1 is decoded with the turn's own options, so its model must be able to take them too. Only for a turn that runs a model
+        # (fix 2): an image, a test study, or text that runs the chat's last X-ray again; a question or a note runs none, and is answered as any is.
+        if opts.compare and (image is not None or opts.test_row is not None or not is_question(text)):
+            partner = compare_partner(model, list(engines), default_model)
+            if partner is None:
+                raise HTTPException(422, NO_COMPARE_MSG)
+            if opts.cached_decode and not engines[partner].card().get("cached_decode_available", False):
+                raise HTTPException(422, NO_CACHE_MSG.format(engines[partner].name))
+        private = "public" not in (mode, session["mode"])
+        gallery = worker.pipeline.gallery
+        test_sha256 = None
+        if opts.test_row is not None:   # R1: test-split studies are private-mode data
+            if not private:   # 403, as every public test-split access (fix-1 (b))
+                raise HTTPException(403, PUBLIC_TEST_SPLIT_MSG)
+            if gallery is None:
+                raise HTTPException(422, NO_GALLERY_MSG)
+            if opts.test_row >= _test_count(gallery):
+                raise HTTPException(422, "test_row must be below {}.".format(_test_count(gallery)))
+            if image is not None:
+                raise HTTPException(422, BOTH_IMAGES_MSG)
+            test_sha256 = await run_in_threadpool(_test_image_sha256, gallery, opts.test_row)
+        upload = sha256 = filename = checked = None
+        if image is not None:
+            upload = await image.read(MAX_UPLOAD_BYTES + 1)
+            if len(upload) > MAX_UPLOAD_BYTES:
+                raise HTTPException(413, TOO_LARGE_MSG)
+            checked = await run_in_threadpool(_checked_upload, upload)
+            sha256, filename = checked[2], _clean_filename(image.filename)
+        elif test_sha256 is not None:   # the picker: that study's image, read from the dataset by preprocess
+            sha256 = test_sha256
+        else:   # a text-only turn reruns the session's newest image still on disk, or the test study it last ran
+            previous = await run_in_threadpool(_previous_image, store, session, gallery if private else None)
+            if previous is None:
+                raise HTTPException(422, NO_IMAGE_MSG)
+            question = is_question(text)   # split on the page's whitespace too (P6-A f)
+            if not question:   # a question gets the fixed answer: no model runs, so no image is used or recorded
+                sha256, filename = previous["sha256"], previous["filename"]
+                if previous.get("test_row") is not None:   # the turn runs that study again, as its resolved options say
+                    opts = opts.model_copy(update={"test_row": previous["test_row"]})
+            elif len(text) <= FREE_NOTE_MAX_CHARS:   # P8 follow-up: a note that runs no model costs the client no turn of its rate limit (app/hardening.py
+                setattr(request.state, FREE_TURN, True)   # gives the token back), when it is short: a longer one is stored whole, so it counts as a turn
+        # P6 fix 1: a client gone by now (the page's Cancel upload aborts its request once the body is sent) starts no turn: no slot is
+        # reserved and nothing is stored, and the request log says 499. The answer reaches no one.
+        if await request.is_disconnected():
+            return Response(status_code=NO_RESPONSE)
+        if not worker.reserve():
+            raise HTTPException(429, BUSY_MSG.format(queue_cap))
+        gone = wrote = False
+        try:
+            if checked is not None:   # stored before start_turn records it (fix-1 I1)
+                wrote = await run_in_threadpool(_save_upload, store, session_id, sha256, upload, checked[0], checked[1])
+            # P6 fix 2: asked again, right before the turn is recorded. The save above takes a while (a 7.8 MP X-ray; longer on the
+            # cluster's NFS), and a Cancel upload that lands during it would leave a turn that no one waits for and that the page's read
+            # after its abort has not seen.
+            gone = await request.is_disconnected()
+            if not gone:
+                user_message_id, message_id = await run_in_threadpool(
+                    store.start_turn, session_id, text, session["mode"], dict(opts.model_dump(), model=model),
+                    sha256, filename, opts.test_row)
+        except KeyError:   # deleted since it was looked up
+            worker.release()
+            raise HTTPException(404, "Session not found.") from None
+        except OSError as exc:   # a full or failing disk: nothing names the image yet
+            worker.release()
+            log.warning("could not store an upload in session %s: %s", session_id, type(exc).__name__)
+            raise HTTPException(500, "Could not store the image.") from None
+        except BaseException:
+            worker.release()
+            raise
+        if gone:
+            # No turn and no message: the slot goes back, and so does the copy of the upload this request wrote. A copy that stood already
+            # is an earlier turn's, of the same bytes (uploads are kept once per chat and hash), and stays.
+            worker.release()
+            if wrote:
+                await run_in_threadpool(store.discard_upload, session_id, sha256)
+            return Response(status_code=NO_RESPONSE)
+        job = TurnJob(session_id, user_message_id, message_id, text, upload, filename,
+                      opts.model_copy(update={"model": model}), mode=session["mode"],
+                      previous_sha256=sha256 if upload is None else None)
+        loop = asyncio.get_running_loop()
+        queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
+        worker.submit(job, lambda event, data: _push(loop, queue, sse(event, data)), lambda: _push(loop, queue, None))
+        # The id comes first in a header, so a client can cancel or poll a turn still waiting in the queue.
+        return StreamingResponse(_frames(queue), media_type="text/event-stream",
+                                 headers=dict(SSE_HEADERS, **{"X-Message-Id": message_id}))
+
+    @app.get("/v1/messages/{message_id}", summary="Get a message and its events",
+             description="The stored message (its status is running, done, error or aborted, and its report is set "
+                         "once it is done) with its events whose `seq` is above `after`, so a client whose stream "
+                         "dropped replays the turn from the last `seq` it saw. Answers 404 for an unknown or hidden "
+                         "message and 422 for a negative or non-integer `after`.",
+             responses=_refusals({404: "Message not found.",
+                                  422: "Invalid request: after: Input should be greater than or equal to 0"}))
+    def get_message(message_id: str, after: int = Query(0, ge=0), client_id: Optional[str] = Depends(client_scope)):
+        return dict(visible_message(message_id, client_id), events=store.events_after(message_id, after))
+
+    # ---- P6-B: a turn's image, from either message of the turn ---------------------------------------------------------------
+
+    def turn_image_message(message_id: str, client_id: Optional[str]) -> Dict[str, Any]:
+        """The user message that holds a turn's image, given either message of the turn: start_turn writes the user message just
+        before its assistant message. 404 for an unknown or hidden message, and for a turn that has no image (a question)."""
+        message: Optional[Dict[str, Any]] = visible_message(message_id, client_id)
+        if message["role"] == "assistant":
+            session = store.get_session(message["session_id"], client_id) or {"messages": []}
+            message = next((m for m in session["messages"] if m["role"] == "user"
+                            and m["seq_in_session"] == message["seq_in_session"] - 1), None)
+        if message is None or not message.get("image_sha256"):
+            raise HTTPException(404, NO_TURN_IMAGE_MSG)
+        return message
+
+    def test_split_image(row: int, variant: str) -> Response:
+        """A test study's image, read where the dataset keeps it and never copied: its 320 px JPEG is both the original and the
+        thumbnail, and the model input is made in memory as preprocess makes it. Its path holds subject and study ids, so a failure
+        names neither, in the message or in the log."""
+        gallery = worker.pipeline.gallery
+        if gallery is None:
+            raise HTTPException(503, NO_GALLERY_MSG)
+        try:
+            path = gallery.test_study(row)["image"]
+        except IndexError:   # a gallery other than the one the turn ran with: it has no such study
+            raise HTTPException(404, IMAGE_GONE_MSG) from None
+        try:
+            data = Path(path).read_bytes()
+            kind = sniff_format(data)
+            if variant == "model_input":
+                png = io.BytesIO()
+                model_input_image(load_upload(data)[0]).save(png, "PNG")   # exactly Prepared.model_input
+                data, kind = png.getvalue(), "PNG"
+        except (OSError, UploadError):
+            log.warning("a test-split image could not be read")
+            raise HTTPException(500, TEST_IMAGE_MSG) from None
+        return Response(data, media_type=IMAGE_TYPES[kind], headers=NO_STORE)
+
+    @app.get("/v1/messages/{message_id}/image", summary="Get a turn's image", response_class=Response,
+             responses={**IMAGE_RESPONSE, **_refusals({
+                 403: PUBLIC_TEST_SPLIT_MSG, 404: "Message not found.",
+                 422: "Invalid request: variant: Input should be 'original', 'thumb' or 'model_input'",
+                 500: TEST_IMAGE_MSG, 503: NO_GALLERY_MSG})},
+             description="One picture of a turn's image, given the user or the assistant message of the turn: an upload is sent "
+                         "with `Cache-Control: private, max-age=3600`, and a test-split study, read from the dataset in private "
+                         "mode only, with `no-store`. Answers 403 for a test-split image in public mode and for `variant=original` in "
+                         "public mode (a public turn is never sent its original), 404 for an unknown or hidden message, a turn with no "
+                         "image or an image no longer stored, 422 for any other `variant`, 500 when a test-split image cannot be read "
+                         "and 503 when the server has no gallery for a test-split turn.")
+    def message_image(message_id: str, variant: Literal["original", "thumb", "model_input"] = Query(..., description=VARIANT_DOC),
+                      client_id: Optional[str] = Depends(client_scope)) -> Response:
+        user = turn_image_message(message_id, client_id)
+        public = "public" in (mode, user["mode"])
+        if user.get("test_row") is not None:   # R1: a test study's image is private-mode data, whoever's session it is in
+            if public:
+                raise HTTPException(403, PUBLIC_TEST_SPLIT_MSG)
+            return test_split_image(int(user["test_row"]), variant)
+        if public and variant == "original":   # app/redact.py never sends a public turn its original: the route holds to that too
+            raise HTTPException(403, PUBLIC_ORIGINAL_MSG)
+        path = store.upload_path(user["session_id"], user["image_sha256"], variant)
+        try:
+            if path is None:
+                raise FileNotFoundError(variant)
+            data = path.read_bytes()
+        except OSError:   # removed from disk since the turn (the session is alive: a deleted one hid the message above)
+            raise HTTPException(404, IMAGE_GONE_MSG) from None
+        return Response(data, media_type=UPLOAD_TYPES.get(path.suffix[1:].lower(), "application/octet-stream"), headers=UPLOAD_CACHE)
+
+    @app.post("/v1/messages/{message_id}/cancel", summary="Cancel a turn",
+              description="Stops a queued or running turn at its next step, so it ends `aborted`; the call is "
+                          "idempotent, and a turn that already finished answers its final `status` with "
+                          "`cancel_requested` false. Answers 404 for an unknown or hidden message.",
+              responses=_refusals({404: "Message not found."}))
+    def cancel_message(message_id: str, client_id: Optional[str] = Depends(client_scope)):
+        """Idempotent (ruling 10): a finished turn answers its final status with cancel_requested false."""
+        message = visible_message(message_id, client_id)
+        requested = worker.cancel(message_id)
+        status = (store.get_message(message_id, client_id) or message)["status"]   # it may have ended meanwhile
+        return {"id": message_id, "status": status, "cancel_requested": requested}
+
+    @app.get("/v1/sessions/{session_id}/export", summary="Export a session",
+             description="The whole session with every message and its events, as a download: `format=json` (the "
+                         "default) is the stored event log, `format=md` a readable record. Answers 404 for an "
+                         "unknown or hidden session and 422 for any other `format`.",
+             responses={**EXPORT_RESPONSE, **_refusals({404: "Session not found.", 422: "format must be json or md."})})
+    def export_session(session_id: str, fmt: str = Query("json", alias="format"),
+                       client_id: Optional[str] = Depends(client_scope)) -> Response:
+        try:
+            filename, media_type, body = store.export(session_id, fmt, client_id)
+        except KeyError:
+            raise HTTPException(404, "Session not found.") from None
+        except ValueError:
+            raise HTTPException(422, "format must be json or md.") from None
+        return Response(body, media_type=media_type,
+                        headers={"Content-Disposition": 'attachment; filename="{}"'.format(filename)})
+
+    # ---- P5-E: retrieval and labels on their own, and the test-split picker's list ------------------------------------
+
+    def private_only() -> None:
+        """Test-split studies are private-mode data (R1): 403 in public mode, before anything else about the request."""
+        if mode == "public":
+            raise HTTPException(403, PUBLIC_TEST_SPLIT_MSG)
+
+    @app.post(RETRIEVE_PATH, summary="Find similar X-rays and reports",
+              description="Runs the X-ray through preprocess and encode on the turn worker and returns what a turn's retrieve stage "
+                          "shows: the `k_images` most similar training X-rays and the `k_reports` best-matching report groups, as rank "
+                          "and similarity only in public mode. Answers 413 for an image over the limit, 422 for an image that cannot "
+                          "be used or a k out of range, 429 when the queue is full, 500 when the retrieval fails and 503 when the "
+                          "server has no retrieval gallery.",
+              responses=_refusals({413: TOO_LARGE_MSG,
+                                   422: "Invalid request: k_images: Input should be less than or equal to 12",
+                                   429: BUSY_MSG.format(queue_cap), 500: RETRIEVE_FAILED_MSG, 503: NO_RETRIEVAL_MSG},
+                                  client_id=False))
+    async def retrieve(image: UploadFile = File(..., description=XRAY_DOC),
+                       k_images: int = Form(4, ge=0, le=12, description="How many similar training X-rays, 0 to 12."),
+                       k_reports: int = Form(3, ge=0, le=10, description="How many matching report groups, 0 to 10.")):
+        pipeline = worker.pipeline
+        if not pipeline.retrieval_ready(default_model):
+            raise HTTPException(503, NO_RETRIEVAL_MSG)
+        data = await image.read(MAX_UPLOAD_BYTES + 1)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, TOO_LARGE_MSG)
+        await run_in_threadpool(_checked_upload, data)
+        if not worker.reserve():
+            raise HTTPException(429, BUSY_MSG.format(queue_cap))
+        future = worker.run_task(lambda: pipeline.retrieve_upload(data, k_images, k_reports))
+        try:
+            return await asyncio.wrap_future(future)
+        except Exception as exc:   # its text can hold a path: the class only, in the log; a fixed message in the envelope (M3)
+            log.warning("POST /v1/retrieve failed: %s", type(exc).__name__)
+            raise HTTPException(500, RETRIEVE_FAILED_MSG) from None
+
+    @app.post("/v1/label", summary="Label a report",
+              description="The 14 CheXbert labels of the text, each 0 or 1, as `chexbert_14`. Answers 422 for a missing, empty or "
+                          "too long text (at most {:,} characters) and 503 when the server has no labeller or it does not "
+                          "answer.".format(MAX_LABEL_CHARS),
+              responses=_refusals({422: "Invalid request: text: String should have at least 1 character",
+                                   503: NO_LABELER_MSG}, client_id=False))
+    def label_text(body: LabelText):
+        labeler = worker.pipeline.labeler
+        if labeler is None:
+            raise HTTPException(503, NO_LABELER_MSG)
+        try:
+            row = labeler.label([body.text])[0]
+        except LabelerUnavailable:
+            raise HTTPException(503, LABELER_DOWN_MSG) from None
+        return {"chexbert_14": named_labels(row)}
+
+    # ---- P6-C: a similar X-ray's image, by its gallery row ---------------------------------------------------------------------
+
+    def private_gallery() -> None:
+        """Gallery images are MIMIC data (R1): 403 in public mode, before anything else about the request, the row included."""
+        if mode == "public":
+            raise HTTPException(403, PUBLIC_GALLERY_MSG)
+
+    @app.get("/v1/gallery/images/{row}", summary="Get a similar X-ray's image", response_class=Response,
+             dependencies=[Depends(private_gallery)],
+             responses={**IMAGE_RESPONSE, **_refusals({
+                 403: PUBLIC_GALLERY_MSG, 404: NO_GALLERY_ROW_MSG,
+                 422: "Invalid request: row: Input should be greater than or equal to 0",
+                 500: GALLERY_IMAGE_MSG, 503: NO_RETRIEVAL_MSG}, client_id=False)},
+             description="The stored image of a gallery row (the integer `gallery_row` of a similar X-ray in a retrieve stage, never a "
+                         "path), a 320 px JPEG sent with `Cache-Control: no-store`, in private mode only. Answers 403 in public mode, 404 "
+                         "for a row outside the gallery, 422 for a row that is not a whole number from 0, 500 when the file cannot be read "
+                         "and 503 when the server has no retrieval gallery.")
+    def gallery_image(row: int = PathParam(..., ge=0, description="A similar X-ray's `gallery_row`.")) -> Response:
+        gallery = worker.pipeline.gallery
+        if gallery is None:
+            raise HTTPException(503, NO_RETRIEVAL_MSG)
+        try:
+            path = gallery.image_path(row)
+        except IndexError:
+            raise HTTPException(404, NO_GALLERY_ROW_MSG) from None
+        try:
+            data = path.read_bytes()
+            kind = sniff_format(data)
+        except (OSError, UploadError):   # its path holds subject and study ids: it stays out of the message and the log
+            log.warning("a gallery image could not be read")
+            raise HTTPException(500, GALLERY_IMAGE_MSG) from None
+        return Response(data, media_type=IMAGE_TYPES[kind], headers=NO_STORE)
+
+    @app.get("/v1/test-studies", summary="List test-split studies", dependencies=[Depends(private_only)],
+             description="The studies of the official test split whose study id starts with `q`, in test-row order, `limit` at a "
+                         "time (1 to 200, default 50), each with the `test_row` a turn's options take. Private mode only: answers "
+                         "403 in public mode, 422 for a `limit` outside 1 to 200 and 503 when the server has no retrieval gallery.",
+             responses=_refusals({403: PUBLIC_TEST_SPLIT_MSG,
+                                  422: "Invalid request: limit: Input should be greater than or equal to 1",
+                                  503: NO_GALLERY_MSG}, client_id=False))
+    def test_studies(q: str = Query("", max_length=64, description="The start of a study id; empty lists every study."),
+                     limit: int = Query(50, ge=1, le=200)):
+        gallery = worker.pipeline.gallery
+        if gallery is None:
+            raise HTTPException(503, NO_GALLERY_MSG)
+        return {"studies": gallery.list_test_studies(q, limit)}
+
+    # ---- P9-C: a session's export, written where it stays ---------------------------------------------------------------
+
+    def private_save() -> None:
+        """An export of a private session holds MIMIC-derived text, and this route puts it on the server's disk: private mode only (R1). 403 in
+        public mode, before anything else about the request, so before a client id is asked for, and whoever the session is."""
+        if mode == "public":
+            raise HTTPException(403, PUBLIC_SAVE_MSG)
+
+    @app.post("/v1/sessions/{session_id}/export/save", summary="Save a session's export on the server", dependencies=[Depends(private_save)],
+              responses={**SAVE_EXPORT_RESPONSE, **_refusals({403: PUBLIC_SAVE_MSG, 404: "Session not found.", 422: "format must be json or md.",
+                                                              500: SAVE_EXPORT_FAILED_MSG}, client_id=False)},
+              description="Writes the session's export, the body `GET /v1/sessions/{session_id}/export` sends (`format=json`, the default, or `md`), to "
+                          "`exports/` under the server's home as `session-<id>-<UTC time>.json` or `.md`, a new file each time, never replacing one and "
+                          "readable by its owner only, and answers its file name and size, never the export itself: for a session whose text must stay "
+                          "on the server, in private mode only. Answers 403 in public mode (before anything else), 404 for an unknown or deleted "
+                          "session, 422 for any other `format` and 500 when the export cannot be read or the file cannot be written, with a message "
+                          "that names no path.")
+    def save_export(session_id: str, fmt: str = Query("json", alias="format")):
+        try:
+            saved, size = store.save_export(session_id, fmt, None)   # private mode scopes by nothing: every session
+        except KeyError:
+            raise HTTPException(404, "Session not found.") from None
+        except ValueError:
+            raise HTTPException(422, "format must be json or md.") from None
+        except (OSError, sqlite3.Error) as exc:   # a full disk, a path that cannot be made, a failing database: its class in the log, nothing of it in the answer
+            log.warning("could not save an export: %s", type(exc).__name__)
+            raise HTTPException(500, SAVE_EXPORT_FAILED_MSG) from None
+        return {"saved": saved, "bytes": size}
+
+    return app
+
+
+if __name__ == "__main__":   # python -m app.server: the serving command line (P7-B) lives in app/cli.py
+    from app.cli import main
+    raise SystemExit(main())

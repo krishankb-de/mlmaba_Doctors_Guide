@@ -1,0 +1,948 @@
+"""SQLite session store for the chat app (CHAT_UI_PLAN.md P3-B; the schema is section 6.4).
+
+The event log is the source of truth. The pipeline writes every streamed event here, one transaction each, before it
+is sent, so a stored session replays exactly what the client saw and a dropped stream is resumed by polling it.
+
+D22: /sc/home is NFS, where WAL's shared-memory index is unsafe. locking_mode=EXCLUSIVE is set before WAL, so one
+process owns the file and the wal-index lives in heap memory (there is no -shm file). A second Store on the same
+file opens only after the first is closed. Store.journal_mode is the mode SQLite actually granted; the server prints
+it at start.
+
+One connection (autocommit, explicit BEGIN IMMEDIATE) is shared by the request handlers and the pipeline worker and
+guarded by one lock. Public methods take the lock once; the underscore helpers assume it is held.
+
+client_id=None (a private server) sees every session; otherwise only that client's. Messages and images are resolved
+through their session, so the same rule covers them. delete_session soft-deletes, so a turn that is still running
+keeps storing its events; sweep purges rows and files for good, deleted sessions included. It removes a session's
+upload directory before it commits the deletion of the rows, skips a session whose turn is still running, can be
+limited to one mode, and removes upload directories that no live session owns, so uploads cannot outlive retention.
+
+Held endings (P8-D follow-up): when the database fails while a turn runs, the pipeline hands the ending it could not store
+to hold_ending, and the store keeps it in memory (_held) until the process ends or finish_turn takes the turn. Every read
+of a message or of its events applies it, in one place (_held_for, through _message_out and _held_rows), so a read gives
+what the turn's stream gave: the message's final status, and the held events after the last event the database holds,
+numbered on from it. The next start's recover_after_restart closes such a turn on disk, as it closes any turn left running.
+
+Saved exports (P9-C): save_export writes a session's export, the very body export() gives, to <home>/exports/ for a session whose text has to stay
+on the server: owner-only, whole or not at all, a new name each time and never a replaced file. Nothing in the store reads those files again.
+sweep_exports, which the retention sweep calls with the private days (45, user 2026-10-14), removes the ones whose time in the name is older than that,
+and the temporary files of saves that died, and nothing else: only save_export's own names, as regular files, no link followed.
+"""
+import copy
+import errno
+import json
+import logging
+import os
+import re
+import secrets
+import shutil
+import sqlite3
+import stat
+import threading
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+
+from app.commands import collapse, parse_command
+from app.ids import new_id
+from app.schemas import DISCLAIMER   # the one copy of the message_stop.disclaimer text
+
+log = logging.getLogger(__name__)
+
+RESTART_MESSAGE = "The server restarted while this turn was running."
+MODES = ("private", "public")
+FINAL_STATUSES = ("done", "error", "aborted")
+UPLOAD_EXTS = ("png", "jpg", "webp")
+UPLOAD_NAMES = {"thumb": "thumb.jpg", "model_input": "model_input.png"}   # original.<ext> is found by extension
+SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")   # what new_id produces; no dot or slash, so no path can escape
+SHA256 = re.compile(r"[0-9a-f]{64}")
+MAX_TITLE = 80
+MAX_PAGE = 200
+EXPORT_DIR = "exports"        # under the home: where save_export writes (P9-C)
+MAX_SAVES_PER_SECOND = 1000   # the names of one session's exports in one second before save_export gives up
+EXPORT_NAME = re.compile(r"session-s_[0-9a-f]{22}-(?P<stamp>[0-9]{8}T[0-9]{6}Z)(?:-[0-9]+)?\.(?:json|md)")   # a file save_export names: session-<id>-<time>[-n].<ext>
+EXPORT_TEMP = re.compile(r"\.session-s_[0-9a-f]{22}\.[0-9a-f]{8}\.tmp")   # the hidden file it writes first: .session-<id>.<8 hex>.tmp
+EXPORT_TEMP_DAYS = 1          # a temporary file older than this is what a save that died left, and sweep_exports removes it
+STAMP_FORMAT = "%Y%m%dT%H%M%SZ"   # the UTC time to the second that a saved export's name carries: _stamp writes it and _stamp_time reads it back
+PRIVATE_OPTION_KEYS = ("reference", "test_row")   # Options fields that exist only in private mode (R1)
+
+DDL = """
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '', mode TEXT NOT NULL CHECK (mode IN ('private','public')),
+  client_id TEXT, deleted_at TEXT);
+CREATE TABLE IF NOT EXISTS messages (
+  id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+  seq_in_session INTEGER NOT NULL, role TEXT NOT NULL CHECK (role IN ('user','assistant')),
+  created_at TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', mode TEXT NOT NULL,
+  image_sha256 TEXT, image_filename TEXT, test_row INTEGER, options_json TEXT,
+  status TEXT NOT NULL CHECK (status IN ('running','done','error','aborted')),
+  report TEXT, display_report TEXT, provenance_json TEXT, total_ms REAL,
+  UNIQUE (session_id, seq_in_session));
+CREATE TABLE IF NOT EXISTS events (
+  message_id TEXT NOT NULL REFERENCES messages(id), seq INTEGER NOT NULL, ts TEXT NOT NULL,
+  event TEXT NOT NULL, data_json TEXT NOT NULL, PRIMARY KEY (message_id, seq));
+CREATE TABLE IF NOT EXISTS artifacts (
+  message_id TEXT NOT NULL REFERENCES messages(id), kind TEXT NOT NULL,
+  path TEXT NOT NULL, restricted INTEGER NOT NULL DEFAULT 0);
+"""
+
+_SESSION_SELECT = ("SELECT s.id, s.created_at, s.updated_at, s.title, s.mode, "
+                   "(SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id AND m.role = 'user') AS turns "
+                   "FROM sessions s ")
+_IN_SCOPE = "(? IS NULL OR s.client_id = ?)"   # bound twice with client_id
+_EXPIRED = ("created_at < ? AND (? IS NULL OR mode = ?) AND NOT EXISTS "   # bound with (cutoff, mode, mode)
+            "(SELECT 1 FROM messages m WHERE m.session_id = sessions.id AND m.status = 'running')")
+_PURGE_SQL = (   # one session, in foreign-key order
+    "DELETE FROM events WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?)",
+    "DELETE FROM artifacts WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?)",
+    "DELETE FROM messages WHERE session_id = ?",
+    "DELETE FROM sessions WHERE id = ?",
+)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _stamp() -> str:
+    """The UTC time to the second as a file name carries it, 20261013T181530Z: what a saved export's name adds to the export's own."""
+    return datetime.now(timezone.utc).strftime(STAMP_FORMAT)
+
+
+def _stamp_time(stamp: str) -> Optional[datetime]:
+    """The UTC time a saved export's name carries (_stamp's format read back); None when the digits are no time, such as month 99."""
+    try:
+        return datetime.strptime(stamp, STAMP_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _dumps(obj: Any) -> str:
+    """The encoding of an SSE frame's data line, so a replayed frame is the stored string."""
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+
+def _loads(text: Optional[str]) -> Any:
+    return None if text is None else json.loads(text)
+
+
+def _check_mode(mode: str) -> None:
+    if mode not in MODES:
+        raise ValueError("mode must be one of {}, got {!r}".format(MODES, mode))
+
+
+def _clean_title(text: Optional[str]) -> str:
+    return collapse(text)[:MAX_TITLE]   # on the whitespace the page splits a note on (P6-A f)
+
+
+def _note_title(text: Optional[str]) -> str:
+    """What a turn's note gives the session as its title (P6-A d): the note minus its command tokens. A command is the whole note
+    (app/commands.py), so a note that is one gives nothing, and the image's file name titles the session instead."""
+    return "" if parse_command(text or "") is not None else _clean_title(text)
+
+
+def _text_or_none(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) else None
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _safe_id(value: Any) -> bool:
+    return isinstance(value, str) and SAFE_ID.fullmatch(value) is not None
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and SHA256.fullmatch(value) is not None
+
+
+def _session_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return dict(row)
+
+
+def _message_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    out = dict(row)
+    out["options"] = _loads(out.pop("options_json"))
+    out["provenance"] = _loads(out.pop("provenance_json"))
+    return out
+
+
+def _remove_tree(path: Path) -> None:
+    """Remove a session's upload directory without following symlinks (a link or file in its place is unlinked).
+
+    A missing path is fine; any other failure raises OSError, which sweep treats as "leave the rows for next time".
+    """
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+
+
+def _rmdir_quietly(path: Path) -> None:
+    try:
+        path.rmdir()   # only succeeds on an empty directory
+    except OSError:
+        pass
+
+
+class Store:
+    """The chat database and upload directory under ``home`` (CHAT_HOME)."""
+
+    def __init__(self, home: Path):
+        self.home = Path(home)
+        self._uploads = self.home / "uploads"
+        self._lock = threading.Lock()
+        self._upload_lock = threading.Lock()   # save_upload puts one copy in place at a time (P8-C)
+        self._export_lock = threading.Lock()   # save_export names and places one file at a time (P9-C)
+        self._held: Dict[str, Dict[str, Any]] = {}   # message id -> the ending the database did not take (hold_ending)
+        self.home.mkdir(parents=True, exist_ok=True)
+        self._uploads.mkdir(mode=0o700, exist_ok=True)
+        db = self.home / "chat.db"
+        try:   # DUA: the file can hold MIMIC-derived text in private mode, so it is owner-only from its first byte
+            os.close(os.open(str(db), os.O_CREAT | os.O_RDWR, 0o600))
+        except OSError:
+            pass
+        self._con = sqlite3.connect(str(db), check_same_thread=False, isolation_level=None)
+        try:
+            self._con.row_factory = sqlite3.Row
+            self._con.execute("PRAGMA locking_mode=EXCLUSIVE")   # before WAL, so WAL needs no shared memory (D22)
+            self.journal_mode = str(self._con.execute("PRAGMA journal_mode=WAL").fetchone()[0])   # as granted
+            self._con.execute("PRAGMA synchronous=NORMAL")
+            self._con.execute("PRAGMA foreign_keys=ON")
+            self._con.executescript(DDL)
+        except BaseException:
+            self._con.close()
+            raise
+
+    # ---- sessions ------------------------------------------------------------------------------------------------
+
+    def create_session(self, mode: str, client_id: Optional[str] = None, title: str = "") -> Dict[str, Any]:
+        _check_mode(mode)
+        session_id, now, title = new_id("s"), _now(), _clean_title(title)
+        with self._lock:
+            self._con.execute(
+                "INSERT INTO sessions (id, created_at, updated_at, title, mode, client_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, now, now, title, mode, client_id))
+        return {"id": session_id, "created_at": now, "updated_at": now, "title": title, "mode": mode, "turns": 0}
+
+    def list_sessions(self, client_id: Optional[str], limit: int = 50,
+                      cursor: Optional[str] = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Newest first (ids sort by creation). The cursor is the last id of the page, or None on the last page."""
+        limit = max(1, min(int(limit), MAX_PAGE))
+        with self._lock:
+            rows = self._con.execute(
+                _SESSION_SELECT + "WHERE s.deleted_at IS NULL AND " + _IN_SCOPE + " AND (? IS NULL OR s.id < ?) "
+                "ORDER BY s.id DESC LIMIT ?", (client_id, client_id, cursor, cursor, limit + 1)).fetchall()
+        page = [_session_dict(r) for r in rows[:limit]]
+        return page, (page[-1]["id"] if len(rows) > limit else None)
+
+    def get_session(self, session_id: str, client_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """The session with its messages in order (events come from events_after); None if hidden or deleted."""
+        with self._lock:
+            row = self._session_row(session_id, client_id)
+            if row is None:
+                return None
+            messages = self._con.execute(
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY seq_in_session", (session_id,)).fetchall()
+            out = _session_dict(row)
+            out["messages"] = [self._message_out(m) for m in messages]
+        return out
+
+    def delete_session(self, session_id: str, client_id: Optional[str]) -> bool:
+        if not _safe_id(session_id):
+            return False
+        with self._lock:
+            cur = self._con.execute(
+                "UPDATE sessions SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL "
+                "AND (? IS NULL OR client_id = ?)", (_now(), session_id, client_id, client_id))
+            deleted = cur.rowcount == 1
+        if deleted:
+            shutil.rmtree(self._uploads / session_id, ignore_errors=True)
+        return deleted
+
+    def last_image(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """The image (or test row) of the session's latest turn that carried one; a text-only turn reuses it."""
+        with self._lock:
+            row = self._con.execute(
+                "SELECT image_sha256, image_filename, test_row FROM messages WHERE session_id = ? AND role = 'user' "
+                "AND (image_sha256 IS NOT NULL OR test_row IS NOT NULL) ORDER BY seq_in_session DESC LIMIT 1",
+                (session_id,)).fetchone()
+        if row is None:
+            return None
+        return {"sha256": row["image_sha256"], "filename": row["image_filename"], "test_row": row["test_row"]}
+
+    # ---- turns and events ----------------------------------------------------------------------------------------
+
+    def start_turn(self, session_id: str, text: str, mode: str, options: Dict[str, Any],
+                   image_sha256: Optional[str] = None, image_filename: Optional[str] = None,
+                   test_row: Optional[int] = None) -> Tuple[str, str]:
+        """Store the user message (done) and the assistant message (running); -> (user_message_id, message_id).
+
+        The user message carries the text and the image; the assistant message carries the options and, later, the
+        result. The first turn also titles the session: the note unless it is a command, else the filename, else the test row (P6-A d:
+        "beam 5" is no title, the X-ray's name is). ``mode`` must
+        be the session's own (ValueError otherwise). A test row and a reference are private-mode data (R1): a public
+        session stores neither, not as a column and not inside the options JSON, and titles itself with neither.
+        """
+        _check_mode(mode)
+        if image_sha256 is not None and not _is_sha256(image_sha256):
+            raise ValueError("image_sha256 must be 64 lowercase hex characters")
+        user_id, message_id, now = new_id("m"), new_id("m"), _now()
+        with self._tx() as con:
+            row = con.execute("SELECT title, mode FROM sessions WHERE id = ? AND deleted_at IS NULL",
+                              (session_id,)).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            if mode != row["mode"]:
+                raise ValueError("mode {!r} is not the session's mode {!r}".format(mode, row["mode"]))
+            if row["mode"] != "private":
+                test_row = None
+                options = {k: v for k, v in (options or {}).items() if k not in PRIVATE_OPTION_KEYS}
+            title = (row["title"] or _note_title(text) or _clean_title(image_filename)
+                     or ("test row {}".format(test_row) if test_row is not None else ""))
+            last = con.execute("SELECT COALESCE(MAX(seq_in_session), 0) FROM messages WHERE session_id = ?",
+                               (session_id,)).fetchone()[0]
+            con.execute(
+                "INSERT INTO messages (id, session_id, seq_in_session, role, created_at, text, mode, image_sha256, "
+                "image_filename, test_row, status) VALUES (?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, 'done')",
+                (user_id, session_id, last + 1, now, text or "", mode, image_sha256, image_filename, test_row))
+            con.execute(
+                "INSERT INTO messages (id, session_id, seq_in_session, role, created_at, mode, options_json, status) "
+                "VALUES (?, ?, ?, 'assistant', ?, ?, ?, 'running')",
+                (message_id, session_id, last + 2, now, mode, _dumps(options or {})))
+            con.execute("UPDATE sessions SET updated_at = ?, title = ? WHERE id = ?", (now, title, session_id))
+        return user_id, message_id
+
+    def save_upload(self, session_id: str, sha256: str, original: bytes, ext: str,
+                    thumb_jpeg: bytes, model_input_png: bytes) -> bool:
+        """Write uploads/<session>/<sha256>/{original.<ext>, thumb.jpg, model_input.png}; -> True when this call wrote the copy.
+
+        Atomic: the files go to a temp directory that is renamed into place, so a failed write (disk quota) leaves
+        nothing behind. Once per session and hash: if all three files are there already, the first copy stands and this
+        call wrote nothing (False). Saves of the same bytes at once (turns of one session that carry one picture) are
+        safe: the copy that is put in place first stands, and a save that is late finds it complete, leaves it alone and
+        returns False (P8-C, the load drill). discard_upload takes back a copy that was written for a turn that was then
+        not started (P6 fix 2).
+        """
+        if not _safe_id(session_id) or not _is_sha256(sha256):
+            raise ValueError("session_id and sha256 must be plain ids")
+        ext = ext.lower().lstrip(".")
+        ext = "jpg" if ext == "jpeg" else ext
+        if ext not in UPLOAD_EXTS:
+            raise ValueError("ext must be one of {}, got {!r}".format(UPLOAD_EXTS, ext))
+        with self._lock:
+            if not self._session_alive(session_id):
+                raise KeyError(session_id)
+        final = self._uploads / session_id / sha256
+        names = ("original.{}".format(ext), UPLOAD_NAMES["thumb"], UPLOAD_NAMES["model_input"])
+
+        def complete() -> bool:
+            return all((final / name).is_file() for name in names)
+
+        if complete():
+            return False
+        tmp = final.parent / ".{}.{}.tmp".format(sha256[:12], secrets.token_hex(4))
+        try:
+            tmp.mkdir(parents=True, mode=0o700)
+            for name, blob in zip(names, (original, thumb_jpeg, model_input_png)):
+                (tmp / name).write_bytes(blob)
+            with self._upload_lock:   # one copy at a time: a save that is late must see the copy of the save before it, complete
+                if complete():
+                    return False   # the copy in place stands; the finally below removes this save's temporary directory
+                if final.exists():
+                    shutil.rmtree(final, ignore_errors=True)   # an incomplete leftover
+                try:
+                    os.replace(str(tmp), str(final))
+                except OSError:
+                    if not complete():   # else the copy is in place already
+                        raise
+                    return False
+                return True   # the only path on which this call wrote the copy
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)   # after a successful rename tmp is gone and this does nothing
+            if not final.exists():
+                _rmdir_quietly(final.parent)   # a failed first upload leaves no empty session directory either
+
+    def discard_upload(self, session_id: str, sha256: str) -> None:
+        """Remove uploads/<session>/<sha256>, and the session's directory if that leaves it empty (P6 fix 2).
+
+        Only for the copy a turn route wrote itself (save_upload said True) for a turn it then did not start, its client
+        gone: a copy that stood already is an earlier turn's. A copy that is gone already is fine; a failure to remove it
+        is left to the session's deletion, as the copy names nothing.
+        """
+        if not _safe_id(session_id) or not _is_sha256(sha256):
+            raise ValueError("session_id and sha256 must be plain ids")
+        final = self._uploads / session_id / sha256
+        with self._upload_lock:   # never between another save's complete() check and its rename
+            shutil.rmtree(final, ignore_errors=True)
+            _rmdir_quietly(final.parent)
+
+    def upload_path(self, session_id: str, sha256: str, variant: str) -> Optional[Path]:
+        """The file of one variant ("original", "thumb" or "model_input"); None if absent, unsafe or deleted."""
+        if not _safe_id(session_id) or not _is_sha256(sha256):
+            return None
+        with self._lock:
+            if not self._session_alive(session_id):
+                return None
+        base = self._uploads / session_id / sha256
+        if variant == "original":
+            candidates = [base / "original.{}".format(ext) for ext in UPLOAD_EXTS]
+        elif variant in UPLOAD_NAMES:
+            candidates = [base / UPLOAD_NAMES[variant]]
+        else:
+            return None
+        return next((p for p in candidates if p.is_file()), None)
+
+    def append_event(self, message_id: str, event: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Store one event in its own transaction; -> data plus its seq (1, 2, ... per message, no gaps).
+
+        Raises KeyError for a message that does not exist (a deleted session's messages still do).
+        """
+        with self._tx() as con:
+            if con.execute("SELECT 1 FROM messages WHERE id = ?", (message_id,)).fetchone() is None:
+                raise KeyError(message_id)
+            return self._insert_event(con, message_id, event, data)
+
+    def events_after(self, message_id: str, after: int = 0) -> List[Dict[str, Any]]:
+        """The message's events whose seq is above `after`, in order, those of an ending held for it included (_held_rows)."""
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT seq, event, data_json FROM events WHERE message_id = ? AND seq > ? ORDER BY seq",
+                (message_id, after)).fetchall()
+            held = self._held_rows(message_id, after)
+        return [{"seq": r["seq"], "event": r["event"], "data": json.loads(r["data_json"])} for r in rows] + held
+
+    def get_message(self, message_id: str, client_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """One message, resolved through its session: hidden by scope or by deletion, it is None. The final fields of an ending held for
+        it are applied (_message_out)."""
+        with self._lock:
+            row = self._con.execute(
+                "SELECT m.* FROM messages m JOIN sessions s ON s.id = m.session_id "
+                "WHERE m.id = ? AND s.deleted_at IS NULL AND " + _IN_SCOPE,
+                (message_id, client_id, client_id)).fetchone()
+            return None if row is None else self._message_out(row)
+
+    def message_visible(self, message_id: str) -> bool:
+        """get_message(message_id, None) is not None, without reading the row: a running turn asks it at every step (P4-H)."""
+        with self._lock:
+            return self._con.execute(
+                "SELECT 1 FROM messages m JOIN sessions s ON s.id = m.session_id WHERE m.id = ? AND s.deleted_at IS NULL",
+                (message_id,)).fetchone() is not None
+
+    def finish_turn(self, message_id: str, status: str, report: Optional[str] = None,
+                    display_report: Optional[str] = None, provenance: Optional[Dict[str, Any]] = None,
+                    total_ms: Optional[float] = None) -> None:
+        """The turn's final status and result, in its message's row. An ending held for it is let go: the database has the turn now."""
+        if status not in FINAL_STATUSES:
+            raise ValueError("status must be one of {}, got {!r}".format(FINAL_STATUSES, status))
+        with self._tx() as con:
+            cur = con.execute(
+                "UPDATE messages SET status = ?, report = ?, display_report = ?, provenance_json = ?, total_ms = ? "
+                "WHERE id = ? AND role = 'assistant'",
+                (status, report, display_report, None if provenance is None else _dumps(provenance),
+                 None if total_ms is None else float(total_ms), message_id))
+            if cur.rowcount != 1:
+                raise KeyError(message_id)
+            con.execute("UPDATE sessions SET updated_at = ? WHERE id = (SELECT session_id FROM messages WHERE id = ?)",
+                        (_now(), message_id))
+        with self._lock:
+            self._held.pop(message_id, None)
+
+    def hold_ending(self, message_id: str, events: Sequence[Tuple[str, Dict[str, Any]]], status: str,
+                    report: Optional[str] = None, display_report: Optional[str] = None,
+                    provenance: Optional[Dict[str, Any]] = None, total_ms: Optional[float] = None) -> None:
+        """Keep in memory the end of a turn that the database did not take (P8-D follow-up): `events`, the (event, data) pairs the pipeline
+        could not store, in their order, and the fields finish_turn would have stored. It is held until the process ends or until
+        finish_turn takes the turn, and every read gives the message as if it had been stored: its final fields, and those events after
+        the last one the database holds for it. Writes nothing to the database, which has just failed."""
+        if status not in FINAL_STATUSES:
+            raise ValueError("status must be one of {}, got {!r}".format(FINAL_STATUSES, status))
+        held = {"events": [(event, copy.deepcopy(data), _now()) for event, data in events],
+                "message": {"status": status, "report": report, "display_report": display_report,
+                            "provenance": copy.deepcopy(provenance), "total_ms": None if total_ms is None else float(total_ms)}}
+        with self._lock:
+            self._held[message_id] = held
+
+    def held_endings(self) -> Dict[str, List[str]]:
+        """-> {message id: the names of its held events, in order} for every turn whose ending is held in memory."""
+        with self._lock:
+            return {message_id: [event for event, _, _ in held["events"]] for message_id, held in self._held.items()}
+
+    def recover_after_restart(self) -> int:
+        """Close every turn a restart left running; -> how many.
+
+        A turn whose log has no message_stop gets the ending a failed turn gets (an error event with type
+        "server_restart", then message_stop with status "error"), so a client polling it stops. A turn that did log
+        its message_stop but died before finish_turn is finished from that event instead. One transaction.
+        """
+        with self._tx() as con:
+            running = [r[0] for r in con.execute("SELECT id FROM messages WHERE status = 'running' ORDER BY id")]
+            for message_id in running:
+                row = con.execute("SELECT data_json FROM events WHERE message_id = ? AND event = 'message_stop' "
+                                  "ORDER BY seq DESC LIMIT 1", (message_id,)).fetchone()
+                if row is None:
+                    self._insert_event(con, message_id, "error", {
+                        "type": "error", "error": {"type": "server_restart", "message": RESTART_MESSAGE}})
+                    stop = self._insert_event(con, message_id, "message_stop", {
+                        "message_id": message_id, "status": "error", "total_ms": None, "report": None,
+                        "display_report": None, "truncated_mid_sentence": False, "disclaimer": DISCLAIMER})
+                else:
+                    stop = json.loads(row[0])
+                status = stop.get("status") if stop.get("status") in FINAL_STATUSES else "error"
+                # the stored event is untrusted at start-up: an odd value must not stop the server from coming up
+                con.execute("UPDATE messages SET status = ?, report = ?, display_report = ?, total_ms = ? WHERE id = ?",
+                            (status, _text_or_none(stop.get("report")), _text_or_none(stop.get("display_report")),
+                             _float_or_none(stop.get("total_ms")), message_id))
+        return len(running)
+
+    # ---- export and retention ------------------------------------------------------------------------------------
+
+    def export(self, session_id: str, fmt: str, client_id: Optional[str]) -> Tuple[str, str, bytes]:
+        """-> (filename, media type, body) for fmt "json" (the event log) or "md" (the readable record). An ending held for a turn is
+        part of it, as every read gives it.
+
+        Raises KeyError if the session is hidden by scope or deleted, ValueError for another format.
+        """
+        if fmt not in ("json", "md"):
+            raise ValueError("export format must be 'json' or 'md', got {!r}".format(fmt))
+        with self._lock:
+            row = self._session_row(session_id, client_id)
+            if row is None:
+                raise KeyError(session_id)
+            rows = self._con.execute(
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY seq_in_session", (session_id,)).fetchall()
+            events = self._con.execute(
+                "SELECT e.message_id, e.seq, e.ts, e.event, e.data_json FROM events e "
+                "JOIN messages m ON m.id = e.message_id WHERE m.session_id = ? ORDER BY e.message_id, e.seq",
+                (session_id,)).fetchall()
+            messages = [self._message_out(m) for m in rows]
+            held = {m["id"]: self._held_rows(m["id"], stamped=True) for m in messages}
+        logs: Dict[str, List[Dict[str, Any]]] = {}
+        for e in events:
+            logs.setdefault(e["message_id"], []).append(
+                {"seq": e["seq"], "ts": e["ts"], "event": e["event"], "data": json.loads(e["data_json"])})
+        session = _session_dict(row)
+        docs = [dict(m, events=logs.get(m["id"], []) + held[m["id"]]) for m in messages]
+        if fmt == "json":
+            body = json.dumps({"session": session, "messages": docs}, indent=2, ensure_ascii=False)
+            return "session-{}.json".format(session_id), "application/json", body.encode("utf-8")
+        return ("session-{}.md".format(session_id), "text/markdown; charset=utf-8",
+                _markdown(session, docs).encode("utf-8"))
+
+    def save_export(self, session_id: str, fmt: str, client_id: Optional[str]) -> Tuple[str, int]:
+        """Write the session's export under <home>/exports/ and -> (the file's name, its size in bytes) (P9-C: an export that must stay on the
+        server). The body is export()'s own, the one every download gets, so an ending the database did not take (the held ones) is in the file too.
+        KeyError and ValueError are export()'s, raised before the directory or any file is made; any OSError is the caller's.
+
+        The file is session-<id>-<UTC time to the second>.json or .md: a new name each time. One that is taken (a second save in the same second)
+        gets -2, -3 ... before the extension, and no file is ever replaced. It is owner-only (mode 0600, whatever the umask; the directory 0700, made
+        so, and narrowed if somebody made it wider, never widened) and written whole: first to a hidden temporary file of the same directory, then
+        renamed to its name, so that nothing is ever there under a name that is only half written. The temporary file is removed if anything fails."""
+        filename, _, body = self.export(session_id, fmt, client_id)
+        stem, ext = os.path.splitext(filename)
+        directory = self.home / EXPORT_DIR
+        directory.mkdir(mode=0o700, exist_ok=True)
+        mode = stat.S_IMODE(directory.stat().st_mode)
+        if mode & 0o077:
+            os.chmod(str(directory), mode & 0o700)
+        tmp = directory / ".{}.{}.tmp".format(stem, secrets.token_hex(4))
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            stamp = _stamp()
+            with self._export_lock:   # the first free name is taken by the rename that follows it: one save at a time (this process owns the home)
+                for attempt in range(1, MAX_SAVES_PER_SECOND + 1):
+                    name = "{}-{}{}{}".format(stem, stamp, "" if attempt == 1 else "-{}".format(attempt), ext)
+                    if not os.path.lexists(str(directory / name)):
+                        os.replace(str(tmp), str(directory / name))
+                        return name, len(body)
+            raise FileExistsError(errno.EEXIST, "no free name for an export")
+        finally:
+            try:
+                os.unlink(str(tmp))   # gone already after a rename
+            except OSError:
+                pass
+
+    def sweep_exports(self, older_than_days: int, now: Optional[datetime] = None) -> int:
+        """Remove the saved exports more than ``older_than_days`` days old and the temporary files of saves that died; -> how many files (P9-C
+        follow-up: a saved export is kept as long as a private session, 45 days). The age is the UTC time in the file's name, to the second, and only
+        a file strictly older goes, the rule of sweep (`created_at < cutoff`): one exactly that old stays until the next second. The name alone says
+        what is ours: save_export's own (EXPORT_NAME) or its temporary one (EXPORT_TEMP). A temporary name has no time in it, so that file goes when
+        its own modification time is more than EXPORT_TEMP_DAYS old, as does a file of the first kind whose digits are no time (month 99).
+
+        The directory is opened once, with O_NOFOLLOW, and everything after the open goes through that one handle: the listing (scandir of the
+        handle), the look at each entry (never through a link) and each removal (unlink of the bare name, relative to the handle). So a link in the
+        directory's place is refused at the open (one line of the log, in words, with no path), and an exports/ that is swapped for a link after the
+        open changes nothing: the sweep goes on in the directory it opened. Of the names that are ours only a regular file is removed: a link that
+        the listing shows is passed over, a directory is never entered, and no other name is touched. What no call can close is an entry that
+        becomes a link after it was listed; unlink never follows a link, so what such a link points to is never touched (at most the link itself
+        goes, a name of ours).
+
+        Nothing is raised for a file or the directory, only for a negative number of days: a file that cannot be removed is skipped and logged with
+        the class of its exception and nothing else (the text of an OSError names a path), and the next sweep tries it again; a missing directory
+        has nothing to sweep. ``now``, a datetime with a time zone, is the clock (a test gives one). The count is of the files removed, a leftover
+        temporary file among them."""
+        if older_than_days < 0:
+            raise ValueError("older_than_days must not be negative")
+        now = datetime.now(timezone.utc) if now is None else now
+        try:
+            cutoff: Optional[datetime] = now - timedelta(days=older_than_days)
+        except OverflowError:   # nothing is that old
+            cutoff = None
+        temp_cutoff = (now - timedelta(days=EXPORT_TEMP_DAYS)).timestamp()
+        directory = str(self.home / EXPORT_DIR)
+        try:   # the one look at the path: a link in the directory's place is refused here (ELOOP, or ENOTDIR on Linux), and nothing below uses the path
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return 0
+        except OSError as exc:
+            if os.path.islink(directory):   # only to say why: it picks the line of the log and decides nothing
+                log.warning("sweep: the exports directory is a symbolic link, so it is not swept")
+            else:
+                log.warning("sweep: could not open the saved exports (%s); the next sweep retries", type(exc).__name__)
+            return 0
+        removed = 0
+        try:
+            try:
+                with os.scandir(fd) as scan:   # the directory the handle is, listed whole before anything is removed
+                    entries = list(scan)
+            except OSError as exc:
+                log.warning("sweep: could not list the saved exports (%s); the next sweep retries", type(exc).__name__)
+                return 0
+            for entry in entries:   # scandir(fd) gives bare names: every call below goes through the handle, none through a path
+                export = EXPORT_NAME.fullmatch(entry.name)
+                if export is None and EXPORT_TEMP.fullmatch(entry.name) is None:
+                    continue   # a name that save_export does not make: not ours
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue   # a link, a directory, anything but a regular file: passed over, never entered
+                    if export is None:   # a temporary file: its own time
+                        expired = entry.stat(follow_symlinks=False).st_mtime < temp_cutoff
+                    else:
+                        stamped = _stamp_time(export.group("stamp"))
+                        if stamped is not None:
+                            expired = cutoff is not None and stamped < cutoff
+                        else:   # the name of a save, with digits that are no time: the file's own
+                            expired = cutoff is not None and entry.stat(follow_symlinks=False).st_mtime < cutoff.timestamp()
+                    if expired:
+                        os.unlink(entry.name, dir_fd=fd)   # a name in the opened directory: unlink never follows a link
+                        removed += 1
+                except FileNotFoundError:
+                    continue   # gone already
+                except OSError as exc:
+                    log.warning("sweep: could not remove a saved export (%s); the next sweep retries", type(exc).__name__)
+        finally:
+            os.close(fd)
+        return removed
+
+    def sweep(self, older_than_days: int, mode: Optional[str] = None) -> int:
+        """Purge sessions created more than ``older_than_days`` ago; -> how many.
+
+        ``mode`` limits it to sessions created in that mode (the server keeps 45 days for private, 7 for public).
+        Keyed on creation time, so "sessions are deleted after N days" holds even for one still in use. Deleted
+        sessions are purged too; a session whose turn is still running waits for the next sweep (run
+        recover_after_restart first at start-up). Per session the upload directory is removed first and the rows
+        are deleted and committed after, so a crash or a failed removal (it is logged) leaves the rows for the
+        next sweep to redo. Last, upload directories that no live session owns (a crash, or a save_upload that
+        raced a delete) are removed, whatever ``mode`` is.
+        """
+        if older_than_days < 0:
+            raise ValueError("older_than_days must not be negative")
+        if mode is not None:
+            _check_mode(mode)
+        try:
+            cutoff: Optional[str] = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat(
+                timespec="microseconds")
+        except OverflowError:   # nothing is that old
+            cutoff = None
+        purged = 0
+        if cutoff is not None:
+            with self._lock:
+                ids = [r[0] for r in self._con.execute(
+                    "SELECT id FROM sessions WHERE " + _EXPIRED + " ORDER BY id", (cutoff, mode, mode))]
+            purged = sum(self._purge(session_id, cutoff, mode) for session_id in ids)
+        self._reclaim_orphan_uploads()
+        return purged
+
+    # The two steps of sweep. Each takes the lock itself, one session at a time, so event writes are not held up long.
+    def _purge(self, session_id: str, cutoff: str, mode: Optional[str]) -> int:
+        """Remove one expired session in one transaction, its upload directory before its rows; -> 1, or 0 if skipped.
+
+        Still expired and still idle is checked again here: a turn may have started since sweep chose the session.
+        If the directory cannot be removed the transaction rolls back, so the rows stay and the next sweep retries.
+        """
+        try:
+            with self._tx() as con:
+                if con.execute("SELECT 1 FROM sessions WHERE id = ? AND " + _EXPIRED,
+                               (session_id, cutoff, mode, mode)).fetchone() is None:
+                    return 0
+                if _safe_id(session_id):
+                    _remove_tree(self._uploads / session_id)
+                for sql in _PURGE_SQL:
+                    con.execute(sql, (session_id,))
+            return 1
+        except OSError as exc:
+            log.warning("sweep: could not remove uploads/%s (%s); its rows stay for the next sweep", session_id, exc)
+            return 0
+
+    def _reclaim_orphan_uploads(self) -> None:
+        """Remove uploads/<name> directories that no live session owns (one scandir, symlinks never followed).
+
+        Only names that look like ids and real directories qualify. The listing is taken before the sessions are
+        read, so a session created meanwhile is never mistaken for an orphan: its directory can only appear after
+        its row. A deleted session counts as not live, which is what reclaims what a save_upload left after a delete.
+        """
+        try:
+            with os.scandir(str(self._uploads)) as entries:
+                names = [e.name for e in entries if _safe_id(e.name) and e.is_dir(follow_symlinks=False)]
+        except OSError:
+            return
+        if not names:
+            return
+        with self._lock:
+            live = {r[0] for r in self._con.execute("SELECT id FROM sessions WHERE deleted_at IS NULL")}
+        for name in names:
+            if name not in live:
+                try:
+                    shutil.rmtree(self._uploads / name)
+                except OSError as exc:
+                    log.warning("sweep: could not remove orphaned uploads/%s (%s); the next sweep retries", name, exc)
+
+    def close(self) -> None:
+        """Release the EXCLUSIVE lock (D22); the server's lifespan calls this at shutdown."""
+        with self._lock:
+            self._con.close()
+
+    # ---- helpers (the lock is held by the caller) ----------------------------------------------------------------
+
+    @contextmanager
+    def _tx(self) -> Iterator[sqlite3.Connection]:
+        """One write transaction under the lock: BEGIN IMMEDIATE, COMMIT, or ROLLBACK if the body raises."""
+        with self._lock:
+            con = self._con
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                yield con
+                con.execute("COMMIT")
+            except BaseException:
+                try:
+                    con.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def _insert_event(self, con: sqlite3.Connection, message_id: str, event: str,
+                      data: Dict[str, Any]) -> Dict[str, Any]:
+        seq = con.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE message_id = ?",
+                          (message_id,)).fetchone()[0]
+        stored = dict(data, seq=seq)
+        con.execute("INSERT INTO events (message_id, seq, ts, event, data_json) VALUES (?, ?, ?, ?, ?)",
+                    (message_id, seq, _now(), event, _dumps(stored)))
+        return stored
+
+    def _session_row(self, session_id: str, client_id: Optional[str]) -> Optional[sqlite3.Row]:
+        return self._con.execute(_SESSION_SELECT + "WHERE s.id = ? AND s.deleted_at IS NULL AND " + _IN_SCOPE,
+                                 (session_id, client_id, client_id)).fetchone()
+
+    # The one place a read takes a held ending from (P8-D follow-up): every read of a message goes through _message_out, and every read of
+    # its events through _held_rows, and both ask _held_for. A turn the database has finished has its ending there, so nothing held applies.
+    def _held_for(self, message_id: str, status: Any) -> Optional[Dict[str, Any]]:
+        held = self._held.get(message_id)
+        return held if held is not None and status == "running" else None
+
+    def _message_out(self, row: sqlite3.Row) -> Dict[str, Any]:
+        """A message as every read gives it: its row, with the final fields of an ending held for it."""
+        out = _message_dict(row)
+        held = self._held_for(out["id"], out["status"])
+        if held is not None:
+            out.update(copy.deepcopy(held["message"]))
+        return out
+
+    def _held_rows(self, message_id: str, after: int = 0, stamped: bool = False) -> List[Dict[str, Any]]:
+        """The events of an ending held for this message whose seq is above `after`, numbered on from the last event the database holds for
+        it, so that no seq comes twice and their order stays; with `ts` (the time each was held) when stamped, as the export has it."""
+        if message_id not in self._held:
+            return []
+        row = self._con.execute("SELECT status, (SELECT COALESCE(MAX(seq), 0) FROM events WHERE message_id = ?) FROM messages "
+                                "WHERE id = ?", (message_id, message_id)).fetchone()
+        held = None if row is None else self._held_for(message_id, row[0])
+        if held is None:
+            return []
+        out = []
+        for seq, (event, data, ts) in enumerate(held["events"], row[1] + 1):
+            if seq > after:
+                stored = dict(copy.deepcopy(data), seq=seq)
+                out.append({"seq": seq, "ts": ts, "event": event, "data": stored} if stamped else {"seq": seq, "event": event, "data": stored})
+        return out
+
+    def _session_alive(self, session_id: str) -> bool:
+        return self._con.execute("SELECT 1 FROM sessions WHERE id = ? AND deleted_at IS NULL",
+                                 (session_id,)).fetchone() is not None
+
+
+# ---- markdown export -------------------------------------------------------------------------------------------------
+
+def _utc_text(stamp: Any) -> str:
+    try:
+        t = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return str(stamp)
+    if t.tzinfo is not None:
+        t = t.astimezone(timezone.utc)
+    return t.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _oneline(value: Any) -> str:
+    if isinstance(value, (dict, list)):
+        value = _dumps(value)
+    return " ".join(str(value).split())
+
+
+def _cell(value: Any) -> str:
+    return _oneline(value).replace("|", "\\|")
+
+
+def _quote(text: Any) -> str:
+    return "\n".join("> " + line if line else ">" for line in str(text).splitlines() or [""])
+
+
+def _num(value: Any) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "{:.3f}".format(value)
+    return _oneline(value)
+
+
+def _stage_detail(events: List[Dict[str, Any]], stage: str) -> Dict[str, Any]:
+    """The detail of the last stage_end event of this stage that has one (a skipped stage has none)."""
+    found: Dict[str, Any] = {}
+    for e in events:
+        data = e["data"]
+        if e["event"] == "stage_end" and data.get("stage") == stage and isinstance(data.get("detail"), dict):
+            found = data["detail"]
+    return found
+
+
+def _error_message(events: List[Dict[str, Any]]) -> Optional[str]:
+    for e in reversed(events):
+        if e["event"] == "error" and isinstance(e["data"].get("error"), dict):
+            return e["data"]["error"].get("message")
+    return None
+
+
+def _compare_part(events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A compare turn's block 1 (P9-F), read from the log, the only place it is kept: {model, started, report, display_report, positives}. started:
+    the log holds block 1's content_block_start. The others are None when the log does not have them (a turn that did not finish has no report,
+    one that was not labelled no positives). None for any other turn."""
+    start = next((e["data"] for e in events if e["event"] == "message_start"), {})
+    if not isinstance(start.get("compare"), dict):
+        return None
+    stop = next((e["data"] for e in reversed(events) if e["event"] == "message_stop"), {})
+    ended = stop.get("compare") if isinstance(stop.get("compare"), dict) else {}
+    labels = _stage_detail(events, "label").get("compare")
+    started = any(e["event"] == "content_block_start" and e["data"].get("index") == 1 for e in events)
+    return {"model": ended.get("model") or start["compare"].get("model"), "started": started, "report": ended.get("report"),
+            "display_report": ended.get("display_report"), "positives": labels.get("positives") if isinstance(labels, dict) else None}
+
+
+# How a compare turn whose block 1 started, and which did not finish, ended (P9-F fix 1): block 0's rule, no report, and the status in words.
+COMPARE_ENDED = {"aborted": "the turn was stopped", "error": "the turn ended in an error", "running": "the turn is still running"}
+
+
+def _compare_lines(partner: Dict[str, Any], status: str) -> List[str]:
+    """A compare turn's Markdown lines (P9-F), which say only what happened: the second report, its model and its positive labels for a turn
+    that finished; what became of it for one that did not, and then what block 0's part shows of such a turn, its labels once the label stage
+    has run (fix 2); and one line when the turn ended before block 1 started (P9-F fix 1)."""
+    model = _oneline(partner["model"])
+    if not partner["started"]:
+        if status == "running":
+            return ["", "Compare mode: {} decodes the same X-ray once the first report is done; the turn is still running.".format(model)]
+        return ["", "Compare mode: the turn ended before {} decoded.".format(model)]
+    if status == "done":
+        out = ["", "Compare mode: the same X-ray, decoded by {} too.".format(model)]
+    else:   # the report and the positives follow, by block 0's rule: a report when the turn has one, the labels whatever the status (fix 2)
+        out = ["", "Compare mode: {} began decoding the same X-ray too, and {}.".format(model, COMPARE_ENDED.get(status, "the turn ended " + status))]
+    if partner["report"]:
+        out += ["", "Report ({}):".format(model), "", _quote(partner["report"])]
+        if partner["display_report"] and partner["display_report"] != partner["report"]:
+            out += ["", "Display report ({}, sentence repaired):".format(model), "", _quote(partner["display_report"])]
+    if isinstance(partner["positives"], list):
+        out += ["", "Positive CheXbert-14 labels ({}): {}".format(model, ", ".join(_oneline(p) for p in partner["positives"]) or "none")]
+    return out
+
+
+def _markdown(session: Dict[str, Any], messages: List[Dict[str, Any]]) -> str:
+    """Per turn: heading with the time, the image (filename or test row), the report, the 14 labels, a compare turn's second report
+    (its model, its text and its positive labels: P9-F), neighbours, one provenance line. Neighbours (MIMIC-derived) and test rows appear
+    only if the session is private."""
+    private = session["mode"] == "private"
+    header = ["Mode: {}".format(session["mode"]), "Created: {}".format(_utc_text(session["created_at"]))]
+    if session["title"]:
+        header.append("Title: {}".format(_oneline(session["title"])))
+    out = ["# Session {}".format(session["id"]), "", "_{}_".format(DISCLAIMER), "", " · ".join(header)]
+    turns: List[Dict[str, Any]] = []
+    for m in messages:
+        if m["role"] == "user":
+            turns.append({"user": m, "assistant": None})
+        elif turns and turns[-1]["assistant"] is None:
+            turns[-1]["assistant"] = m
+        else:   # an assistant message with no user message before it (start_turn never writes one)
+            turns.append({"user": None, "assistant": m})
+    for n, turn in enumerate(turns, 1):
+        user, asst = turn["user"], turn["assistant"]
+        out += ["", "## Turn {} — {}".format(n, _utc_text((user or asst)["created_at"]))]
+        if user is not None:
+            if user["image_filename"]:
+                out += ["", "Image: `{}`".format(_oneline(user["image_filename"]).replace("`", "'"))]
+            elif user["test_row"] is not None and private:
+                out += ["", "Image: test row {}".format(user["test_row"])]
+            if user["text"].strip():
+                out += ["", "Text:", "", _quote(user["text"])]
+        if asst is None:
+            continue
+        events = asst["events"]
+        if asst["report"]:
+            out += ["", "Report:", "", _quote(asst["report"])]
+            if asst["display_report"] and asst["display_report"] != asst["report"]:
+                out += ["", "Display report (sentence repaired):", "", _quote(asst["display_report"])]
+        if asst["status"] != "done":
+            error = _error_message(events)
+            out += ["", "Status: {}{}".format(asst["status"], " · Error: {}".format(_oneline(error)) if error else "")]
+        labels = _stage_detail(events, "label").get("chexbert_14")
+        if isinstance(labels, dict) and labels:
+            out += ["", "CheXbert-14 labels of the generated report (1 = positive):", "",
+                    "| Finding | Label |", "| --- | --- |"]
+            out += ["| {} | {} |".format(_cell(k), _cell(v)) for k, v in labels.items()]
+        partner = _compare_part(events)
+        if partner is not None:   # P9-F: a compare turn's second report, with its model and its positive labels, or what became of it
+            out += _compare_lines(partner, asst["status"])
+        if private:
+            found = _stage_detail(events, "retrieve")
+            images = [x for x in found.get("image_neighbors") or [] if isinstance(x, dict)]
+            reports = [x for x in found.get("report_matches") or [] if isinstance(x, dict)]
+            if images:
+                out += ["", "Nearest images:", ""]
+                out += ["- #{} · similarity {}{}".format(
+                    x.get("rank"), _num(x.get("similarity")),
+                    " · study {}".format(_oneline(x["study_id"])) if x.get("study_id") else "") for x in images]
+            if reports:
+                out += ["", "Nearest reports:", ""]
+                for x in reports:
+                    out.append("- #{} · similarity {}".format(x.get("rank"), _num(x.get("similarity"))))
+                    if x.get("report"):
+                        out.append("  " + _quote(x["report"]).replace("\n", "\n  "))
+        provenance = dict(asst["provenance"] or {})
+        if asst["total_ms"] is not None and "total_ms" not in provenance:
+            provenance["total_ms"] = asst["total_ms"]
+        parts = ["{}={}".format(k, _oneline(v)) for k, v in provenance.items() if v is not None]
+        out += ["", "Provenance: " + (" · ".join(parts) if parts else "none recorded")]
+    return "\n".join(out) + "\n"

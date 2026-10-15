@@ -1,0 +1,2364 @@
+// app/static/app.js — wires the page: routing, the sessions sidebar, the composer, one streaming turn with Stop and the
+// polling watchdog, the settings drawer, exports and the health strip (CHAT_UI_PLAN.md P4-D). api.js, state.js and render.js
+// do the data and the drawing; this file owns the page and what happens when.
+//
+// Two halves. The first is pure and exported, so node tests it without a page: parseRoute, loadSettings / saveSettings,
+// optionsFromSettings, clientId, errorMessage, createWatchdog (a state machine whose only input from outside is the clock it
+// is given) and the small formatters. The second, createApp(env), is everything that touches the page, and takes what it
+// touches (document, window, fetch, storage, timers, the api module) as env, so a test hands it a shim page and fakes. The
+// last lines start it, and only on a page that has a #composer: importing this file in node does nothing.
+//
+// A turn is one POST that streams. When no event arrives for 3 s while the turn runs, the page drops that stream (which does
+// not stop the turn on the server: D7) and polls GET /v1/messages/{id}?after=<lastSeq> until the turn ends; Stop sends the
+// cancel first and then drops the stream, and the poll brings the turn's own message_stop. Leaving a session drops the
+// stream and does not poll: coming back finds the turn running and polls it from its last seq.
+//
+// The image intake (click, drag-drop, paste, the preview) is composer.js's (P6-A): this file attaches it and spends what it holds once the
+// server has accepted the turn it went with. A picture of a card, and the upload in the user's own message (P6-G), open viewer.js over the page
+// (P6-E); while it is open it is the topmost layer: Escape closes it and nothing under it, and the focus goes back to the picture's button.
+//
+// The settings drawer is a form that ends in Save (P4-G). A number applies as it is typed while it is a whole number inside its
+// bounds; anything else is left as typed, with a line under the field that says what it takes, and is never clamped, applied or stored.
+// Save (or Enter in a field) checks every field, then stores, closes the drawer and says so; closing it any other way puts the saved
+// value back in a field that holds a draft.
+//
+// Every control is shown or hidden with the hidden attribute and every string reaches the page as a text node (el() and
+// textContent), never as markup. Nothing is stored but the settings and the client id, both inside try/catch.
+import * as realApi from './api.js';
+import { attachComposer } from './composer.js';
+import { applyEvent, initialView } from './state.js';
+import { openViewer as showViewer } from './viewer.js';
+import {
+  TEST_MODEL, detailTable, el, focusKey, isTestModel, optionChips, ownXraySide, renderAssistantCard, renderUserTurn, restoreFocus, scheduleRender, settleClamps,
+  statusText,
+} from './render.js';
+
+const { asked, authHeaders, retryAfterSeconds, REQUEST_TIMEOUT_MS } = realApi;
+
+export const SETTINGS_KEY = 'cxrchat.settings';
+export const CLIENT_KEY = 'cxrchat.client';
+export const STALL_MS = 3000;          // silence on the stream that hands a running turn to polling
+export const TICK_MS = 500;            // how often a running turn asks the watchdog
+export const HEALTH_MS = 10000;        // /healthz, while it answers
+export const HEALTH_SLOW_MS = 30000;   // and after HEALTH_SLOW_AFTER failures in a row, until it answers again
+export const HEALTH_SLOW_AFTER = 3;
+export const HEALTH_TIMEOUT_MS = 5000;  // a /healthz that has not answered by then has failed: a half-open tunnel never says so itself
+const PAGE = 50;                       // sessions per request of the sidebar
+const NEAR_PX = 80;                    // "at the bottom" for auto-scroll: within this many pixels of it
+const REVOKE_MS = 1000;                // an export's object URL is revoked this long after its link was clicked
+const SESSION_ID = /^[A-Za-z0-9_-]{1,64}$/;   // what the server's new_id produces
+const CLIENT_ID = /^[\x21-\x7e]{1,128}$/;     // what the server accepts as X-Client-Id: visible ASCII
+const SHORT_VIEWPORT = '(max-height: 480px)'; // the page scrolls instead of #conversation (styles.css)
+
+// ---- routes ---------------------------------------------------------------------------------------------------------------
+
+// #/s/<id> is a session, #/new an empty chat that has no session until its first turn is sent, and anything else (no hash,
+// "#/", a malformed id) is home: the page resolves it to the newest session, or to #/new when there is none.
+export function parseRoute(hash) {
+  const h = typeof hash === 'string' ? hash : '';
+  const m = /^#\/s\/([^/?#]+)\/?$/.exec(h);
+  if (m) {
+    let id = '';
+    try { id = decodeURIComponent(m[1]); } catch { id = ''; }
+    if (SESSION_ID.test(id)) return { kind: 'session', id };
+  }
+  return h === '#/new' ? { kind: 'new' } : { kind: 'home' };
+}
+
+// ---- settings and options --------------------------------------------------------------------------------------------------
+
+export const BOUNDS = Object.freeze({   // the server's bounds (app/schemas.py Options), in the order the drawer lists the fields
+  beam_size: [1, 8], max_new_tokens: [16, 200], k_images: [0, 12], k_reports: [0, 10],
+});
+const NUMBER_KEYS = Object.keys(BOUNDS);
+const rangeLabel = (title, key) => `${title} (${BOUNDS[key][0]}–${BOUNDS[key][1]})`;           // "Token budget (16–200)": the range is in the label
+const rangeMessage = (key) => `Enter a whole number from ${BOUNDS[key][0]} to ${BOUNDS[key][1]}.`;   // what a field says when its text is not one
+const SAVED_TEXT = 'Settings saved. They apply from your next Send.';
+const QUESTION_TEXT = 'This note is not a command: with no new image, Send gets no report.';   // the re-run hint, for a note the server will not run
+const SAVED_MS = 4000;   // how long the page says so
+const UPLOADING_TEXT = 'Uploading…';          // the status between Send and the accept of a turn that uploads an image (P6-A c)
+const SENDING_TEXT = 'Sending…';              // and of one that uploads nothing: a re-run, a test study (P6 fix 1)
+const CANCEL_UPLOAD = 'Cancel upload';        // what Stop reads then: the page has no id of the turn yet, so it aborts the request
+const CANCEL_SEND = 'Cancel';
+const CANCELLED = 'cancelled';                // what runTurn says of a turn whose request the user aborted before its id came
+const UPLOAD_CANCELLED = 'Upload cancelled.';   // what the status says once the request is aborted, for a turn that uploads an image
+const SEND_CANCELLED = 'Send cancelled.';       // and for one that uploads nothing (P6 fix 1)
+const CANCELLING_TEXT = 'Cancelling…';          // what Stop reads, switched off, while the page asks the chat about the turn (P6 fix 2)
+const MAY_FINISH_TEXT = 'The server may still finish that turn; reopen the chat to check.';   // when the chat could not be read
+const cancelledText = (file) => (file ? UPLOAD_CANCELLED : SEND_CANCELLED);
+const PICK_LIMIT = 50;         // test-split studies per request of the picker (GET /v1/test-studies takes 1 to 200)
+const PICK_DEBOUNCE_MS = 250;  // the pause in typing after which the picker asks for the studies that match
+const STORAGE_TEXT = 'Browser storage is unavailable, so these settings last until the page closes.';
+const NO_CACHE_NOTE = 'This model has no decode cache, so decoding runs uncached.';   // under Cached decode when the chosen model has none
+// P9-B: what the GitHub Pages copy says while it has no API server (it asks nothing of anyone until one is set), and what the drawer says under
+// the API server field of a value it does not take.
+const FIRST_RUN_TEXT = 'Set the API server in Settings, for example http://localhost:8000 (your tunnel).';
+const API_SERVER_TEXT = 'Enter an origin and nothing after it: https://host[:port], or http://localhost[:port] (also 127.0.0.1 or [::1]) for this computer.';
+// The published protocol, as every Options default has it, but for two switches that are on here and off in the server's Options (its
+// API contract). display_repair changes only what is shown: the report is the decoder's own text either way, and Show raw shows that
+// text. stop_on_repeat ends a decoder that has no stop condition of its own once the report begins to repeat itself, so that a turn
+// does not go on writing the same sentence to its token budget; off, the whole budget is decoded, which is the published protocol.
+// model '' is the server's default; token is the access token. The API server (api_server, P9-B) is not among them: it is a setting only once
+// one is set, so that the settings of a page that never had one are stored as they always were, and every request goes to the page's own origin.
+export const DEFAULT_SETTINGS = Object.freeze({
+  model: '', decode: 'beam', beam_size: 3, max_new_tokens: 100, cached_decode: true, compile: false,
+  k_images: 4, k_reports: 3, label: true, display_repair: true, stop_on_repeat: true, token: '',
+});
+
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+function clampInt(value, [low, high], fallback) {
+  const n = typeof value === 'number' ? value : typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
+  return Number.isFinite(n) ? Math.min(high, Math.max(low, Math.round(n))) : fallback;
+}
+
+// A whole number inside the bounds, as that number; null for anything else (half typed, out of range, not a number).
+function wholeNumber(value, [low, high]) {
+  const n = typeof value === 'number' ? value : typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
+  return Number.isInteger(n) && n >= low && n <= high ? n : null;
+}
+
+// The API server setting (P9-B): '' for this page's own origin, else an origin, returned as a browser names it (lower case, no default port, no
+// trailing slash); null for anything else. https with any host, http only with localhost, 127.0.0.1 or [::1] (this computer), a port if need be,
+// and nothing after the port but an optional "/": no path, query, fragment or user name, which would take the token, and every request,
+// somewhere else. app/cli.py normalize_origin (--cors-origin) is the same rule: tests/fixtures/origins.json holds both to it.
+const OCTET = '(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)';
+const LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
+const ORIGIN = new RegExp(`^(https?)://(\\[::1\\]|(?:${OCTET}\\.){3}${OCTET}|(?:${LABEL}\\.)*[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)(?::([1-9]\\d{0,4}))?/?$`);
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+const DEFAULT_PORTS = { http: '80', https: '443' };
+
+export function normalizeApiServer(value) {
+  if (typeof value !== 'string') return null;
+  const raw = value.replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, '');
+  if (raw === '') return '';
+  if (raw.length > 300 || !/^[\x21-\x7e]+$/.test(raw)) return null;
+  const m = ORIGIN.exec(raw.toLowerCase());
+  if (!m) return null;
+  const [, scheme, host, port] = m;
+  if (host.length > 253 || (port && Number(port) > 65535) || (scheme === 'http' && !LOOPBACK_HOSTS.has(host))) return null;
+  return `${scheme}://${host}${port && port !== DEFAULT_PORTS[scheme] ? `:${port}` : ''}`;
+}
+
+// Is this the GitHub Pages copy of the page (P9-B)? scripts/pages_build.py puts <meta name="cxr-pages" content="1"> in its index.html; the page the
+// API serves has none. There the page's own origin is github.io, which has no API.
+export const PAGES_META = 'cxr-pages';
+export function isPagesCopy(doc) {
+  try {
+    return !!doc?.querySelector?.(`meta[name="${PAGES_META}"][content="1"]`);
+  } catch { return false; }
+}
+
+// Anything in, a complete settings object out: a key that is missing or of the wrong type takes its default, a number is
+// clamped to its bounds, and a key that is not a setting is dropped. api_server is there only when one is set (P9-B), as an origin
+// normalizeApiServer takes: what it does not take is no API server at all. compare (P9-F) is there only while it is on, a real true: the
+// settings of a page that never compared are stored as they always were.
+function sanitize(raw) {
+  const o = isObject(raw) ? raw : {};
+  const d = DEFAULT_SETTINGS;
+  const flag = (key) => (typeof o[key] === 'boolean' ? o[key] : d[key]);
+  const server = normalizeApiServer(o.api_server);
+  return {
+    model: typeof o.model === 'string' ? o.model : d.model,
+    decode: o.decode === 'greedy' || o.decode === 'beam' ? o.decode : d.decode,
+    beam_size: clampInt(o.beam_size, BOUNDS.beam_size, d.beam_size),
+    max_new_tokens: clampInt(o.max_new_tokens, BOUNDS.max_new_tokens, d.max_new_tokens),
+    cached_decode: flag('cached_decode'),
+    compile: flag('compile'),
+    k_images: clampInt(o.k_images, BOUNDS.k_images, d.k_images),
+    k_reports: clampInt(o.k_reports, BOUNDS.k_reports, d.k_reports),
+    label: flag('label'),
+    display_repair: flag('display_repair'),
+    stop_on_repeat: flag('stop_on_repeat'),
+    token: typeof o.token === 'string' ? o.token : d.token,
+    ...(server ? { api_server: server } : {}),
+    ...(o.compare === true ? { compare: true } : {}),
+  };
+}
+
+// The stored settings, or the defaults. storage may be absent, may throw on any access (a browser that blocks site data),
+// and may hold anything: all of it ends in the defaults, never in an exception.
+export function loadSettings(storage) {
+  let parsed = null;
+  try {
+    const raw = storage?.getItem(SETTINGS_KEY);
+    parsed = typeof raw === 'string' ? JSON.parse(raw) : null;
+  } catch { parsed = null; }
+  return sanitize(parsed);
+}
+
+// true when the settings were stored; false when there is no storage, or it refused (full, blocked, private window).
+export function saveSettings(storage, settings) {
+  try {
+    storage.setItem(SETTINGS_KEY, JSON.stringify(sanitize(settings)));
+    return true;
+  } catch { return false; }
+}
+
+// Does the server run this stage ('retrieval' or 'labels') for this model? GET /v1/models says in each card's `features` (P5-E: the
+// gallery serves only the models of its tower) and, for the default model, in its own `features`; false means the stage is skipped.
+// The model is a name; one left out or not listed is the default, as chosenCard has it. A server that does not say (an older one, or
+// before /v1/models has answered) is taken to run it: a control is not disabled on a guess.
+export function serverHas(models, feature, model = '') {
+  const card = chosenCard({ model }, models);
+  const features = isObject(card?.features) ? card.features : isObject(models) ? models.features : null;
+  return !(isObject(features) && features[feature] === false);
+}
+
+const cardsOf = (models) => (Array.isArray(models) ? models : Array.isArray(models?.models) ? models.models : []).filter(isObject);
+
+// What the drawer says under the k fields when the chosen model runs no retrieval (P6-C ruling): a server with no gallery at all, or one
+// whose gallery another model's image tower made (a query of this model's tower would land in another space). null when it runs one.
+export const RETRIEVAL_NOTES = Object.freeze({
+  none: 'This server has no retrieval gallery, so similar X-rays and matching reports are skipped.',
+  tower: 'The gallery was built with another image tower, so this model skips similar X-rays and matching reports.',
+});
+
+// Does this server offer the test-split picker (P6-D)? Only in private mode (test-split studies are private data, R1) and with a gallery,
+// which /v1/models says by a model's features: the list and the studies come from it. A server that does not say offers none.
+export function pickerAvailable(models) {
+  if (!isObject(models) || models.mode !== 'private') return false;
+  return (isObject(models.features) && models.features.retrieval === true)
+    || cardsOf(models).some((c) => isObject(c.features) && c.features.retrieval === true);
+}
+
+// A study of the picker's list as its button reads: "study 50000007 · PA · test row 1".
+export const studyText = (s) => [s?.study_id != null ? `study ${s.study_id}` : null, typeof s?.view === 'string' && s.view ? s.view : null,
+                                 `test row ${s?.test_row}`].filter(Boolean).join(' · ');
+
+export function retrievalNote(models, model = '') {
+  if (serverHas(models, 'retrieval', model)) return null;
+  const gallery = cardsOf(models).some((c) => isObject(c.features) && c.features.retrieval === true)
+    || (isObject(models) && isObject(models.features) && models.features.retrieval === true);
+  return gallery ? RETRIEVAL_NOTES.tower : RETRIEVAL_NOTES.none;
+}
+
+// The card of the model the settings choose: the named one, else the server's default. null while /v1/models is unknown.
+export function chosenCard(settings, models) {
+  const wanted = typeof settings?.model === 'string' ? settings.model : '';
+  const cards = cardsOf(models);
+  return cards.find((c) => c.name === wanted) ?? cards.find((c) => c.name === models?.default_model) ?? null;
+}
+
+// Compare mode (P9-F). /v1/models offers it with features.compare, which a server says only when it serves a Mamba-3 model and the 13D model, and
+// each card then names its partner in compare_with: the model a compare turn of it decodes beside it. -> the partner of the model the settings
+// choose, { name, card }, or null where compare is not offered (or the chosen card names none).
+export const compareOffered = (models) => isObject(models) && isObject(models.features) && models.features.compare === true;
+export function comparePartner(settings, models) {
+  if (!compareOffered(models)) return null;
+  const name = chosenCard(settings, models)?.compare_with;
+  return typeof name === 'string' && name ? { name, card: cardsOf(models).find((c) => c.name === name) ?? null } : null;
+}
+
+// What the drawer says under the stop switch (P9-G5b), worded for the model that is chosen. A model trained to end its reports (its card says
+// eos_trained, and only a real true says it) ends at its own end of report with the switch off, as with it on, so "the whole token budget"
+// would be wrong of it; the published models have no stop of their own.
+export const STOP_HINTS = Object.freeze({
+  budget: 'Off: the published protocol, which always decodes the whole token budget.',
+  eos: 'Off: this model still ends its report where it was trained to; the token budget is the limit.',
+});
+export const stopHint = (card) => (card?.eos_trained === true ? STOP_HINTS.eos : STOP_HINTS.budget);
+
+// The options field of a turn: exactly the keys of the server's Options that the drawer sets (it refuses any other), every
+// one inside its bounds. models is the /v1/models payload ({default_model, allow_compile, models: [card, ...]}), or null
+// before it has loaded. A model the server does not list is left out, so the server's default runs; cached decoding is
+// off when the chosen card says there is no cache, and compile unless the server allows it. compare (P9-F) is sent, last, only when the
+// setting is on and the server offers it; its second report decodes with these same options, so cached decoding is off as well when the
+// partner's card says it has no cache (the 13D decoder has none).
+export function optionsFromSettings(settings, models) {
+  const s = sanitize(settings);
+  const card = chosenCard(s, models);
+  const partner = s.compare === true ? comparePartner(s, models) : null;
+  const listed = cardsOf(models).some((c) => c.name === s.model);
+  const options = {};
+  if (s.model && listed) options.model = s.model;
+  Object.assign(options, {
+    decode: s.decode,
+    beam_size: s.beam_size,
+    max_new_tokens: s.max_new_tokens,
+    cached_decode: s.cached_decode && !(card && card.cached_decode_available === false) && partner?.card?.cached_decode_available !== false,
+    compile: s.compile && !Array.isArray(models) && models?.allow_compile === true,
+    k_images: s.k_images,
+    k_reports: s.k_reports,
+    label: s.label,
+    display_repair: s.display_repair,
+    stop_on_repeat: s.stop_on_repeat,
+  });
+  if (partner) options.compare = true;
+  return options;
+}
+
+// ---- identity -------------------------------------------------------------------------------------------------------------
+
+function randomId() {
+  const c = globalThis.crypto;
+  if (typeof c?.randomUUID === 'function') return c.randomUUID();
+  if (typeof c?.getRandomValues === 'function') {
+    return Array.from(c.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return Array.from({ length: 4 }, () => Math.random().toString(16).slice(2, 10).padEnd(8, '0')).join('');
+}
+
+// The X-Client-Id: random, kept under cxrchat.client. A storage that refuses (or an id it holds that the server would
+// refuse) gives a fresh one, so the page still has an identity, for as long as the caller keeps this one.
+export function clientId(storage) {
+  try {
+    const kept = storage?.getItem(CLIENT_KEY);
+    if (typeof kept === 'string' && CLIENT_ID.test(kept)) return kept;
+  } catch { /* read refused: make one */ }
+  const fresh = randomId();
+  try { storage?.setItem(CLIENT_KEY, fresh); } catch { /* write refused: it lives as long as the page */ }
+  return fresh;
+}
+
+// window.localStorage, or null: the property itself throws in a browser that blocks site data.
+export function browserStorage(win) {
+  try { return win?.localStorage ?? null; } catch { return null; }
+}
+
+// ---- messages for the user ---------------------------------------------------------------------------------------------------
+
+const text = (v) => (typeof v === 'string' && v.trim() ? v.trim() : '');
+const clip = (s, n = 300) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+const isAbort = (err) => err?.name === 'AbortError';   // what fetch throws for a request whose signal was aborted
+const GENERIC_ERROR = 'Something went wrong — see the console';   // for what is a bug of the page's, not the server's or the network's
+// What the browsers' fetch says when the network fails, each in its own words (Chrome, Firefox, Safari, node).
+const FETCH_FAILURE = /failed to fetch|fetch failed|load failed|networkerror|network error|network connection|internet connection|network request failed/i;
+
+// A TypeError is how fetch reports a network failure, and also how a bug of ours reports itself. Where only fetch can have
+// thrown (a request of the page's own, a cancel) the error is marked, and errorMessage trusts the mark. The stream and the poll
+// are marked at their source instead: api.js marks what the transport threw (transportFailure), and fromTransport reads that.
+function markNetwork(err) {
+  if (err instanceof TypeError && !('network' in err)) err.network = true;
+  return err;
+}
+
+// What a request of the Pages copy throws while it has no API server (P9-B), before anything is sent: it says what to set.
+const noServerError = () => Object.assign(new Error(FIRST_RUN_TEXT), { noServer: true });
+
+// A failure that is the server's (it refused), the network's, the user's own cancel, or the Pages copy's want of an API server is shown;
+// anything else is ours and is logged.
+const expected = (err) => typeof err?.status === 'number' || err?.network === true || isAbort(err) || err?.noServer === true;
+
+// A 429 is two refusals (app/hardening.py, app/server.py). The queue is full (`overloaded_error`): that clears in moments, and the page says so in its own
+// short line. In public mode this client has started its turns of the last ten minutes (`rate_limited`): that does not clear in moments, and the server
+// words it, with how long to wait. The page shows the server's message, and the wait from Retry-After (api.js puts it on the error as `retryAfter`, in whole
+// seconds) unless the message gives that wait already, as the server's does: it is not said twice. No message at all is a sentence of our own.
+function rateLimitMessage(err) {
+  const server = text(err?.body?.error?.message) || 'Too many turns from this client.';
+  const wait = Number.isInteger(err?.retryAfter) && err.retryAfter > 0 ? err.retryAfter : null;
+  const said = wait !== null && new RegExp(`\\b${wait}\\s*(?:s|sec|secs|seconds)\\b`, 'i').test(server);
+  return clip(wait === null || said ? server : `${server} Try again in ${wait} s.`);
+}
+
+// What a failed request says to the user. err is what api.js throws: an Error with `status` and `body` (the server's
+// envelope {type: "error", error: {type, message}}) and, for a refusal that has the header, `retryAfter`; or what fetch throws when the network fails (a TypeError).
+export function errorMessage(err) {
+  if (typeof err === 'string') return text(err) || 'Something went wrong.';
+  if (isAbort(err)) return 'The request was cancelled.';   // never the browser's own "signal is aborted without reason"
+  if (err?.noServer === true) return FIRST_RUN_TEXT;      // the Pages copy has no API server yet (P9-B)
+  const status = err?.status;
+  const server = text(err?.body?.error?.message);
+  if (status === 401) return 'Enter the access token in Settings';
+  if (status === 429) return err?.body?.error?.type === 'rate_limited' ? rateLimitMessage(err) : 'The server is busy; try again shortly';
+  if (status === 413) return clip(server || 'The image is too large.');
+  if (status === 422) return clip(server || 'The server could not use that request.');
+  if (typeof status === 'number') {
+    if (server) return clip(server);
+    if (status === 400) return 'The server could not read the request.';
+    if (status === 403) return 'The server refused this request.';
+    if (status === 404) return 'Not found. It may have been deleted.';
+    return status >= 500 ? 'The server had a problem. Try again.' : 'The request failed.';
+  }
+  if (err?.network === true || (err instanceof TypeError && FETCH_FAILURE.test(err.message))) {
+    return 'Cannot reach the server. Check the connection and try again.';
+  }
+  if (err instanceof TypeError) return GENERIC_ERROR;
+  return clip(text(err?.message) || 'Something went wrong.');
+}
+
+// What comes out of an api.js generator's next(): a stream that failed, a poll that was refused. (What the page does with each event is
+// its own, and is caught where it is done.) api.js marks a failure of the transport where it happens (transportFailure): that one is the
+// network's, and is said as such. Any other error, a TypeError too, is a bug, and the page logs it (P4-H): a TypeError is not the network
+// just because it is a TypeError.
+async function* fromTransport(source) {
+  try {
+    yield* source;
+  } catch (err) {
+    if (err?.transport === true && !('network' in err)) err.network = true;
+    throw err;
+  }
+}
+
+// ---- the watchdog ----------------------------------------------------------------------------------------------------------
+
+// A state machine for one turn's transport, and nothing else: no timers, no page, no network. The clock is the only input
+// from outside, and every method returns what the page should do. Phases: idle, stream (the POST is open), poll (the stream
+// is given up and GET /v1/messages/{id} is followed), failed (the poll threw a terminal error: the page offers a retry).
+export function createWatchdog({ now = () => Date.now(), stallMs = STALL_MS } = {}) {
+  let phase = 'idle';
+  let heard = 0;
+  return {
+    get phase() { return phase; },
+    arm() { phase = 'stream'; heard = now(); },                       // the turn was sent
+    bytes() { if (phase === 'stream') heard = now(); },               // an event came in on the stream
+    // Asked every TICK_MS with the view's status: 'poll' once, when the turn is running and the stream has been silent for
+    // stallMs (the page drops the stream); otherwise 'none'. A turn that has ended is idle.
+    tick(status) {
+      if (phase !== 'stream') return 'none';
+      if (status !== 'running') { phase = 'idle'; return 'none'; }
+      if (now() - heard < stallMs) return 'none';
+      phase = 'poll';
+      return 'poll';
+    },
+    // The stream is over (it closed, was dropped, or Stop dropped it): 'poll' while the turn is still running.
+    ended(status) {
+      if (phase === 'idle' || phase === 'failed') return 'none';
+      phase = status === 'running' ? 'poll' : 'idle';
+      return phase === 'poll' ? 'poll' : 'none';
+    },
+    resume() { phase = 'poll'; },                                     // a turn found running on open: no stream, poll it
+    failed() { if (phase === 'poll') phase = 'failed'; },             // the poller threw a terminal error
+    retry() { if (phase !== 'failed') return 'none'; phase = 'poll'; return 'poll'; },
+    settle() { phase = 'idle'; },                                     // the turn ended, or the page left it
+  };
+}
+
+// ---- small formatters --------------------------------------------------------------------------------------------------------
+
+export const sessionTitle = (session) => text(session?.title) || 'New chat';
+
+// "Oct 3", or "Oct 3, 2025" for another year; '' for what is not a date.
+export function sessionDate(iso, now = new Date()) {
+  const d = new Date(iso);
+  if (typeof iso !== 'string' || Number.isNaN(d.getTime())) return '';
+  const options = d.getFullYear() === now.getFullYear() ? { month: 'short', day: 'numeric' } : { year: 'numeric', month: 'short', day: 'numeric' };
+  return d.toLocaleDateString(undefined, options);
+}
+
+export function sessionMeta(session, now = new Date()) {
+  const n = Number.isInteger(session?.turns) ? session.turns : 0;
+  return [sessionDate(session?.updated_at ?? session?.created_at, now), `${n} ${n === 1 ? 'turn' : 'turns'}`].filter(Boolean).join(' · ');
+}
+
+// What the strip says: the mode and the load. A payload that lacks a number says what it has.
+export function healthText(h) {
+  const mode = text(h?.mode);
+  const n = Number.isInteger(h?.turns_in_flight) ? h.turns_in_flight : null;
+  const cap = Number.isInteger(h?.queue_cap) ? h.queue_cap : null;
+  const load = n === null ? '' : `${n}${cap === null ? '' : ` of ${cap}`} ${cap === null && n === 1 ? 'turn' : 'turns'} in flight`;   // "1 of 4 turns", "1 turn"
+  return [mode, load].filter(Boolean).join(' · ') || 'server ok';
+}
+
+// How long the server keeps a session, as the banner says it: /healthz's retention_days (P8-B); '' for a payload with no usable number.
+export function retentionText(h) {
+  const days = Number.isInteger(h?.retention_days) && h.retention_days > 0 ? h.retention_days : null;
+  return days === null ? '' : `Sessions are deleted after ${days} ${days === 1 ? 'day' : 'days'}`;
+}
+
+// 10 s while the server answers, 30 s after three failed checks in a row, and 10 s again at the first answer.
+export const nextHealthDelay = (failures) => (failures >= HEALTH_SLOW_AFTER ? HEALTH_SLOW_MS : HEALTH_MS);
+
+// The file name an export is saved under: the server's Content-Disposition when it is a plain file name, else one made
+// from the session id. Never anything with a path in it.
+export function exportFilename(contentDisposition, sessionId, format) {
+  const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(typeof contentDisposition === 'string' ? contentDisposition : '');
+  return m && /^\w[\w.-]{0,100}$/.test(m[1]) ? m[1] : `session-${sessionId}.${format}`;
+}
+
+// A user message and the assistant message that answers it, as the user turn draws them. The assistant row carries the
+// turn's resolved options. A user message with neither an image nor a test row is a question the server answered with no model: it
+// shows no options (P4-H). start is the data of the turn's message_start, when its log could be read.
+// P6-B: the server lists a user message's image_urls, so a replayed upload, or a test study, shows its thumbnail again (fetched through
+// ctx.loadImage). A text-only re-run (message_start.image.source 'previous') ran an earlier upload: the live turn showed no picture of its
+// own for it, so its file name stays, as before.
+export function userTurnMessage(user, assistant, start = null) {
+  const filename = text(user?.image_filename);
+  const study = Number.isInteger(user?.test_row);
+  const ran = !!filename || study;
+  const thumb = isObject(user?.image_urls) && typeof user.image_urls.thumb === 'string' ? user.image_urls.thumb : null;
+  const url = start?.image?.source === 'previous' ? null : thumb;
+  return {
+    text: typeof user?.text === 'string' ? user.text : '',
+    image: filename || url ? { url, filename: filename || null, ...(study && url ? { source: 'test_split' } : {}) } : null,
+    options: ran && isObject(assistant?.options) ? assistant.options : null,
+  };
+}
+
+// Is the scroller within NEAR_PX of its end? m is an element, or {scrollTop, clientHeight, scrollHeight}. Without those
+// numbers (a page that has not laid out) it says yes: the page follows the turn.
+export function nearBottom(m, slack = NEAR_PX) {
+  const { scrollTop, clientHeight, scrollHeight } = m ?? {};
+  if (![scrollTop, clientHeight, scrollHeight].every(Number.isFinite)) return true;
+  return scrollHeight - scrollTop - clientHeight <= slack;
+}
+
+// The server's text commands (app/commands.py), each the whole note once its whitespace is collapsed, case aside, ASCII only on both sides.
+// The page reads them only to say what Send will do: with no new image, a command or an empty note runs the chat's last X-ray again, and
+// any other note gets the server's fixed answer and no report (post_message). The server decides; tests/frontend/fixtures/commands.json
+// holds the two to one list, and every rule on either side to an example in it (tests/test_app_commands.py, tests/frontend/app.test.mjs).
+export const COMMANDS = Object.freeze([/^beam \d+$/i, /^greedy$/i, /^tokens \d+$/i, /^retrieve \d+$/i, /^reference:\s*.+$/i,
+                                       /^repair (?:on|off)$/i]);
+
+// The whitespace a note is split on: the server's (app/commands.py WHITESPACE), Python's and JavaScript's together, so U+001C..U+001F and
+// U+0085 (Python's alone) and U+FEFF (JavaScript's alone) are whitespace on both sides (P6-A f). tests/fixtures/whitespace.json lists it,
+// and both test suites read that file.
+const SPACE = /[\t\n\v\f\r\x1c-\x1f \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+/;
+
+// A note's words joined by single spaces, as the server collapses it; '' for what is not a string.
+export const collapse = (note) => (typeof note === 'string' ? note.split(SPACE).filter(Boolean).join(' ') : '');
+
+export function isCommand(note) {
+  const t = collapse(note);
+  return COMMANDS.some((command) => command.test(t));
+}
+
+// Does a turn of this note and this file run the model? With a file it does; with none, only an empty note or a command does: the server's
+// rule (app/commands.py is_question), on the same whitespace.
+const runsTheModel = (note, file) => !!file || !collapse(note) || isCommand(note);
+
+// Does the element show the keyboard's focus ring (:focus-visible), which a browser draws for a focus the keyboard brought and not for a
+// click or a tap? A browser that cannot tell is taken not to.
+function focusVisible(node) {
+  try { return node?.matches?.(':focus-visible') === true; } catch { return false; }
+}
+
+// ---- the page -----------------------------------------------------------------------------------------------------------------
+
+// env: document, window (location, history, addEventListener, matchMedia, navigator, confirm), storage, fetch, api (the
+// api.js functions), now, setTimeout / setInterval / clearInterval, URL, confirm, ResizeObserver. All optional but document.
+export function createApp(env) {
+  const doc = env.document;
+  const win = env.window ?? {};
+  const api = env.api ?? realApi;
+  const storage = env.storage ?? null;
+  const urls = env.URL ?? globalThis.URL;
+  const doFetch = (url, init) => (env.fetch ?? globalThis.fetch)(url, init);
+  const later = (fn, ms) => (env.setTimeout ? env.setTimeout(fn, ms) : globalThis.setTimeout(fn, ms));
+  const cancelLater = (id) => (env.clearTimeout ? env.clearTimeout(id) : globalThis.clearTimeout(id));
+  const every = (fn, ms) => (env.setInterval ? env.setInterval(fn, ms) : globalThis.setInterval(fn, ms));
+  const cancelEvery = (id) => (env.clearInterval ? env.clearInterval(id) : globalThis.clearInterval(id));
+  // The next animation frame: env's, else the page's, else a timer (a page with none). A test hands one it runs by hand.
+  const frame = (fn) => {
+    const raf = env.requestAnimationFrame ?? win.requestAnimationFrame ?? globalThis.requestAnimationFrame;
+    return typeof raf === 'function' ? raf.call(globalThis, fn) : later(fn, 16);
+  };
+  // Delete is the one thing this asks about, and it fails closed: with no way to ask, nothing is deleted.
+  const confirmed = (message) => (env.confirm ? env.confirm(message) : typeof win.confirm === 'function' ? win.confirm(message) : false);
+  const watchdog = createWatchdog({ now: env.now ?? (() => Date.now()) });
+
+  const $ = (id) => doc.getElementById(id);
+  const qa = (node, selector) => Array.from(node.querySelectorAll(selector));
+  const ui = {
+    toggle: $('sidebar-toggle'), sidebar: $('sidebar'), newChat: $('new-session'), list: $('session-list'),
+    conversation: $('conversation'), drawer: $('drawer'), composer: $('composer'), well: $('image-well'),
+    preview: $('preview'), prompt: $('prompt'), chips: $('chips'), settings: $('settings'), send: $('send'),
+    stop: $('stop'), file: $('file'), badge: $('mode-badge'), testBadge: $('test-badge'), health: $('health'),
+  };
+
+  const state = {
+    settings: loadSettings(storage),
+    clientId: clientId(storage),
+    models: null,            // the /v1/models payload
+    session: { id: null, turns: [], ui: new Map(), blobUrls: new Set() },   // what the conversation shows
+    sessions: [],            // the sidebar
+    nextCursor: null,
+    sessionsLoaded: false,
+    turn: null,              // the turn this view is following, if one is running
+    busy: false,             // a turn runs here: Send is off and Stop is on
+    loading: false,          // a session is being fetched
+    file: null,              // the attached image, not yet sent (composer.js says which)
+    composer: null,          // composer.js's intake: { get, clear }
+    viewer: null,            // viewer.js's handle while the viewer is open (P6-E)
+    said: '',                // the last text written to the status region
+    gen: 0,                  // bumped by every route change, so a late answer can tell it is stale
+    ticker: null,
+    drawerOpener: null,
+    healthFailures: 0,
+    healthTimer: null,       // the next /healthz check (P6-A d: a turn's accept and its end ask at once, and the schedule starts over)
+    healthBusy: false,       // a check is on its way
+    healthAgain: false,      // and another was asked for meanwhile: it runs when that one ends
+    loadingMore: false,      // a page of the sidebar is being fetched: More is off, so it cannot be asked twice
+    noticeRetry: null,
+    noticeOwner: null,       // the turn whose failed Stop the notice says, if it is that: the end of the turn takes it down
+    savedTimer: null,        // the timer that takes "Settings saved." down again
+    pickTimer: null,         // the picker's pause in typing (P6-D)
+    pickGen: 0,              // bumped by every list request, by a change of the query and by closing the picker: a late list is stale
+    pickShown: null,         // the query whose studies the list shows now; null while it shows none (P6 fix 1)
+    pickLoading: null,       // { gen, query, done }: the list request on its way, which Enter waits for rather than asking again
+    settling: false,         // a measure of the clamped reports is waiting for the next frame (P6 fix 1)
+    route: null,             // the route handleRoute showed last ('new' or 's/<id>'): a notice belongs to the route it was raised on
+    missing: null,           // a session the server said it does not have: home never picks it
+    serverGen: 0,            // bumped by every change of the API server (P9-B fix 1): what the last one answers after that is dropped, unsaid
+  };
+
+  // Where every request goes (P9-B): the API server of the settings, or, while there is none, this page's own origin (''), as before. The Pages
+  // copy's own origin is github.io, which has no API: there no API server is no server at all (null), and nothing is asked of anyone.
+  const pagesCopy = isPagesCopy(doc);
+  const apiBase = () => state.settings.api_server || (pagesCopy ? null : '');
+  const noServer = () => apiBase() === null;
+  // The base and the identity every call of the data layer carries; with no server to ask, it throws before anything is sent: the token goes
+  // to the API server and to no other origin.
+  const auth = () => {
+    const base = apiBase();
+    if (base === null) throw noServerError();
+    return { base, token: state.settings.token, clientId: state.clientId };
+  };
+  const report = (err) => { try { console.error(err); } catch { /* no console */ } };
+  const detach = (promise) => { Promise.resolve(promise).catch(report); };   // a handler's async work: failures are shown, never unhandled
+
+  // ---- requests --------------------------------------------------------------------------------------------------------------
+
+  // A JSON request with the page's auth headers, under the data layer's own timeout (api.js asked, REQUEST_TIMEOUT_MS: P8 follow-up). A half-open
+  // tunnel takes the request and never answers, and fetch never fails by itself, so a list, a delete or an export would wait for ever. Its body is
+  // read inside the limit too: with `raw` the answer is {headers, blob}, the export's whole file, not a response whose body is still to come. The
+  // timeout is a failure of the transport, which api.js makes a TypeError as fetch's own is, so it surfaces as any network failure does ("Cannot
+  // reach the server..."). A refusal throws what api.js throws: an Error with status, body and, for a 429, retryAfter.
+  // The path is asked of the API server, when the settings name one (P9-B); the Pages copy with none asks nothing and throws noServerError.
+  async function request(path, { method = 'GET', body, headers, raw = false, signal } = {}) {
+    const base = apiBase();
+    if (base === null) throw noServerError();
+    const init = { method, body, signal, headers: { ...authHeaders(state.settings.token, state.clientId), ...headers } };
+    try {
+      return await asked(`${base}${path}`, init, REQUEST_TIMEOUT_MS, async (res) => {
+        if (!res.ok) {
+          throw Object.assign(new Error('request refused'), { status: res.status, body: await res.json().catch(() => null), retryAfter: retryAfterSeconds(res) });
+        }
+        if (raw) return { headers: res.headers, blob: await res.blob() };
+        return res.status === 204 ? null : res.json();
+      }, doFetch);   // the page's fetch, which a test hands its own of
+    } catch (err) {
+      throw markNetwork(err);   // only the transport can have thrown a TypeError here: fetch itself, a body cut off, or the timeout
+    }
+  }
+
+  // ---- the notice above the composer and the live status ----------------------------------------------------------------------
+
+  function showNotice(message, retry = null, owner = null) {
+    ui.noticeText.textContent = message;
+    ui.noticeRetry.hidden = !retry;
+    state.noticeRetry = retry;
+    state.noticeOwner = owner;
+    ui.notice.hidden = false;
+  }
+
+  function clearNotice() {
+    // Its Retry or Dismiss is about to go. One pressed from the keyboard (:focus-visible) hands the focus to the note field, where the next
+    // note is typed; one tapped or clicked leaves it to the browser (P6-A e): the note field would open a phone's keyboard over the page.
+    const active = doc.activeElement;
+    if (active && ui.notice.contains(active) && focusVisible(active)) ui.prompt.focus();
+    ui.notice.hidden = true;
+    ui.noticeText.textContent = '';
+    ui.noticeRetry.hidden = true;
+    state.noticeRetry = null;
+    state.noticeOwner = null;
+  }
+
+  // The status region says a thing only when it changes, so the same word is not read twice. again: a message that is news every time
+  // (a refusal) is said again, the same words too.
+  function announce(message, again = false) {
+    if (message === state.said && !again) return;
+    if (again) ui.status.textContent = '';   // a live region reads what is put into it: empty, then the words, so that the same words are new
+    state.said = message;
+    ui.status.textContent = message;
+  }
+
+  // ---- the conversation --------------------------------------------------------------------------------------------------------
+
+  // model: the one the turn ran on (its options say), whose features decide whether a user turn shows the k it never used.
+  const cardCtx = (n, model) => ({
+    loadImage: (url) => api.loadImage(url, auth()),
+    openViewer: (spec, opener) => openViewer(spec, opener),   // a picture of the card (P6-E)
+    copy,
+    showModels: () => openDrawer({ models: true }),
+    labelNames: Array.isArray(state.models?.label_names) ? state.models.label_names : undefined,
+    retrieval: serverHas(state.models, 'retrieval', model),   // false: a user turn shows no k, which that model's turns never use
+    labels: serverHas(state.models, 'labels', model),         // false: no labeller, so no card says "labelling…" (P6-C)
+    ui: state.session.ui,
+    turn: n,
+  });
+
+  // The upload in a user turn opens the viewer on what the card's "Your X-ray" tile opens (P6-G): ownXraySide gives the side from the turn's view as it
+  // is when the thumbnail is clicked (the tile's own choice once message_start has come, the thumbnail's own picture before it), and the focus goes back
+  // to the thumbnail, or to the one that replaced it where the user turn was drawn again under the viewer (message_start does).
+  const thumbOf = (turn) => turn.userEl?.querySelector('button.thumb-button') ?? null;
+  const userCtx = (turn, model) => {
+    const cx = cardCtx(turn.n, model);
+    return { ...cx, openViewer: (image, opener) => openViewer({ left: ownXraySide(turn.view, image, cx) }, opener, () => thumbOf(turn)) };
+  };
+
+  function copy(value) {
+    const clipboard = win.navigator?.clipboard;
+    return typeof clipboard?.writeText === 'function' ? clipboard.writeText(value) : Promise.reject(new Error('no clipboard'));
+  }
+
+  // Where the page scrolls: #conversation, or the document where the layout is short (styles.css, max-height 480px).
+  const scroller = {
+    short: () => !!win.matchMedia?.(SHORT_VIEWPORT)?.matches,
+    near() {
+      if (this.short()) {
+        const root = doc.documentElement ?? {};
+        return nearBottom({ scrollTop: win.scrollY ?? root.scrollTop, clientHeight: win.innerHeight ?? root.clientHeight, scrollHeight: root.scrollHeight });
+      }
+      return nearBottom(ui.conversation);
+    },
+    toEnd(node) {
+      if (this.short()) node?.scrollIntoView?.({ block: 'end' });
+      else ui.conversation.scrollTop = ui.conversation.scrollHeight;
+    },
+  };
+
+  function makeTurn(session, n) {
+    const turn = { n, id: null, session, view: initialView(null), userEl: null, card: null, text: '', image: null, file: null,
+                   controller: null, poller: null, streaming: false, polling: false, stopping: false, left: false, settled: false,
+                   dirty: false, reloading: false, testRow: null, cancelled: false };   // testRow: the test study the turn ran (P6-D);
+                                                                                    // cancelled: its upload, before the accept (P6-A c)
+    turn.draw = () => paint(turn);   // one function per card, so scheduleRender draws it at most once a frame
+    return turn;
+  }
+
+  // Replaces the card with one built from the latest view, keeps focus on the same control and the scroll where the
+  // reader had it, and says what changed. Called at most once per animation frame per card (scheduleRender), and straight
+  // away when the turn ends.
+  function paint(turn) {
+    if (turn.left || !turn.dirty || !turn.card) return;
+    turn.dirty = false;
+    const old = turn.card;
+    const near = scroller.near();
+    const active = doc.activeElement;
+    const key = active && old.contains(active) ? focusKey(active) : null;   // a control of this card only
+    const next = renderAssistantCard(turn.view, cardCtx(turn.n));
+    if (old.parentNode) old.replaceWith(next); else ui.conversation.append(next);
+    turn.card = next;
+    settleClamps(next);   // in the page now: which reports overflow their three lines can be measured (P6 fix 1)
+    if (key) restoreFocus(next, key);
+    announce(statusText(turn.view));
+    if (near) scroller.toEnd(next);
+  }
+
+  // What the chips of a user turn need besides its options (render.js optionChips, P9-G5b): how its generate stage ended, and whether its model
+  // was trained to end its reports. The turn's own card (message_start) says the second; before the server has answered, it is the card the
+  // page lists for the model it chose (the server's default when none was named).
+  function chipsOutcome(view, model) {
+    const card = isObject(view?.provenance) ? view.provenance : chosenCard({ model: model ?? '' }, state.models);
+    const detail = view?.stages?.generate?.detail;
+    return { stopped: typeof detail?.stopped === 'string' ? detail.stopped : '', eosTrained: card?.eos_trained === true };
+  }
+
+  // Draws the user turn again from the turn's view: when the server says what it resolved (message_start) and when the generate stage says
+  // how the report ended. The options are the server's own, commands included; a turn with no image is a question it answers with no model,
+  // so none were used. The thumbnail is a control (P6-G): one that has the focus hands it to the new one, and nothing else takes it.
+  function refreshUserBubble(turn) {
+    if (!turn.userEl) return;
+    const options = turn.view.image && isObject(turn.view.options) ? turn.view.options : null;
+    const next = renderUserTurn({ text: turn.text, image: turn.image, options, outcome: chipsOutcome(turn.view, options?.model) },
+                                userCtx(turn, options?.model));
+    const held = !!doc.activeElement && turn.userEl.contains(doc.activeElement);
+    turn.userEl.replaceWith(next);
+    turn.userEl = next;
+    if (held) thumbOf(turn)?.focus({ preventScroll: true });
+  }
+
+  // A control that is disabled while it has the focus loses it to the page itself (the focus fixup rule), and the keyboard would have to
+  // start again from the top: Send and Stop switch themselves off when they are pressed. Pressed from the keyboard (the control shows its
+  // focus ring, :focus-visible), the note field, where the next note is typed, takes the focus first (P4-H). A click or a tap leaves the
+  // focus to the browser: in the note field, a tap would open a phone's keyboard over the card that is about to stream.
+  function keepFocusFrom(control) {
+    if (doc.activeElement === control && focusVisible(control)) ui.prompt.focus();
+  }
+
+  // The state of the controls that depend on whether a turn runs.
+  function syncControls() {
+    if (state.busy || state.loading) { keepFocusFrom(ui.send); keepFocusFrom(ui.pick); closePicker({ restore: false }); }   // a list for starting a turn
+    ui.send.disabled = state.busy || state.loading;
+    ui.pick.disabled = state.busy || state.loading;   // one turn at a time, a picked study's too
+    ui.stop.hidden = !state.busy;
+    ui.exports.hidden = !state.session.id;
+    fields.runningNote.hidden = !state.busy;
+    syncRerun();
+  }
+
+  // The file name of the newest user turn that had an image, or "test row N" for a test study (P6-D): the one a text-only turn runs again
+  // (the server's rule, post_message).
+  function newestImage() {
+    const turns = state.session.turns;
+    for (let i = turns.length - 1; i >= 0; i--) {
+      if (turns[i].image?.filename) return turns[i].image.filename;
+      if (Number.isInteger(turns[i].testRow)) return `test row ${turns[i].testRow}`;
+    }
+    return '';
+  }
+
+  // Under the image well, when Send with no new image would run the chat's last X-ray again: with a file attached, in an empty chat
+  // and while a turn runs (or a chat loads) it says nothing. Information, not an alert. It follows the note as it is typed (P4-H): a note
+  // that is not a command gets the server's fixed answer and no report, and the hint says so instead of promising a re-run.
+  function syncRerun() {
+    const name = state.file || state.busy || state.loading ? '' : newestImage();
+    ui.rerun.hidden = !name;
+    if (name) {
+      ui.rerun.textContent = runsTheModel(ui.prompt.value ?? '', null) ? `No new image: Send re-runs ${name} with these settings.` : QUESTION_TEXT;
+      ui.rerun.setAttribute('title', ui.rerun.textContent);   // whole, where a short page or a narrow composer cuts its one line short (P6 fix 1)
+      ui.send.setAttribute('aria-describedby', 'rerun-hint');   // Send says what it will do, to whoever reaches it by tab
+    } else {
+      ui.rerun.removeAttribute('title');
+      ui.send.removeAttribute('aria-describedby');   // a hidden note that is still named would still be read out
+    }
+  }
+
+  // aria-busy on #conversation goes on at once and comes off a frame after the page stops being busy: put on and taken off inside
+  // one task, the attribute would never reach assistive technology. A frame that finds a turn running again leaves it on.
+  function markBusy(on) {
+    if (on) ui.conversation.setAttribute('aria-busy', 'true');
+    else frame(() => { if (!state.busy) ui.conversation.removeAttribute('aria-busy'); });
+  }
+
+  // While a turn runs the composer is scrolled to its end, where Stop is (P9-G5b fix 1). The composer scrolls inside itself where its rows are taller
+  // than the page leaves it (a phone, a short window). One row more than fits (the "Settings saved" row, a third row of chips) adds a scrollbar,
+  // which takes 15 px of its width, Stop wraps onto a row of its own, and that row lay below the fold: out of sight, the control that ends the turn.
+  // Called when the page goes busy, once Stop is shown and has its label, and when a row comes while it is busy (a Save during the turn).
+  function keepStopInView() {
+    if (state.busy) ui.composer.scrollTop = ui.composer.scrollHeight;
+  }
+
+  function setBusy(on) {
+    const wasBusy = state.busy;
+    state.busy = on;
+    if (on) {
+      markBusy(true);
+    } else {
+      markBusy(false);
+      ui.stop.disabled = false;
+      ui.stop.textContent = 'Stop';
+      if (wasBusy && (doc.activeElement === ui.stop || doc.activeElement === ui.send)) ui.prompt.focus();   // the control that had focus is going away
+    }
+    syncControls();
+    if (on) keepStopInView();   // after the controls: Stop is shown, and the row it is on is laid out
+  }
+
+  // ---- one turn: the stream, the watchdog, the poll, Stop ----------------------------------------------------------------
+
+  function stopTicker() {
+    if (state.ticker !== null) cancelEvery(state.ticker);
+    state.ticker = null;
+  }
+
+  function startTicker(turn) {
+    stopTicker();
+    state.ticker = every(() => {
+      if (watchdog.tick(turn.view.status) === 'poll') turn.controller?.abort();   // the stream goes; the poll starts as it unwinds
+    }, TICK_MS);
+  }
+
+  // The turn is over: draw its final card, free the composer, refresh the sidebar (its title and count changed).
+  function settle(turn) {
+    if (turn.settled) return;
+    turn.settled = true;
+    stopTicker();
+    watchdog.settle();
+    try {
+      paint(turn);
+    } finally {   // a card that cannot be drawn must not leave the composer locked
+      if (state.turn === turn) {
+        state.turn = null;
+        setBusy(false);
+      }
+      if (state.noticeOwner === turn) clearNotice();   // "couldn't stop": the turn ended by itself
+      detach(refreshSessions());
+      detach(checkHealth());   // the load it took is given back: the strip says so now, not at its next check (P6-A d)
+    }
+  }
+
+  function feed(turn, event) {
+    if (turn.left) return;   // events already read when the view was left still come out of the stream: they are not drawn
+    try {
+      if (!turn.card && typeof event.data?.message_id === 'string') accept(turn, event.data.message_id);   // a server that sent no X-Message-Id
+      turn.view = applyEvent(turn.view, event);
+      turn.dirty = true;
+      if (event.event === 'message_start') {
+        adoptStudy(turn, event.data);
+        refreshUserBubble(turn);
+      } else if (event.event === 'stage_end' && event.data.stage === 'generate') {
+        refreshUserBubble(turn);   // how the report ended is known now: the chip of the stop switch says it (P9-G5b)
+      }
+      if (turn.view.status !== 'running') settle(turn);
+      else scheduleRender(turn.draw);
+    } catch (err) {   // a reducer or a builder that threw on this event: say so, log it, and carry on with the next one
+      report(err);
+      showNotice(GENERIC_ERROR);
+    }
+  }
+
+  // A test study's turn (the picker's, or a text-only re-run of one) shows the study's own picture in its user turn once message_start names
+  // it (P6-D): no one attached it, so the page has no preview of its own. Its row is what the re-run hint then names.
+  function adoptStudy(turn, data) {
+    const image = isObject(data?.image) ? data.image : null;
+    if (image?.source !== 'test_split') return;
+    if (Number.isInteger(data.options?.test_row)) turn.testRow = data.options.test_row;
+    if (!turn.image && typeof image.urls?.thumb === 'string') turn.image = { url: image.urls.thumb, filename: null, source: 'test_split' };
+  }
+
+  // The poll that takes over from the stream: from the last seq the view has, until the turn leaves running. A terminal
+  // error (not the transient ones api.js retries) is shown with a Retry that starts the poll again from that seq.
+  async function pollTurn(turn) {
+    stopTicker();
+    const poller = new AbortController();
+    turn.poller = poller;
+    turn.polling = true;
+    try {
+      for await (const event of fromTransport(api.pollMessage({ messageId: turn.id, after: turn.view.lastSeq, ...auth(), signal: poller.signal }))) {
+        feed(turn, event);
+      }
+    } catch (err) {
+      // A poll that fails after the turn's own message_stop was read (the server stores that before it marks the message finished, so
+      // the poll that read it asks once more) has nothing left to ask: a Retry for a finished turn would be a button that does nothing.
+      if (turn.left || turn.settled || isAbort(err)) return;
+      if (!expected(err)) report(err);   // a bug, not the network or a refusal: the notice says "see the console", and the console has it
+      watchdog.failed();
+      if (state.turn === turn) {   // Stop works again, whatever it said: pressing it follows the turn from here
+        turn.stopping = false;
+        ui.stop.disabled = false;
+        ui.stop.textContent = 'Stop';
+      }
+      showNotice(errorMessage(err), () => follow(turn));
+      return;
+    } finally {
+      turn.polling = false;
+    }
+    if (turn.left || turn.settled) return;
+    if (turn.view.status === 'running') {   // the poll ended and the log has no end: do not leave the page waiting for it
+      showNotice('The turn ended without a result. Reload the chat to see it.');
+      settle(turn);
+    }
+  }
+
+  // Polls a turn that nothing is following (its poll failed for good), from the last seq the view has. Retry in the notice and
+  // Stop both come here. A turn that was left is not followed, so a Retry that comes late starts nothing; one that is already
+  // being polled needs nothing. (A turn that has ended never gets here: pollTurn offers no Retry for a failure after the end, and
+  // Stop looks at `settled` before it asks.)
+  function follow(turn) {
+    if (turn.left || turn.polling) return;
+    if (watchdog.retry() !== 'poll') watchdog.resume();
+    if (state.noticeRetry) clearNotice();
+    detach(pollTurn(turn));
+  }
+
+  async function runTurn(session, { text: note, file, options }) {
+    const turn = makeTurn(session, session.turns.length + 1);
+    turn.text = note;
+    turn.file = file;
+    try {
+      if (file) {
+        const url = urls.createObjectURL(file);
+        session.blobUrls.add(url);
+        turn.image = { url, filename: file.name };
+      }
+      // A note the server will not run (no file, no command) uses no settings, so its turn shows no chips (P4-H).
+      const ran = runsTheModel(note, file) || Number.isInteger(options.test_row);   // a picked study runs whatever the note says
+      turn.userEl = renderUserTurn({ text: note, image: turn.image, options: ran ? options : null, outcome: chipsOutcome(null, options.model) },
+                                   userCtx(turn, options.model));
+      session.turns.push(turn);
+      ui.conversation.append(turn.userEl);
+      scroller.toEnd(turn.userEl);
+      state.turn = turn;
+      syncControls();
+
+      const form = new FormData();
+      if (file) form.append('image', file, file.name);
+      form.append('text', note);
+      form.append('options', JSON.stringify(options));
+
+      turn.controller = new AbortController();
+      ui.stop.disabled = false;   // "Cancel upload" until the server has the turn and has said its id, which is what Stop then cancels (P6-A c)
+      turn.streaming = true;
+      // No stall clock yet: accept() starts it when the server has the turn. Until then the request is an upload, and the server
+      // decoding and saving it, which can take longer than 3 s on a slow tunnel, and is not silence.
+      for await (const event of fromTransport(api.streamTurn({
+        sessionId: session.id, form, ...auth(), signal: turn.controller.signal, onMessageId: (id) => accept(turn, id),
+      }))) {
+        watchdog.bytes();
+        feed(turn, event);
+      }
+    } catch (err) {
+      if (!turn.id) return refuse(turn, err);   // it never started here: no id was ever given (CANCELLED: the user aborted it)
+      // A network error mid-stream (a server that died, a tunnel that dropped) is no bug of the page's: the poll below carries the turn
+      // on, and only what is unexpected is logged (P4-H: a killed server logged "TypeError: network error" as one).
+      if (!expected(err) && !turn.left) report(err);
+    } finally {
+      turn.streaming = false;
+    }
+    if (turn.left || turn.settled) return null;
+    if (!turn.id) return refuse(turn, new Error('The server closed the connection before it accepted the turn.'));
+    if (watchdog.ended(turn.view.status) === 'poll') await pollTurn(turn);
+    return null;
+  }
+
+  // The page's own work around a turn must not stop the turn, nor the work after it: a failure is logged and said, and the caller goes on.
+  function attempt(work) {
+    try {
+      work();
+    } catch (err) {
+      report(err);
+      showNotice(GENERIC_ERROR);
+    }
+  }
+
+  // What was sent is spent: the text of the note that was sent, and the file that was attached. What was typed or attached since
+  // Send is the next turn's, and stays.
+  function spendComposer(turn) {
+    const typed = ui.prompt.value ?? '';
+    ui.prompt.value = typed.startsWith(turn.text) ? typed.slice(turn.text.length) : typed;
+    if (state.file === turn.file) state.composer.clear();
+  }
+
+  // The server has the turn: Stop works, and the 3 s of silence that mean "poll instead" are counted from here. Stop, the clock, the
+  // ticker and the spending of the composer come before any drawing, and each is guarded: a page that cannot draw its card still
+  // follows the turn to its end, and does not send the same note and image again at the next Send.
+  function accept(turn, id) {
+    if (turn.left) return;   // the user moved to another chat while the upload was in flight: its turn is theirs to find later
+    turn.id = id;
+    turn.view = initialView(id);
+    ui.stop.disabled = false;
+    ui.stop.textContent = 'Stop';   // the server has the turn: Stop cancels it there
+    watchdog.arm();
+    startTicker(turn);
+    attempt(() => spendComposer(turn));
+    attempt(() => {   // a card that is made but not yet in the page is put there by its first paint
+      turn.card = renderAssistantCard(turn.view, cardCtx(turn.n));
+      ui.conversation.append(turn.card);
+      settleClamps(turn.card);
+      scroller.toEnd(turn.card);
+      announce(statusText(turn.view));
+    });
+    // The server has stored the turn, which counts it and, in a new chat, titles the chat: the sidebar says so now, not only when the
+    // turn ends (P4-H; a new chat was listed as an empty "New chat" for as long as its first turn ran), and so does the strip (P6-A d).
+    detach(refreshSessions());
+    detach(checkHealth());
+  }
+
+  // The turn never started here (the request was refused, the network was down, or the user cancelled it): take its user turn back out, show
+  // why, and leave the composer as the user had it, so Send tries again with nothing to re-enter. A cancel is the user's own doing: the status
+  // says so, and no alert does; the composer stays locked until send() has asked the chat whether the server took the turn all the same
+  // (afterCancel). -> CANCELLED for a cancel, else null.
+  function refuse(turn, err) {
+    if (turn.left) return null;   // the user left this chat: nothing here to undo, and the ticker is now another turn's
+    stopTicker();
+    watchdog.settle();
+    turn.userEl?.remove();
+    const at = turn.session.turns.indexOf(turn);
+    if (at >= 0) turn.session.turns.splice(at, 1);
+    if (turn.image) { urls.revokeObjectURL(turn.image.url); turn.session.blobUrls.delete(turn.image.url); }
+    if (state.turn === turn) state.turn = null;
+    if (turn.cancelled && isAbort(err)) {
+      announce(cancelledText(turn.file), true);
+      return CANCELLED;
+    }
+    setBusy(false);
+    doneUploading();
+    showNotice(errorMessage(err));
+    if (!expected(err)) report(err);
+    return null;
+  }
+
+  // The status still says "Uploading…" or "Sending…" about a request that is over: it is taken down.
+  function doneUploading() {
+    if (state.said === UPLOADING_TEXT || state.said === SENDING_TEXT) announce('');
+  }
+
+  // After a Cancel upload or a Cancel (P6 fix 1, fix 2). The server starts a turn once it has the whole body, unless it sees the client gone by
+  // then (it looks twice: once the body is read, once the upload is saved), so a cancel just after that aborts a request whose turn already
+  // runs, and no id ever came. The page reads the chat once, under api.js's 15 s limit, Stop reading "Cancelling…" and switched off meanwhile,
+  // and cancels each running turn of the chat that it is not following, as Stop cancels one.
+  // - A chat that was there before is kept, and drawn again from the server whenever the read shows a turn the page did not know (a running
+  //   one, now cancelled, or one that had finished already), so what the server holds is what the page shows; the status says again what it
+  //   said, as the new drawing empties it.
+  // - A chat this Send made is deleted after that cancel (at once when the server stored nothing in it).
+  // - A read that fails or runs out of time leaves the page not knowing: the composer is free, the status keeps what it said, and a notice
+  //   says that the server may still finish that turn. A chat this Send made is kept then: it may hold that turn.
+  // Accepted limitation (ruling 5c): "each running turn that the page is not following" also takes a turn that another tab is running in the
+  // same chat at that moment. Nothing robust tells the two apart, and it takes an explicit Cancel upload in that chat.
+  // Another API server set while it waits (P9-B fix 2): the chat is the last server's, so nothing of it is sent to the new one, nothing more is said,
+  // and the server change has already freed the composer. A cancel that can no longer reach the last server is dropped, not sent elsewhere: its turn
+  // ends by itself there, as it does when a tab closes.
+  async function afterCancel(session, fresh, said) {
+    const asOf = state.serverGen;
+    keepFocusFrom(ui.stop);
+    ui.stop.disabled = true;
+    ui.stop.textContent = CANCELLING_TEXT;
+    const changed = await cancelStrayTurns(session);
+    if (asOf !== state.serverGen) return;   // its cancels went to the last server; its chat is not deleted on the new one
+    if (changed === null) {
+      if (state.session === session) showNotice(MAY_FINISH_TEXT);
+      return;
+    }
+    if (fresh) {
+      dropEmptySession(session);
+      return;
+    }
+    if (changed > 0 && state.session === session) {
+      await openSession(session.id);
+      if (asOf !== state.serverGen) return;   // the chat drawn again was the last server's: its status is not said on the new server's page
+      announce(said, true);
+    }
+  }
+
+  // Reads the chat once and cancels each running turn of it that the page is not following; -> how many of its turns the page now shows
+  // otherwise (those it did not know, and those it knew running that were just cancelled), or null when the chat could not be read in time, or
+  // was read from an API server that is no longer the one set (P9-B fix 2: its turns are not cancelled on the new one).
+  async function cancelStrayTurns(session) {
+    const asOf = state.serverGen;
+    let stored;
+    try {
+      stored = await api.getSession({ sessionId: session.id, ...auth() });
+    } catch {
+      return null;
+    }
+    if (asOf !== state.serverGen) return null;
+    const known = new Set(session.turns.map((t) => t.id).filter(Boolean));
+    const followed = state.turn?.id ?? null;
+    const answers = (Array.isArray(stored?.messages) ? stored.messages : []).filter((m) => isObject(m) && m.role === 'assistant');
+    const running = answers.filter((m) => m.status === 'running' && m.id !== followed);
+    await Promise.all(running.map((m) => api.cancelMessage({ messageId: m.id, ...auth() }).catch(() => null)));
+    return answers.filter((m) => !known.has(m.id)).length + running.filter((m) => known.has(m.id)).length;
+  }
+
+  // Send: the attached file and the note, with the drawer's settings. study (P6-D, the picker) is a test row to run instead: the turn has no
+  // upload (the server reads the study's image where the dataset keeps it), and a file attached meanwhile waits for the next Send.
+  async function send(study = null) {
+    if (state.busy || state.loading) return;
+    if (noServer()) { showNotice(FIRST_RUN_TEXT); return; }   // the Pages copy with no API server: nobody to send it to (P9-B)
+    const picked = Number.isInteger(study) ? study : null;
+    const note = ui.prompt.value ?? '';
+    const file = picked === null ? state.file : null;
+    const session = state.session;
+    if (!file && picked === null && !session.turns.length) { showNotice('Attach an X-ray first.'); return; }
+    clearNotice();
+    clearSaved();   // "Settings saved. They apply from your next Send." is about this Send now: it is stale, and a row more in the composer (P9-G5b fix 1)
+    const options = optionsFromSettings(state.settings, state.models);
+    if (picked !== null) options.test_row = picked;
+    ui.stop.disabled = true;   // until the request is on its way (the chat may still be being made): there is nothing to cancel
+    // Until the page has the turn's id, Stop aborts the request (P6-A c): "Cancel upload" while an image goes up, "Cancel" for a turn that
+    // uploads nothing, a re-run or a test study (P6 fix 1). Set before the page goes busy: it scrolls the composer to its end then, with Stop
+    // laid out as it will stay (its longest label is the one that decides whether it shares Send's row).
+    ui.stop.textContent = file ? CANCEL_UPLOAD : CANCEL_SEND;
+    setBusy(true);
+    announce(file ? UPLOADING_TEXT : SENDING_TEXT);
+    const fresh = !session.id;   // this Send makes the chat
+    try {
+      if (fresh) await createSession(session);
+      // the user moved to another chat while this one was being made, or to another API server, which takes the open chat down in the same task
+      // (forgetServer, P9-B fix 1): a chat the last server made is not this one's, so nothing is streamed into it, and nothing is deleted on either
+      if (state.session !== session) return;
+      // A change of API server while the turn runs leaves the turn (leaveTurn): it comes back as null, its user turn still in the chat, and
+      // nothing below runs for it. A cancel that came first is followed in afterCancel, which drops what the last server answers after a change.
+      const outcome = await runTurn(session, { text: note, file, options });
+      if (outcome === CANCELLED) await afterCancel(session, fresh, cancelledText(file));
+      else if (fresh && !session.turns.length) dropEmptySession(session);   // its first turn was refused: no chat was started after all
+    } catch (err) {   // the chat could not be made, or something broke that runTurn does not deal with itself
+      if (state.session === session) {
+        showNotice(errorMessage(err));
+        if (!expected(err)) report(err);
+      }
+    } finally {
+      if (state.busy && !state.turn && state.session === session) setBusy(false);   // nothing is following a turn: the composer is not locked
+      if (!state.turn && state.session === session) doneUploading();
+    }
+  }
+
+  // An empty chat becomes a session at its first turn. The address follows without a navigation (replaceState fires no
+  // hashchange), so the turn that is about to stream is not torn down by the route handler. The sidebar lists it once the server
+  // has that turn (accept), titled; until then it would only be an empty "New chat".
+  async function createSession(session) {
+    const made = await request('/v1/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    session.id = made.id;
+    if (state.session === session) {   // not if the user has gone to another chat meanwhile: the address is theirs
+      setAddress(`#/s/${made.id}`);
+      syncControls();
+    }
+  }
+
+  // The chat this page made for a first turn that the server then refused holds nothing: it is deleted again and the page is back on the
+  // empty chat it was, so a refused upload does not leave an empty "New chat" in the sidebar (P4-H). The notice that says why stays, and so
+  // does the composer. The page lets go of the chat first and deletes it after, in the background: the composer is free again already, and
+  // a Send meanwhile makes a chat of its own instead of sending into the one being deleted. A delete that fails leaves the chat as it is:
+  // empty, and harmless. After a Cancel upload (afterCancel) the running turns the server took all the same are cancelled before this.
+  function dropEmptySession(session) {
+    const id = session.id;
+    const asOf = state.serverGen;
+    if (state.session === session) {
+      session.id = null;
+      setAddress('#/new');
+      state.route = 'new';   // the page is where it was, so its notice is not one of a route left behind
+      syncControls();
+    }
+    // the sidebar is listed again once the chat is gone, unless another API server is set by then (P9-B fix 2): its sidebar is its own
+    detach(request(`/v1/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }).then(() => (asOf === state.serverGen ? refreshSessions() : null), () => {}));
+  }
+
+  // Stop: ask the server to cancel, then drop the stream. The turn's own message_stop (status aborted) settles the card;
+  // the poll that follows the dropped stream is what brings it.
+  async function stopTurn() {
+    const turn = state.turn;
+    if (!turn || turn.stopping || turn.settled) return;
+    if (!turn.id) { cancelUpload(turn); return; }   // no turn on the server yet (P6-A c)
+    turn.stopping = true;
+    keepFocusFrom(ui.stop);
+    ui.stop.disabled = true;
+    ui.stop.textContent = 'Stopping…';
+    try {
+      await api.cancelMessage({ messageId: turn.id, ...auth() });
+    } catch (err) {
+      turn.stopping = false;
+      if (turn.settled || turn.left || state.turn !== turn) return;   // it ended while the cancel was on its way: nothing to report
+      ui.stop.disabled = false;
+      ui.stop.textContent = 'Stop';
+      showNotice(errorMessage(markNetwork(err)), null, turn);   // the turn's end takes it down again
+      return;
+    }
+    if (turn.settled || turn.left) return;
+    if (state.noticeOwner === turn) clearNotice();   // an earlier Stop failed and this one did not
+    if (turn.streaming) turn.controller?.abort();   // the poll that brings the turn's own message_stop starts as the stream unwinds
+    else follow(turn);                              // nothing is following it (its poll failed for good): follow it again
+  }
+
+  // "Cancel upload" (P6-A c): the page has no id of the turn yet, so the request is aborted, and refuse() takes the user turn back out. The note
+  // and the image were not spent (the accept spends them), so Send sends them again. The server may have taken the turn all the same, between
+  // the request's last byte and its response's headers: send() then asks the chat, and cancels it there (afterCancel, P6 fix 1).
+  function cancelUpload(turn) {
+    if (turn.cancelled || !turn.controller) return;   // while the chat is still being made there is no request yet: Stop is off then
+    turn.cancelled = true;
+    keepFocusFrom(ui.stop);
+    ui.stop.disabled = true;
+    turn.controller.abort();
+  }
+
+  // Leaving a session (or a token change): the stream and the poll are dropped, the turn is not cancelled and is not
+  // followed. Opening that session later finds it running and polls it.
+  function leaveTurn() {
+    stopTicker();
+    watchdog.settle();
+    const turn = state.turn;
+    if (!turn) return;
+    turn.left = true;
+    turn.controller?.abort();
+    turn.poller?.abort();
+    state.turn = null;
+  }
+
+  // A turn found running when its session was opened: no stream to rejoin, so poll it from the last seq it has.
+  function resume(turn) {
+    state.turn = turn;
+    setBusy(true);
+    ui.stop.disabled = false;
+    watchdog.resume();
+    detach(pollTurn(turn));
+  }
+
+  // ---- sessions: the view, the sidebar, the routes ------------------------------------------------------------------------
+
+  function resetView(id) {
+    state.viewer?.close({ restore: false });   // the viewer shows a picture of the chat that is going
+    leaveTurn();
+    api.clearImageCache();
+    for (const url of state.session.blobUrls) urls.revokeObjectURL(url);
+    state.session = { id, turns: [], ui: new Map(), blobUrls: new Set() };
+    ui.conversation.replaceChildren();
+    announce('');
+    clearNotice();
+    setBusy(false);
+  }
+
+  // One message with its events, as {log} or {error}: a message that cannot be read costs its own card and not the whole chat.
+  const loadLog = (messageId) => request(`/v1/messages/${encodeURIComponent(messageId)}?after=0`).then((log) => ({ log }), (error) => ({ error }));
+
+  // -> the chat and the log of each of its turns; null for a chat whose answer comes from an API server that is no longer the one set (P9-B fix 2):
+  // no request is built from it, for its ids are the last server's. The change has moved the route on as well (forgetServer), so openSession drops it.
+  async function loadSession(id) {
+    const asOf = state.serverGen;
+    const session = await request(`/v1/sessions/${encodeURIComponent(id)}`);
+    if (asOf !== state.serverGen) return null;
+    const assistants = session.messages.filter((m) => m.role === 'assistant');
+    const loaded = await Promise.all(assistants.map((m) => loadLog(m.id)));
+    return { session, logs: new Map(assistants.map((m, i) => [m.id, loaded[i]])) };
+  }
+
+  // The card of a turn whose log could not be read: what is wrong, and a Retry that reads it again.
+  function failedCard(turn, error) {
+    return el('article', { class: 'card', 'aria-label': `Assistant report, turn ${turn.n}`, 'data-message-id': turn.id },
+      el('p', { class: 'note error' }, `Couldn't load this turn. ${errorMessage(error)}`),
+      el('button', { type: 'button', 'aria-label': `Retry loading turn ${turn.n}`, onclick: () => detach(reloadTurn(turn)) }, 'Retry'));
+  }
+
+  async function reloadTurn(turn) {
+    if (turn.reloading) return;
+    turn.reloading = true;
+    const view = turn.session;
+    let loaded;
+    try {
+      loaded = await loadLog(turn.id);
+    } finally {
+      turn.reloading = false;
+    }
+    if (state.session !== view) return;   // the user has gone to another chat meanwhile
+    let next;
+    if (loaded.error) {
+      next = failedCard(turn, loaded.error);
+    } else {
+      turn.view = loaded.log.events.reduce(applyEvent, initialView(turn.id));
+      next = renderAssistantCard(turn.view, cardCtx(turn.n));
+    }
+    const hadFocus = doc.activeElement && turn.card.contains(doc.activeElement);
+    turn.card.replaceWith(next);
+    turn.card = next;
+    settleClamps(next);
+    if (hadFocus) qa(next, 'button')[0]?.focus();   // the Retry that had focus is gone: the first control of what replaced it
+    if (!loaded.error && view.turns[view.turns.length - 1] === turn && turn.view.status === 'running' && loaded.log.status === 'running') resume(turn);
+  }
+
+  // Draws every turn from the stored log: the same reducers and builders the live stream goes through.
+  function showSession({ session, logs }) {
+    const view = state.session;
+    const pairs = [];
+    let user = null;
+    for (const m of session.messages) {
+      if (m.role === 'user') {
+        if (user) pairs.push({ user, assistant: null });   // a user message with no answer: drawn alone
+        user = m;
+      } else {
+        pairs.push({ user, assistant: m });
+        user = null;
+      }
+    }
+    if (user) pairs.push({ user, assistant: null });
+    const nodes = [];
+    for (const { user: u, assistant: a } of pairs) {
+      const turn = makeTurn(view, view.turns.length + 1);
+      const loaded = a ? logs.get(a.id) : null;
+      const replayed = loaded?.log ? loaded.log.events.reduce(applyEvent, initialView(a.id)) : null;   // the turn as its log tells it
+      if (u) {
+        const events = a ? logs.get(a.id)?.log?.events : null;
+        const start = Array.isArray(events) ? events.find((e) => e?.event === 'message_start')?.data ?? null : null;
+        const shown = userTurnMessage(u, a, start);
+        turn.text = shown.text;      // a turn that was still queued has no events: its message_start rebuilds this bubble,
+        turn.image = shown.image;    // and rebuilds it from these
+        turn.testRow = Number.isInteger(u.test_row) ? u.test_row : null;   // a test study: what the re-run hint names (P6-D)
+        // how its report ended, and what its model was, from the log (P9-G5b): "ended the report" is the turn's, not the page's today
+        turn.userEl = renderUserTurn({ ...shown, outcome: chipsOutcome(replayed, shown.options?.model) }, userCtx(turn, shown.options?.model));
+        nodes.push(turn.userEl);
+      }
+      if (a) {
+        turn.id = a.id;
+        if (replayed) {
+          turn.view = replayed;
+          turn.card = renderAssistantCard(turn.view, cardCtx(turn.n));
+        } else {
+          turn.card = failedCard(turn, loaded?.error);
+        }
+        nodes.push(turn.card);
+      }
+      view.turns.push(turn);
+    }
+    markBusy(true);   // a screen reader does not read the whole history as it goes in
+    try {
+      ui.conversation.replaceChildren(...nodes);
+      settleClamps(ui.conversation);
+    } finally {
+      markBusy(false);
+    }
+    scroller.toEnd(nodes[nodes.length - 1]);
+    const last = view.turns[view.turns.length - 1];
+    const lastLog = last?.id ? logs.get(last.id)?.log : null;
+    if (lastLog && last.view.status === 'running' && lastLog.status === 'running') resume(last);
+  }
+
+  async function openSession(id) {
+    const gen = ++state.gen;
+    resetView(id);
+    state.loading = true;
+    syncControls();
+    renderSessions();
+    try {
+      const data = await loadSession(id);
+      if (gen !== state.gen) return;
+      showSession(data);
+    } catch (err) {
+      if (gen !== state.gen) return;
+      if (err?.status === 404) {   // not there (any more): the newest chat that is, from a fresh list, or an empty one
+        const asOf = state.serverGen;
+        state.missing = id;
+        state.sessionsLoaded = false;
+        state.loading = false;
+        setAddress('#/');
+        await handleRoute();
+        if (asOf !== state.serverGen) return;   // another API server is set since (P9-B fix 2): the chat it lacked was the last one's
+        showNotice(errorMessage(err));   // after the fallback has opened its chat, which clears the notices of the one before
+      } else {
+        state.session.id = null;   // nothing is open: its link (or the route) opens it again, and so does the Retry
+        renderSessions();          // and the sidebar does not mark it as the page
+        showNotice(errorMessage(err), () => detach(openSession(id)));
+      }
+    } finally {
+      if (gen === state.gen) {
+        state.loading = false;
+        syncControls();
+      }
+    }
+  }
+
+  function openNew() {
+    ++state.gen;
+    resetView(null);
+    ui.prompt.value = '';
+    state.composer.clear();
+    state.loading = false;
+    syncControls();
+    renderSessions();
+  }
+
+  // Shows the route the address names. Home has no view of its own: it becomes the newest session, or #/new when there is
+  // none (and never the session that was just found missing). The Pages copy with no API server has no chat to show (P9-B): the address
+  // stays as it is, a new token included, and the first server set opens it (P9-B fix 2); meanwhile the page says what to set.
+  async function handleRoute() {
+    if (noServer()) { showNotice(FIRST_RUN_TEXT); return; }
+    let route = parseRoute(win.location?.hash);
+    if (route.kind === 'home') {
+      const gen = ++state.gen;
+      if (!state.sessionsLoaded) await refreshSessions();
+      if (gen !== state.gen) return;
+      const newest = state.sessions.find((s) => s.id !== state.missing);
+      const hash = newest ? `#/s/${newest.id}` : '#/new';
+      setAddress(hash);
+      route = parseRoute(hash);
+    }
+    const key = route.kind === 'session' ? `s/${route.id}` : 'new';
+    if (state.route !== null && state.route !== key) clearNotice();   // a notice belongs to the route it was raised on
+    state.route = key;
+    if (route.kind === 'session') {
+      if (state.session.id !== route.id) await openSession(route.id);
+    } else if (state.session.id !== null || state.session.turns.length) {
+      openNew();
+    }
+  }
+
+  // The address changes without a history entry and without a hashchange: the caller shows the route itself.
+  function setAddress(hash) {
+    if (typeof win.history?.replaceState === 'function') win.history.replaceState(null, '', hash);
+    else if (win.location) win.location.hash = hash;
+  }
+
+  // A link the user follows: a new history entry. The same address fires no hashchange, so it is handled here.
+  function navigate(hash) {
+    if (!win.location || win.location.hash === hash) return handleRoute();
+    win.location.hash = hash;
+    return undefined;
+  }
+
+  // -> whether the list was read (a failure is the notice's to say). An answer, or a failure, of an API server that is no longer the one set is
+  // dropped without a word (P9-B fix 1): false.
+  async function refreshSessions({ more = false } = {}) {
+    const shown = state.sessions.length;
+    const onMore = more && doc.activeElement === ui.more;
+    const asOf = state.serverGen;
+    let read = false;
+    if (more) {
+      if (state.loadingMore) return read;   // a double click asks once
+      state.loadingMore = true;
+      ui.more.disabled = true;
+    }
+    try {
+      const limit = more ? PAGE : Math.min(200, Math.max(PAGE, state.sessions.length));
+      const query = `limit=${limit}${more && state.nextCursor ? `&cursor=${encodeURIComponent(state.nextCursor)}` : ''}`;
+      const page = await request(`/v1/sessions?${query}`);
+      if (asOf !== state.serverGen) return read;
+      state.sessions = more ? [...state.sessions, ...page.sessions] : page.sessions;
+      state.nextCursor = page.next_cursor ?? null;
+      state.sessionsLoaded = true;
+      renderSessions();
+      read = true;
+    } catch (err) {
+      if (asOf !== state.serverGen) return read;
+      state.sessionsLoaded = true;
+      showNotice(errorMessage(err));
+    } finally {
+      // A More of the last API server ends with nothing of the new one's (P9-B fix 2): the change has reset More (forgetServer), and the focus
+      // stays where the user is now.
+      if (more && asOf === state.serverGen) {
+        state.loadingMore = false;
+        ui.more.disabled = false;
+        if (onMore) (ui.more.hidden ? qa(ui.list, 'li a')[shown] : ui.more)?.focus();   // More keeps focus; the last page hands it to its first new row
+      }
+    }
+    return read;
+  }
+
+  const rowOf = (id) => qa(ui.list, 'li').find((li) => li.getAttribute('data-session') === id);   // an id is compared, never put into a selector
+
+  function renderSessions() {
+    const active = doc.activeElement;
+    const held = active && ui.list.contains(active) ? { id: active.closest('li')?.getAttribute('data-session'), tag: active.localName } : null;
+    ui.list.replaceChildren(...state.sessions.map((s) => {
+      const title = sessionTitle(s);
+      const current = s.id === state.session.id;
+      return el('li', { 'data-session': s.id },
+        el('a', {
+          href: `#/s/${s.id}`, 'aria-current': current ? 'page' : null,
+          onclick: () => {
+            closeSidebar();
+            if (win.location?.hash === `#/s/${s.id}`) detach(handleRoute());   // the same address fires no hashchange: a chat that failed to open tries again here
+          },
+        },
+          el('span', { class: 'session-title' }, title), el('span', { class: 'session-meta' }, sessionMeta(s))),
+        el('button', { type: 'button', class: 'session-delete', 'aria-label': `Delete chat: ${title}`, onclick: () => detach(deleteSession(s)) }, '✕'));
+    }));
+    ui.more.hidden = !state.nextCursor;
+    syncControls();
+    if (held?.id) rowOf(held.id)?.querySelector(held.tag)?.focus();   // a rebuilt list must not drop the keyboard's place
+  }
+
+  async function deleteSession(session) {
+    if (!confirmed(`Delete "${sessionTitle(session)}"? This cannot be undone.`)) return;
+    const asOf = state.serverGen;
+    try {
+      await request(`/v1/sessions/${encodeURIComponent(session.id)}`, { method: 'DELETE' });
+    } catch (err) {
+      if (asOf !== state.serverGen) return;   // another API server is set since (P9-B fix 1): the last one's answer is not said
+      if (err?.status !== 404) { showNotice(errorMessage(err)); return; }   // already gone: the list below says so
+    }
+    if (asOf !== state.serverGen) return;   // nor followed: the sidebar and the chat are the new server's
+    const here = state.session.id === session.id;
+    if (here) resetView(null);   // its image URLs and its stream go with it
+    await refreshSessions();
+    if (asOf !== state.serverGen) return;   // P9-B fix 2: the address, the chat and the focus are the new server's page's, after every wait
+    if (here) {
+      setAddress('#/');
+      await handleRoute();   // home: the newest chat that is left, or an empty one
+      if (asOf !== state.serverGen) return;
+    }
+    const open = state.session.id ? rowOf(state.session.id) : null;
+    (open?.querySelector('a') ?? ui.newChat).focus();   // the Delete that had focus is gone: the chat that is open, or New chat
+  }
+
+  // ---- export --------------------------------------------------------------------------------------------------------------------
+
+  async function exportSession(format) {
+    const id = state.session.id;
+    if (!id) return;
+    const asOf = state.serverGen;
+    try {
+      const { headers, blob } = await request(`/v1/sessions/${encodeURIComponent(id)}/export?format=${format}`, { raw: true });
+      if (asOf !== state.serverGen) return;   // the file of an API server that is no longer the one set is not saved (P9-B fix 1)
+      const url = urls.createObjectURL(blob);
+      const link = doc.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', exportFilename(headers?.get?.('Content-Disposition'), id, format));
+      doc.body.append(link);
+      link.click();
+      link.remove();
+      later(() => urls.revokeObjectURL(url), REVOKE_MS);
+    } catch (err) {
+      if (asOf === state.serverGen) showNotice(errorMessage(err));
+    }
+  }
+
+  // ---- the health strip ----------------------------------------------------------------------------------------------------------
+
+  function setHealth(message, down) {
+    if (ui.health.textContent !== message) ui.health.textContent = message;
+    if (down) ui.health.setAttribute('data-state', 'down'); else ui.health.removeAttribute('data-state');
+  }
+
+  // How long sessions are kept (P8-B) has an element of its own after the strip, made here and not in index.html: it is a policy and not a load, and on a
+  // phone it takes one line of its own where, joined to the strip's text, it would wrap the whole strip and push the study list off a 320 x 568 screen.
+  const retention = el('span', { id: 'retention', class: 'note', hidden: true });
+  ui.health.parentNode.append(retention);
+
+  function setRetention(h) {
+    const sentence = retentionText(h);
+    if (retention.textContent !== sentence) retention.textContent = sentence;
+    retention.hidden = sentence === '';
+  }
+
+  // Asks /healthz now and schedules the next check: 10 s on, 30 s after three failures. A turn's accept and its end ask too (P6-A d), which
+  // starts the schedule over: there is one next check at any time, and one check on its way at most. It asks the API server (P9-B); with
+  // none, on the Pages copy, it asks nothing and schedules nothing, and an answer from a server that is no longer the one set is not shown:
+  // the one that is set is asked instead.
+  async function checkHealth() {
+    if (state.healthBusy) { state.healthAgain = true; return; }
+    const base = apiBase();
+    if (base === null) return;
+    const asOf = state.serverGen;
+    state.healthBusy = true;
+    if (state.healthTimer !== null) cancelLater(state.healthTimer);
+    state.healthTimer = null;
+    const controller = new AbortController();
+    const timer = later(() => controller.abort(), HEALTH_TIMEOUT_MS);   // a half-open tunnel never answers and never fails by itself
+    try {
+      const res = await doFetch(`${base}/healthz`, { cache: 'no-store', signal: controller.signal });
+      if (!res.ok) throw new Error('unhealthy');
+      const h = await res.json();
+      if (asOf !== state.serverGen) {
+        state.healthAgain = true;
+      } else {
+        state.healthFailures = 0;
+        if (text(h?.mode)) ui.badge.textContent = h.mode;
+        setHealth(healthText(h), false);
+        setRetention(h);
+      }
+    } catch {
+      if (asOf !== state.serverGen) {
+        state.healthAgain = true;
+      } else {
+        state.healthFailures += 1;
+        setHealth('server restarting…', true);
+      }
+    } finally {
+      cancelLater(timer);
+      state.healthBusy = false;
+    }
+    if (state.healthAgain) {   // asked for while this one was on its way: the answer it wants is a fresh one
+      state.healthAgain = false;
+      await checkHealth();
+      return;
+    }
+    state.healthTimer = later(() => { state.healthTimer = null; detach(checkHealth()); }, nextHealthDelay(state.healthFailures));
+  }
+
+  // ---- the shell: sidebar and drawer ---------------------------------------------------------------------------------------------
+
+  function openSidebar() {
+    closePicker({ restore: false });   // the study list starts a turn from the composer, which the sidebar now covers (P6 fix 1)
+    doc.body.classList.add('sidebar-open');
+    ui.toggle.setAttribute('aria-expanded', 'true');
+  }
+
+  function closeSidebar({ restore = true } = {}) {
+    if (!doc.body.classList.contains('sidebar-open')) return false;
+    doc.body.classList.remove('sidebar-open');
+    ui.toggle.setAttribute('aria-expanded', 'false');
+    if (restore) ui.toggle.focus();
+    return true;
+  }
+
+  function openDrawer({ models = false } = {}) {
+    if (ui.drawer.hidden) {
+      const from = doc.activeElement;
+      state.drawerOpener = from && from !== doc.body && !ui.picker.contains(from) ? from : ui.settings;
+      closePicker({ restore: false });   // and the study list closes: Escape then closes the drawer, back to Settings (P6 fix 1)
+      clearSaved();   // "Settings saved." that is still on the page is about a Save that is behind the user now
+      ui.drawer.hidden = false;
+      ui.settings.setAttribute('aria-expanded', 'true');
+      ui.drawerClose.focus();
+    }
+    if (models) ui.modelsSection.scrollIntoView?.({ block: 'start' });
+  }
+
+  function closeDrawer({ restore = true } = {}) {
+    if (ui.drawer.hidden) return false;
+    discardDrafts();
+    ui.drawer.hidden = true;
+    ui.settings.setAttribute('aria-expanded', 'false');
+    if (restore) {
+      const to = state.drawerOpener && doc.body.contains(state.drawerOpener) ? state.drawerOpener : ui.settings;
+      to.focus();
+    }
+    state.drawerOpener = null;
+    return true;
+  }
+
+  function onKeydown(event) {
+    if (event.key !== 'Escape') return;
+    if (state.viewer) {   // the topmost layer (P6-E): Escape closes it and nothing under it, wherever the focus is
+      state.viewer.close();
+      event.preventDefault();
+      return;
+    }
+    if (!ui.picker.hidden && ui.picker.contains(doc.activeElement)) {   // the study list is Escape's only when the focus is in it (P6 fix 1)
+      closePicker();
+      event.preventDefault();
+      return;
+    }
+    const drawer = closeDrawer();
+    const sidebar = closeSidebar({ restore: !drawer });
+    if (drawer || sidebar) event.preventDefault();
+  }
+
+  // ---- the viewer (P6-E) -------------------------------------------------------------------------------------------------------------
+
+  // A picture of a card, or the upload in the user's own message (P6-G), opens viewer.js over the page: its pictures come through api.js's loadImage
+  // with this page's auth (and its refusals kept), and the full-size original, which no card shows, is let go of when it closes (api.js forgetImage).
+  // Closed, it gives the focus back to the control that opened it, or, where the card has been drawn again meanwhile (a turn that ran on), to the same
+  // control of the new card; refind, for a control that has no key (the thumbnail of a user turn, which message_start draws again), says where the
+  // new one is.
+  function openViewer(spec, opener = null, refind = null) {
+    const from = opener && doc.body.contains(opener) ? opener : doc.activeElement;
+    const key = from ? focusKey(from) : null;
+    const messageId = from?.closest?.('article.card')?.getAttribute('data-message-id') ?? null;
+    const handle = showViewer(spec, {
+      document: doc, root: ui.viewer, window: win, ResizeObserver: env.ResizeObserver,
+      loadImage: (url) => api.loadImage(url, auth()),
+      forgetImage: (url) => api.forgetImage?.(url),
+      onClose: ({ restore }) => {
+        if (state.viewer === handle) state.viewer = null;
+        if (restore) giveFocusBack(from, messageId, key, refind);
+      },
+    });
+    if (handle) state.viewer = handle;   // nothing to show opens nothing, and leaves an open viewer as it is
+  }
+
+  function giveFocusBack(from, messageId, key, refind = null) {
+    if (from && from !== doc.body && doc.body.contains(from)) {
+      from.focus();
+      return;
+    }
+    const again = refind?.();   // the control was drawn again meanwhile: the one that replaced it
+    if (again && doc.body.contains(again)) {
+      again.focus();
+      return;
+    }
+    const card = messageId ? qa(ui.conversation, 'article.card').find((c) => c.getAttribute('data-message-id') === messageId) : null;
+    if (card && key) restoreFocus(card, key);
+  }
+
+  // ---- the settings drawer ----------------------------------------------------------------------------------------------------------
+
+  const fields = { inputs: {}, errors: {} };
+  const drafts = new Set();   // the number fields whose text the settings did not take: not a whole number inside the bounds
+
+  // true when the settings were stored; false when the browser would not (the note under the fields says so).
+  function persist() {
+    const ok = saveSettings(storage, state.settings);
+    fields.storageNote.hidden = ok;
+    return ok;
+  }
+
+  // sync false leaves the drawer's controls as they are: the field being typed in is not rewritten under the hand that types.
+  function update(patch, { sync = true } = {}) {
+    state.settings = sanitize({ ...state.settings, ...patch });
+    const ok = persist();
+    if (sync) syncDrawer();
+    renderChips();
+    return ok;
+  }
+
+  // A number field's text is a draft until it is a whole number inside the bounds: the field then has the line that says what it takes
+  // under it (aria-invalid, and aria-describedby naming the line), and the settings, the chips and the stored copy stay as they were.
+  function showDraft(key, on) {
+    const input = fields.inputs[key];
+    if (on) drafts.add(key); else drafts.delete(key);
+    fields.errors[key].hidden = !on;
+    if (on) input.setAttribute('aria-invalid', 'true'); else input.removeAttribute('aria-invalid');
+    describe(input, fields.errors[key].id, on);
+  }
+
+  // Closing the drawer puts the saved value back in every field that holds a draft, and takes its line down.
+  function discardDrafts() {
+    if (!drafts.size) return;
+    if (drafts.has('api_server')) fields.apiServer.value = state.settings.api_server ?? '';   // P9-B: syncDrawer writes the numbers only
+    for (const key of [...drafts]) showDraft(key, false);
+    syncDrawer();
+  }
+
+  // The visible live region beside the chips, emptied (and its timer stopped).
+  function clearSaved() {
+    if (state.savedTimer !== null) cancelLater(state.savedTimer);
+    state.savedTimer = null;
+    ui.saved.textContent = '';
+    ui.saved.removeAttribute('data-state');
+  }
+
+  // "Settings saved." in that region for SAVED_MS; a second Save starts the time over. warn: where the browser would not store the settings
+  // the same region says that instead (the storage note), in the warning's colour, and never "saved".
+  function confirmSaved(message, warn = false) {
+    clearSaved();
+    ui.saved.textContent = message;
+    if (warn) ui.saved.setAttribute('data-state', 'warn');
+    state.savedTimer = later(clearSaved, SAVED_MS);
+    keepStopInView();   // a Save while a turn runs adds this row to a busy composer: Stop, its last row, stays in sight (P9-G5b fix 1)
+  }
+
+  // Save, which is the form's submit: Enter in a text field submits it too. Every number field the page lets the user edit must hold a
+  // whole number inside its bounds, else nothing is stored and the drawer stays open on the first that does not (with every wrong
+  // field's line showing). Otherwise the settings are stored, the drawer closes to where it was opened from, and the page says so beside
+  // the chips. Where the browser will not store them, the drawer closes all the same (one that stays open looks dead), the settings still
+  // apply in this tab, and what the page says beside the chips is the storage note, in the warning's colour, and never "saved".
+  function saveDrawer() {
+    const wrong = NUMBER_KEYS.filter((key) => !fields.inputs[key].disabled && wholeNumber(fields.inputs[key].value, BOUNDS[key]) === null);
+    const serverWrong = normalizeApiServer(fields.apiServer.value) === null;   // P9-B: the API server is refused as a wrong number is
+    if (wrong.length || serverWrong) {
+      for (const key of wrong) showDraft(key, true);
+      if (serverWrong) showDraft('api_server', true);
+      const first = wrong.length ? fields.inputs[wrong[0]] : fields.apiServer;   // the first in the form: the numbers come before it
+      first.focus();
+      first.select();   // a field that already has focus gets no focus event, so its bad text is selected here: the next key replaces it
+      announce(wrong.length ? rangeMessage(wrong[0]) : API_SERVER_TEXT, true);   // a refusal is news every time, the same words too
+      return false;
+    }
+    const patch = {};
+    for (const key of NUMBER_KEYS) {
+      if (!fields.inputs[key].disabled) patch[key] = wholeNumber(fields.inputs[key].value, BOUNDS[key]);
+      showDraft(key, false);
+    }
+    const stored = update(patch);
+    commitApiServer();   // a server typed and not yet committed (no change came before the submit) applies here
+    closeDrawer();
+    confirmSaved(stored ? SAVED_TEXT : STORAGE_TEXT, !stored);
+    return true;
+  }
+
+  function buildDrawer() {
+    // A number field: a whole number inside the bounds applies at once, so that the chips follow the keys; anything else stays as typed,
+    // with its line under it, until it is right or the drawer closes. Nothing is clamped (the "1" on the way to "150" is not 16), and
+    // nothing wrong is left in force: the "30" on the way to "300" does apply, and when the text stops being a number the setting can take,
+    // the setting goes back to what it was before this edit (an edit runs from the focus, or the first key, to the change or the blur).
+    const number = (key) => {
+      const input = el('input', { type: 'number', min: BOUNDS[key][0], max: BOUNDS[key][1], step: 1, inputmode: 'numeric', 'data-setting': key });
+      fields.inputs[key] = input;
+      fields.errors[key] = el('p', { class: 'field-error', id: `${key}-error`, hidden: true }, rangeMessage(key));
+      const read = () => {
+        const n = wholeNumber(input.value, BOUNDS[key]);
+        showDraft(key, n === null);
+        return n;
+      };
+      let before;   // the setting when this edit began; undefined between edits
+      const begin = () => { if (before === undefined) before = state.settings[key]; };
+      input.addEventListener('input', () => {
+        begin();   // here as well as at the focus: a key can come with no focus event before it
+        const n = read();
+        if (n !== null) {
+          if (n !== state.settings[key]) update({ [key]: n }, { sync: false });
+        } else if (state.settings[key] !== before) {
+          update({ [key]: before }, { sync: false });
+        }
+      });
+      input.addEventListener('change', () => {
+        const n = read();
+        if (n !== null) update({ [key]: n });   // writes the number back as the setting has it: "0120" is 120
+        before = undefined;                      // committed: the next edit starts from what the setting is now
+      });
+      // Typing replaces what the field holds: it is selected whole when it gets focus, by Tab or by a click. A click ends in a mouseup,
+      // which would put the caret back and undo that, so the mouseup of the click that gave the field its focus is cancelled; without
+      // this, "150" is typed after the "100" that was there, and 100150 is out of range. Only that click: the first click after a Tab, and
+      // every later click in a field that has focus, place the caret as they always do.
+      let pressed = false;   // a pointer went down on the field while it had no focus: the focus that follows is that click's
+      let guard = false;     // and the mouseup after it must not put the caret back over the selection
+      const down = () => { pressed = doc.activeElement !== input; };
+      input.addEventListener('pointerdown', down);
+      input.addEventListener('mousedown', down);   // a browser with no pointer events
+      input.addEventListener('focus', () => {
+        input.select();
+        guard = pressed;
+        pressed = false;
+        begin();
+      });
+      input.addEventListener('mouseup', (event) => {
+        if (guard) event.preventDefault();
+        guard = pressed = false;
+      });
+      input.addEventListener('blur', () => {
+        guard = pressed = false;
+        before = undefined;
+      });
+      return input;
+    };
+    const choice = (key, ...options) => {
+      const select = el('select', { 'data-setting': key }, ...options.map(([value, label]) => el('option', { value }, label)));
+      select.addEventListener('change', () => update({ [key]: select.value }));
+      return select;
+    };
+    const toggle = (key) => {
+      const input = el('input', { type: 'checkbox', 'data-setting': key });
+      input.addEventListener('change', () => update({ [key]: !!input.checked }));
+      return input;
+    };
+    fields.model = el('select', {});
+    fields.model.addEventListener('change', () => update({ model: fields.model.value === state.models?.default_model ? '' : fields.model.value }));
+    // P9-F: compare mode, a switch named for the chosen model's partner, shown only where /v1/models offers it (syncDrawer). Its words are a
+    // text node that syncDrawer rewrites, so that the switch is never rebuilt under the hand that uses it.
+    fields.compare = toggle('compare');
+    fields.compareText = doc.createTextNode('Compare with another model');
+    fields.compareRow = el('label', { class: 'check', hidden: true }, fields.compare, fields.compareText);
+    fields.decode = choice('decode', ['beam', 'Beam search'], ['greedy', 'Greedy']);
+    fields.beam = number('beam_size');
+    fields.tokens = number('max_new_tokens');
+    fields.cached = toggle('cached_decode');
+    fields.cachedNote = el('p', { class: 'note', id: 'cached-note' }, NO_CACHE_NOTE);
+    fields.cached.setAttribute('aria-describedby', 'cached-note');
+    fields.compile = toggle('compile');
+    fields.compileRow = el('label', { class: 'check' }, fields.compile, 'Compile the model (torch.compile)');
+    fields.kImages = number('k_images');
+    fields.kReports = number('k_reports');
+    fields.retrievalNote = el('p', { class: 'note', id: 'retrieval-note', hidden: true }, RETRIEVAL_NOTES.none);
+    fields.label = toggle('label');
+    fields.labelsNote = el('p', { class: 'note', id: 'labels-note', hidden: true }, 'This server has no CheXbert labeller, so labels are skipped.');
+    fields.repair = toggle('display_repair');
+    fields.stop = toggle('stop_on_repeat');
+    fields.stopHint = el('p', { class: 'hint', id: 'stop-hint' }, stopHint(chosenCard(state.settings, state.models)));   // worded per model: syncDrawer
+    fields.stop.setAttribute('aria-describedby', 'stop-hint');
+    fields.applyNote = el('p', { class: 'hint', id: 'apply-note' }, 'Changes apply from your next Send.');
+    fields.runningNote = el('p', { class: 'hint', id: 'running-note', hidden: true }, 'The running turn keeps the settings it started with.');
+    fields.mode = el('input', { type: 'text', readonly: true });
+    // P9-B: the API server, which every request goes to (and the token with it). It applies when it is committed (the field is left, or Enter),
+    // as the token does, and at Save; while it is typed, a line that said it was wrong goes as soon as it is right.
+    fields.apiServer = el('input', { type: 'url', 'data-setting': 'api_server', autocomplete: 'off', spellcheck: 'false', autocapitalize: 'off',
+                                     'aria-describedby': 'api-server-hint' });
+    fields.inputs.api_server = fields.apiServer;
+    fields.errors.api_server = el('p', { class: 'field-error', id: 'api_server-error', hidden: true }, API_SERVER_TEXT);
+    fields.apiServerHint = el('p', { class: 'hint', id: 'api-server-hint' },
+      'Empty: the server this page came from. Otherwise an origin such as http://localhost:8000.');
+    fields.apiServer.addEventListener('input', () => {
+      if (drafts.has('api_server') && normalizeApiServer(fields.apiServer.value) !== null) showDraft('api_server', false);
+    });
+    fields.apiServer.addEventListener('change', () => commitApiServer());
+    fields.token = el('input', { type: 'password', autocomplete: 'off', spellcheck: 'false' });
+    fields.token.addEventListener('change', () => {
+      const token = fields.token.value.trim();
+      if (token === state.settings.token) return;
+      update({ token });
+      detach(reloadAll());
+    });
+    fields.storageNote = el('p', { class: 'hint', hidden: true }, STORAGE_TEXT);
+    fields.save = el('button', { type: 'submit', id: 'drawer-save' }, 'Save');
+    // novalidate: the browser's own bubbles for min and max would stop the submit before the page could say what its fields take.
+    fields.form = el('form', { id: 'settings-form', novalidate: true },
+      el('label', {}, 'Model', fields.model),
+      fields.compareRow,
+      el('label', {}, 'Decode', fields.decode),
+      el('label', {}, rangeLabel('Beam size', 'beam_size'), fields.beam), fields.errors.beam_size,
+      el('label', {}, rangeLabel('Token budget', 'max_new_tokens'), fields.tokens), fields.errors.max_new_tokens,
+      el('label', { class: 'check' }, fields.cached, 'Cached decode'), fields.cachedNote,
+      fields.compileRow,
+      el('label', {}, rangeLabel('Similar images', 'k_images'), fields.kImages), fields.errors.k_images,
+      el('label', {}, rangeLabel('Matching reports', 'k_reports'), fields.kReports), fields.errors.k_reports, fields.retrievalNote,
+      el('label', { class: 'check' }, fields.label, 'CheXbert labels'), fields.labelsNote,
+      el('label', { class: 'check' }, fields.repair, 'Display repair'),
+      el('label', { class: 'check' }, fields.stop, 'Stop when the report starts repeating'), fields.stopHint,
+      el('label', {}, 'Mode', fields.mode),
+      el('label', {}, 'API server', fields.apiServer), fields.errors.api_server, fields.apiServerHint,
+      el('label', {}, 'Access token', fields.token),
+      el('p', { class: 'hint' }, 'Saved in this browser on this device, because you typed it here.'),
+      fields.storageNote,
+      el('div', { class: 'drawer-actions' }, fields.save));
+    fields.form.addEventListener('submit', (event) => {
+      event.preventDefault();   // the page never reloads
+      saveDrawer();
+    });
+    ui.drawerClose = el('button', { type: 'button', id: 'drawer-close', 'aria-label': 'Close settings', onclick: () => closeDrawer() }, '✕');
+    ui.modelsSection = el('section', { id: 'models-section', 'aria-label': 'Models' });
+    ui.drawer.replaceChildren(
+      el('div', { class: 'drawer-head' }, el('h2', {}, 'Settings'), ui.drawerClose),
+      fields.applyNote, fields.runningNote, fields.form, ui.modelsSection);
+    fields.token.value = state.settings.token;
+    fields.apiServer.value = state.settings.api_server ?? '';
+    syncDrawer();
+  }
+
+  // The API server field's text, committed (P9-B): by the field's change (it is left, or Enter is pressed) and by Save. An origin, or nothing
+  // (this page's own origin), is written back as it is kept and, when it differs from the setting, applied at once; anything else stays as
+  // typed, with the fixed line under the field, and the setting does not change. A change that comes once the drawer has closed (Escape, then
+  // the field's blur) puts the kept value back instead, as closing does with any draft. -> whether the text was taken.
+  // What it applies is the page's effective API origin (P9-B fix 2): the API server when one is set, else this page's own origin, or, on the Pages
+  // copy, none. A change goes from an origin to another one, or to none. The first server of the Pages copy, set where there was none, is no change:
+  // nothing was asked of anyone before it, so the token typed meanwhile is that server's, and the address (a chat's link) is the chat it opens.
+  function commitApiServer() {
+    const server = normalizeApiServer(fields.apiServer.value);
+    if (server === null && !ui.drawer.hidden) {
+      showDraft('api_server', true);
+      return false;
+    }
+    showDraft('api_server', false);
+    fields.apiServer.value = server ?? state.settings.api_server ?? '';
+    if (server === null || server === (state.settings.api_server ?? '')) return server !== null;
+    if (noServer()) {   // the first server of the Pages copy
+      update({ api_server: server });
+      firstServer();
+      return true;
+    }
+    // The token was the last server's (P9-B fix 1): a mistyped host must not receive it. It is cleared, and the new server's own is entered.
+    update({ api_server: server, token: '' });
+    fields.token.value = '';
+    serverChanged();
+    return true;
+  }
+
+  // The drawer's controls from the settings and the models: the model list, what the chosen card allows, the numbers (a draft is kept).
+  function fillModels() {
+    const cards = cardsOf(state.models);
+    fields.model.replaceChildren(...(cards.length ? cards.map((c) => el('option', { value: c.name }, c.name)) : [el('option', { value: '' }, 'Server default')]));
+    // A model's description: its name, the line it says about how it measured (the card's evaluation_note, P9-G5b: the EOS model has one), and
+    // its card. The note is a paragraph of its own, so the card's table does not say it a second time; a note that is no text stays in the table.
+    ui.modelsSection.replaceChildren(el('h3', {}, 'Models'), ...cards.flatMap((c) => {
+      const note = text(c.evaluation_note);
+      const { evaluation_note: _said, ...rest } = c;
+      return [el('h4', {}, c.name), ...(note ? [el('p', { class: 'note model-note' }, note)] : []), detailTable(note ? rest : c, `${c.name} details`)];
+    }));
+    syncDrawer();
+    ui.pick.hidden = !pickerAvailable(state.models);   // private mode with a gallery only (P6-D)
+    if (ui.pick.hidden) closePicker({ restore: false });
+  }
+
+  // ---- the test-split picker (P6-D) ------------------------------------------------------------------------------------------------
+
+  // The list of test studies under the composer's "Test-split study" button: a search by the start of a study id, and a button per study
+  // that sends a turn with that test row and no upload. Private mode only, so the study ids it shows never reach a public page (R1).
+  function openPicker() {
+    if (!ui.picker.hidden || ui.pick.hidden || ui.pick.disabled) return;
+    clearStudies('Loading…');   // whatever it showed last is not shown again until the fresh list comes (P6 fix 1)
+    ui.picker.hidden = false;
+    ui.pick.setAttribute('aria-expanded', 'true');
+    ui.pickSearch.focus();
+    detach(loadStudies());
+  }
+
+  const pickQuery = () => (ui.pickSearch.value ?? '').trim();
+
+  // The list goes as soon as it no longer answers the query: when the query changes and when the picker opens again. A focus that was on
+  // one of its studies goes back to the search, never to the page body (P6 fix 1).
+  function clearStudies(status) {
+    const held = doc.activeElement && ui.pickList.contains(doc.activeElement);
+    ui.pickList.replaceChildren();
+    state.pickShown = null;
+    ui.pickStatus.textContent = status;
+    if (held) ui.pickSearch.focus();
+  }
+
+  // -> whether it was open. restore gives the focus back to the button that opened it.
+  function closePicker({ restore = true } = {}) {
+    if (ui.picker.hidden) return false;
+    if (state.pickTimer !== null) cancelLater(state.pickTimer);
+    state.pickTimer = null;
+    state.pickGen += 1;   // a list still on its way is not wanted any more
+    if (doc.activeElement && ui.picker.contains(doc.activeElement) && !restore) ui.prompt.focus();
+    ui.picker.hidden = true;
+    ui.pick.setAttribute('aria-expanded', 'false');
+    if (restore) ui.pick.focus();
+    return true;
+  }
+
+  // Asks for the studies whose id starts with the query, and shows them; -> a promise that ends once they are shown (true), or once the list
+  // is no longer wanted (false: a newer query, or the picker closed). state.pickLoading is it while it is on its way.
+  function loadStudies() {
+    const gen = ++state.pickGen;
+    const query = pickQuery();
+    ui.pickStatus.textContent = 'Loading…';
+    const done = fetchStudies(gen, query).finally(() => { if (state.pickLoading?.gen === gen) state.pickLoading = null; });
+    state.pickLoading = { gen, query, done };
+    return done;
+  }
+
+  // A list, or a failure, that comes once it is no longer wanted is dropped: a newer query, or the picker closed. Another API server closes the picker
+  // in the same task as it is set (forgetServer: the last server's gallery is gone), so the list of the last server is never the one wanted (P9-B fix 1).
+  async function fetchStudies(gen, query) {
+    let body;
+    try {
+      body = await request(`/v1/test-studies?limit=${PICK_LIMIT}${query ? `&q=${encodeURIComponent(query)}` : ''}`);
+    } catch (err) {
+      if (gen !== state.pickGen) return false;
+      clearStudies(errorMessage(err));
+      if (!expected(err)) report(err);
+      return false;
+    }
+    if (gen !== state.pickGen) return false;   // a newer query, or the picker closed (another API server closes it)
+    const studies = (Array.isArray(body?.studies) ? body.studies : []).filter((s) => isObject(s) && Number.isInteger(s.test_row));
+    const held = doc.activeElement && ui.pickList.contains(doc.activeElement);
+    ui.pickList.replaceChildren(...studies.map((s) => el('li', {}, el('button', {
+      type: 'button', class: 'study', 'data-test-row': String(s.test_row),
+      // a button of a list that is gone is no choice: a press that still reaches one (a script, a click on its way) does nothing
+      onclick: (event) => { if (ui.pickList.contains(event.currentTarget)) chooseStudy(s.test_row); },
+    }, studyText(s)))));
+    state.pickShown = query;
+    if (held) ui.pickSearch.focus();   // the study that had the focus is gone with its list
+    const more = studies.length === PICK_LIMIT ? ' (the first; type more of an id to narrow them)' : '';
+    ui.pickStatus.textContent = studies.length ? `${studies.length} ${studies.length === 1 ? 'study' : 'studies'}${more}`
+      : query ? `No study id starts with ${query}.` : 'No test-split studies.';
+    return true;
+  }
+
+  // Enter in the search: the first study of the list for what is typed now, which Enter then chooses (P6 fix 1). The typing pause is cut
+  // short, and a list already on its way for this query is waited for rather than asked for again. Never a study of another query's list.
+  async function firstStudy() {
+    const query = pickQuery();
+    if (state.pickTimer !== null) cancelLater(state.pickTimer);
+    state.pickTimer = null;
+    if (state.pickShown !== query) {
+      const coming = state.pickLoading;
+      await (coming && coming.gen === state.pickGen && coming.query === query ? coming.done : loadStudies());
+    }
+    if (!ui.picker.hidden && state.pickShown === query && pickQuery() === query) ui.pickList.querySelector('button')?.focus();
+  }
+
+  function chooseStudy(row) {
+    closePicker();
+    detach(send(row));
+  }
+
+  // aria-describedby is a list of ids: this adds or takes out one of them, and names a note only while the note is shown (a hidden
+  // element that is named is still read out).
+  function describe(field, id, on) {
+    const ids = (field.getAttribute('aria-describedby') ?? '').split(/\s+/).filter((x) => x && x !== id);
+    if (on) ids.push(id);
+    if (ids.length) field.setAttribute('aria-describedby', ids.join(' ')); else field.removeAttribute('aria-describedby');
+  }
+
+  function syncDrawer() {
+    const s = state.settings;
+    const card = chosenCard(s, state.models);
+    const partner = comparePartner(s, state.models);   // P9-F: the chosen model's, where compare is offered
+    const ownCache = !(card && card.cached_decode_available === false);
+    // a compare turn decodes its second report with the same options: a partner with no cache makes it uncached too
+    const cachedOk = ownCache && !(s.compare === true && partner?.card?.cached_decode_available === false);
+    const retrieval = serverHas(state.models, 'retrieval', s.model);   // the chosen model's own (P5-E)
+    const labelling = serverHas(state.models, 'labels', s.model);
+    fields.model.value = card?.name ?? '';
+    fields.compareRow.hidden = !partner;
+    if (partner && fields.compareText.data !== `Compare with ${partner.name}`) fields.compareText.data = `Compare with ${partner.name}`;
+    fields.compare.checked = !!partner && s.compare === true;
+    fields.decode.value = s.decode;
+    fields.beam.disabled = s.decode === 'greedy';
+    for (const field of [fields.kImages, fields.kReports]) {   // a stage the server skips has nothing to set; the note says so
+      field.disabled = !retrieval;
+      describe(field, 'retrieval-note', !retrieval);
+    }
+    for (const key of NUMBER_KEYS) {
+      const field = fields.inputs[key];
+      if (field.disabled) showDraft(key, false);              // nothing can be typed in it: there is no draft to keep
+      if (!drafts.has(key)) field.value = String(s[key]);    // a draft is not rewritten under the hand that is typing it
+    }
+    fields.cached.disabled = !cachedOk;
+    fields.cached.checked = cachedOk && s.cached_decode;
+    fields.cachedNote.hidden = cachedOk;
+    fields.cachedNote.textContent = ownCache && partner ? `${partner.name} has no decode cache, so a compare turn runs uncached.` : NO_CACHE_NOTE;
+    fields.compileRow.hidden = state.models?.allow_compile !== true;
+    fields.compile.checked = s.compile && state.models?.allow_compile === true;
+    const why = retrievalNote(state.models, s.model);   // the chosen model's own reason (P6-C ruling)
+    fields.retrievalNote.hidden = !why;
+    if (why) fields.retrievalNote.textContent = why;
+    fields.label.disabled = !labelling;
+    fields.label.checked = labelling && s.label;
+    describe(fields.label, 'labels-note', !labelling);
+    fields.labelsNote.hidden = labelling;
+    fields.repair.checked = s.display_repair;
+    fields.stop.checked = s.stop_on_repeat;
+    fields.stopHint.textContent = stopHint(card);   // what Off means for the chosen model (P9-G5b)
+    fields.mode.value = text(state.models?.mode) || '—';
+  }
+
+  function renderChips() {
+    const options = optionsFromSettings(state.settings, state.models);
+    if (!serverHas(state.models, 'retrieval', state.settings.model)) { delete options.k_images; delete options.k_reports; }   // that stage is skipped: no "k 4/3" to show
+    // The next turn has not run: for a model trained to end its reports the chip of the stop switch claims nothing (optionChips, P9-G5b).
+    const outcome = { eosTrained: chosenCard(state.settings, state.models)?.eos_trained === true };
+    ui.chips.replaceChildren(...optionChips(options, outcome).map((c) => el('span', {}, c)));
+  }
+
+  // -> whether the models were read (a failure is the notice's to say). Those of an API server that is no longer the one set, or its failure,
+  // are dropped without a word (P9-B fix 1): false.
+  async function refreshModels() {
+    const asOf = state.serverGen;
+    try {
+      const models = await request('/v1/models');
+      if (asOf !== state.serverGen) return false;
+      state.models = models;
+      if (text(state.models.mode)) ui.badge.textContent = state.models.mode;
+      // "test model" while the server's default is the random-weights engine (P9-G5b): called tiny, or a card that says test_model (P9-F fix 2)
+      ui.testBadge.hidden = !(state.models.default_model === TEST_MODEL || isTestModel(chosenCard({ model: '' }, state.models)));
+      fillModels();
+      renderChips();
+      return true;
+    } catch (err) {
+      if (asOf === state.serverGen) showNotice(errorMessage(err));
+      return false;
+    }
+  }
+
+  // A new token, or a new client id, can change what the server shows: everything is fetched again, and what the old
+  // identity had open (images, a running stream) is dropped first. When the new one is let in (the models and the chats both come), the notice
+  // is over: it was the old identity's, and "Enter the access token in Settings" must not stay on a page that works again (P8-D, chaos item 4;
+  // an open chat clears it as it is drawn again, an empty one never did). One that is refused again raises its notice again, and keeps it.
+  // Another API server (P9-B) is a new identity too, whose chats, models and strip are its own (server: true): what the last one showed goes at
+  // once, and the new one's newest chat opens, never the last one's id (P9-B fix 1). On the Pages copy, no API server leaves nothing to ask: a
+  // change to none takes what the last server showed off the page, and a new token with none set changes nothing, the address included (P9-B fix 2).
+  async function reloadAll({ server = false } = {}) {
+    leaveTurn();
+    api.clearImageCache();
+    if (noServer()) {
+      if (server) leaveServer(); else showNotice(FIRST_RUN_TEXT);
+      return;
+    }
+    if (server) forgetServer();
+    const asOf = state.serverGen;
+    const id = state.session.id;
+    const loaded = await Promise.all([refreshModels(), refreshSessions()]);
+    if (asOf !== state.serverGen) return;   // another API server was set meanwhile: its own reload carries on
+    if (loaded.every(Boolean)) clearNotice();
+    if (id) await openSession(id); else await handleRoute();
+  }
+
+  // What an API server showed, gone, at a change (P9-B fix 1): its chat, its sidebar, its models, the strip, the badges and the strip's schedule. The
+  // address goes home, so that what opens next is the next server's newest chat, and an answer still on its way for a chat is stale.
+  function forgetServer() {
+    ++state.gen;
+    resetView(null);
+    state.loading = false;   // a chat of the last server that was loading is not
+    state.loadingMore = false;   // nor is a More of its sidebar (P9-B fix 2): the new server's More works at once
+    ui.more.disabled = false;
+    if (state.healthTimer !== null) cancelLater(state.healthTimer);
+    state.healthTimer = null;
+    state.healthFailures = 0;
+    Object.assign(state, { sessions: [], nextCursor: null, sessionsLoaded: false, missing: null, models: null });
+    renderSessions();
+    fillModels();
+    renderChips();
+    ui.badge.textContent = '';
+    ui.testBadge.hidden = true;
+    setHealth('', false);
+    setRetention(null);
+    setAddress('#/');
+    syncControls();
+  }
+
+  // The Pages copy left with no API server (P9-B: its field was emptied): what the last server showed goes, and the page says what to set.
+  // Nothing is asked of anyone.
+  function leaveServer() {
+    forgetServer();
+    showNotice(FIRST_RUN_TEXT);
+  }
+
+  // The API server changed (P9-B), as a new token does, and the health strip asks the new one at once. Every answer of the last one still on its
+  // way is stale from here (P9-B fix 1).
+  function serverChanged() {
+    state.serverGen += 1;
+    detach(reloadAll({ server: true }));
+    detach(checkHealth());
+  }
+
+  // The Pages copy's first API server (P9-B fix 2): no change, for nothing was asked of anyone before it, so there is nothing to forget. The page
+  // starts against it as it starts against its own origin, and opens the chat its address names: a chat's link, or home.
+  function firstServer() {
+    detach(reloadAll());
+    detach(checkHealth());
+  }
+
+  // ---- the composer -----------------------------------------------------------------------------------------------------------------
+
+  function wireComposer() {
+    // The one intake path (P6-A): composer.js takes the image from the well, a drop or a paste, shows the preview, and says what is attached.
+    // A refused file is said in the notice; a good one clears it.
+    state.composer = attachComposer({
+      well: ui.well, input: ui.file, preview: ui.preview, doc, urls,
+      onChange: (file) => {
+        state.file = file;
+        if (file) clearNotice();
+        syncControls();   // a new image: Send sends it; none: Send may be a re-run
+      },
+      onError: (message) => showNotice(message),
+    });
+    ui.composer.addEventListener('submit', (event) => { event.preventDefault(); detach(send()); });
+    ui.prompt.addEventListener('input', () => syncRerun());   // the re-run hint follows the note: a command, or a note the server will not run
+    ui.prompt.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) return;   // Shift+Enter is a newline; an IME's Enter is not a send
+      event.preventDefault();
+      detach(send());
+    });
+    ui.stop.addEventListener('click', () => detach(stopTurn()));
+    ui.pickSearch.addEventListener('input', () => {   // one request for a pause in typing, not one per key
+      clearStudies('Searching…');   // the list answers the old query: it goes at once, and so does a list still on its way for it
+      state.pickGen += 1;
+      if (state.pickTimer !== null) cancelLater(state.pickTimer);
+      state.pickTimer = later(() => { state.pickTimer = null; detach(loadStudies()); }, PICK_DEBOUNCE_MS);
+    });
+    ui.pickSearch.addEventListener('keydown', (event) => {   // the search sits in the composer's form: Enter must not send the turn
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      detach(firstStudy());                                  // it goes to the first study of the fresh list, which Enter then chooses
+    });
+  }
+
+  // ---- building and starting ----------------------------------------------------------------------------------------------------------
+
+  function build() {
+    ui.list.setAttribute('role', 'list');   // list-style: none drops the semantics in Safari
+    ui.status = doc.getElementById('status') ?? el('div', { id: 'status', class: 'visually-hidden', role: 'status', 'aria-live': 'polite' });
+    if (!ui.status.parentNode) doc.body.append(ui.status);
+
+    ui.noticeText = el('p', {});
+    ui.noticeRetry = el('button', { type: 'button', hidden: true, onclick: () => state.noticeRetry?.() }, 'Retry');
+    ui.notice = el('div', { id: 'notice', role: 'alert', hidden: true }, ui.noticeText, ui.noticeRetry,
+      el('button', { type: 'button', 'aria-label': 'Dismiss', onclick: () => clearNotice() }, '✕'));
+    ui.rerun = el('p', { id: 'rerun-hint', hidden: true });
+    // The page's own status line is visually hidden; this one is for the eye as well: "Settings saved." beside the chips, for a few seconds.
+    // It is there from the start (empty), so that a screen reader has the region before its first message.
+    ui.saved = el('p', { id: 'saved', role: 'status', 'aria-live': 'polite' });
+    const rows = Array.from(ui.composer.children);
+    rows.splice(rows.indexOf(ui.well) + 1, 0, ui.rerun);   // next to the image well
+    rows.splice(rows.indexOf(ui.chips) + 1, 0, ui.saved);   // and under the chips
+    // P6-D: the test-split picker, a button before Settings and its list, which opens as the composer's first row under the notice
+    ui.pick = el('button', { type: 'button', id: 'pick-study', hidden: true, 'aria-expanded': 'false', 'aria-controls': 'picker',
+                             onclick: () => (ui.picker.hidden ? openPicker() : closePicker()) }, 'Test-split study');
+    rows.splice(rows.indexOf(ui.settings), 0, ui.pick);
+    ui.pickSearch = el('input', { type: 'search', id: 'picker-search', autocomplete: 'off', spellcheck: 'false', maxlength: 64,
+                                  placeholder: 'The start of a study id' });
+    ui.pickStatus = el('p', { id: 'picker-status', role: 'status', 'aria-live': 'polite' });
+    ui.pickList = el('ul', { id: 'picker-list', role: 'list', 'aria-label': 'Test-split studies' });
+    ui.picker = el('div', { id: 'picker', role: 'dialog', 'aria-label': 'Choose a test-split study', hidden: true },
+      el('div', { class: 'picker-head' }, el('label', { for: 'picker-search' }, 'Find a test-split study by its id'),
+        el('button', { type: 'button', id: 'picker-close', 'aria-label': 'Close the study list', onclick: () => closePicker() }, '✕')),
+      ui.pickSearch, ui.pickStatus, ui.pickList);
+    ui.composer.replaceChildren(ui.notice, ui.picker, ...rows);
+
+    ui.exports = el('div', { id: 'exports', role: 'group', 'aria-label': 'Export this chat', hidden: true },
+      el('button', { type: 'button', 'data-format': 'json', onclick: () => detach(exportSession('json')) }, 'Export JSON'),
+      el('button', { type: 'button', 'data-format': 'md', onclick: () => detach(exportSession('md')) }, 'Export Markdown'));
+    ui.more = el('button', { type: 'button', id: 'session-more', hidden: true, onclick: () => detach(refreshSessions({ more: true })) }, 'More');
+    ui.sidebar.replaceChildren(ui.newChat, ui.exports, ui.list, ui.more);
+
+    buildDrawer();
+    renderChips();
+  }
+
+  function wire() {
+    ui.toggle.addEventListener('click', () => { if (doc.body.classList.contains('sidebar-open')) closeSidebar(); else openSidebar(); });
+    doc.body.addEventListener('click', (event) => { if (event.target === doc.body) closeSidebar(); });   // the scrim is the body's ::after
+    ui.settings.addEventListener('click', () => { if (ui.drawer.hidden) openDrawer(); else closeDrawer(); });
+    doc.body.addEventListener('keydown', onKeydown);
+    ui.newChat.addEventListener('click', () => { closeSidebar(); detach(navigate('#/new')); });
+    win.addEventListener?.('hashchange', () => detach(handleRoute()));
+    // A wider or narrower conversation (the window, the drawer, the sidebar) changes which reports overflow their three lines (P6 fix 1).
+    const Observer = env.ResizeObserver ?? globalThis.ResizeObserver;
+    if (typeof Observer === 'function') new Observer(settleSoon).observe(ui.conversation);
+    else win.addEventListener?.('resize', settleSoon);
+    wireComposer();
+  }
+
+  // Measures the clamped reports of the whole conversation on the next frame, however often it is asked before then.
+  function settleSoon() {
+    if (state.settling) return;
+    state.settling = true;
+    frame(() => {
+      state.settling = false;
+      settleClamps(ui.conversation);
+    });
+  }
+
+  async function start() {
+    build();
+    wire();
+    if (noServer()) { showNotice(FIRST_RUN_TEXT); return; }   // the Pages copy's first run (P9-B): nothing is asked until a server is set
+    const asOf = state.serverGen;
+    detach(checkHealth());
+    await Promise.all([refreshModels(), refreshSessions()]);
+    if (asOf !== state.serverGen) return;   // another API server was set meanwhile, whose reload opens what it shows (P9-B fix 1)
+    await handleRoute();
+  }
+
+  return { start, send, stopTurn, handleRoute, navigate, refreshSessions, exportSession, openDrawer, closeDrawer, reloadAll, state, ui };
+}
+
+// ---- start ----------------------------------------------------------------------------------------------------------------------------
+
+export function browserEnv() {
+  return { document, window: globalThis, storage: browserStorage(globalThis), api: realApi };
+}
+
+// Only a page that has the composer starts the app: a test importing this file gets the helpers and nothing else.
+if (typeof document !== 'undefined' && document.getElementById?.('composer')) {
+  createApp(browserEnv()).start().catch((err) => { try { console.error(err); } catch { /* no console */ } });
+}

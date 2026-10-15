@@ -1,0 +1,599 @@
+"""CHAT_UI_PLAN.md P4-A: the page shell (app/static/index.html and styles.css) and how the server serves it."""
+import re
+from collections import Counter
+from html.parser import HTMLParser
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app import server
+from app.server import create_app
+
+STATIC = Path(__file__).resolve().parents[1] / "app" / "static"
+BANNER = "Research prototype — not for clinical use."
+TOKENS = ["--bg", "--fg", "--muted", "--accent", "--card", "--border", "--ok", "--warn", "--bad"]
+IDS = ["mode-badge", "test-badge", "health", "sidebar", "new-session", "session-list", "conversation", "drawer", "composer",
+       "image-well", "preview", "prompt", "chips", "settings", "send", "stop", "file", "viewer", "sidebar-toggle"]
+HIDDEN_AT_START = ["drawer", "preview", "stop", "file", "viewer", "test-badge"]   # the scripts show these by clearing `hidden`
+DARK = r"@media\s*\(\s*prefers-color-scheme:\s*dark\s*\)"
+NARROW = r"@media\s*\(\s*max-width:\s*800px\s*\)"
+
+
+@pytest.fixture
+def client(tmp_path):
+    with TestClient(create_app(engine="tiny", home=str(tmp_path))) as c:
+        yield c
+
+
+def test_index_is_served_and_has_the_banner(client):
+    r = client.get("/")
+    assert r.status_code == 200 and "Research prototype — not for clinical use." in r.text
+
+
+# P9-B: what the page says of its API server, word for word, and how many times each file of app/static says it. These sentences, whole, and
+# nothing else may hold an absolute URL: none of them is a URL the page loads (every request goes to the API server the user sets, or to the
+# page's own origin).
+DISPLAY_SENTENCES = {
+    "Set the API server in Settings, for example http://localhost:8000 (your tunnel).": {"app.js": 1},
+    "Enter an origin and nothing after it: https://host[:port], or http://localhost[:port] (also 127.0.0.1 or [::1]) for this computer.": {"app.js": 1},
+    "Empty: the server this page came from. Otherwise an origin such as http://localhost:8000.": {"app.js": 1},
+}
+# What the guard must still find (P9-B fix 1): an origin of the display sentences anywhere but in them.
+NOT_A_SENTENCE = ["fetch('http://localhost:8000/v1/models');", "const BASE = 'http://localhost:8000';", "const at = 'http://localhost:8000@evil.example/x';",
+                  "fetch('http://localhost[:port]/v1/models');", "img.src = 'https://host[:port]/x.png';",
+                  "fetch('HTTP://LOCALHOST:8000/v1/models');", "const far = 'http://localhost:80001/x';", '<script src="http://localhost:8000/static/x.js"></script>']
+
+
+ABSOLUTE_URL = re.compile(r"https?://", re.I)   # in any letter case, as a browser reads a scheme (P9-B fix 2)
+
+
+def _besides_the_display_sentences(text):
+    """The text with the display sentences taken out, each whole: an origin of theirs anywhere else is left where it is."""
+    for sentence in DISPLAY_SENTENCES:
+        text = text.replace(sentence, "")
+    return text
+
+
+def test_the_absolute_url_guard_takes_out_only_the_display_sentences_whole():
+    app_js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert not ABSOLUTE_URL.search(_besides_the_display_sentences(app_js))
+    for added in NOT_A_SENTENCE:   # a scratch copy of the scanned text
+        assert ABSOLUTE_URL.search(_besides_the_display_sentences(app_js + "\n" + added + "\n")), added
+
+
+def test_each_display_sentence_is_in_the_file_that_says_it_as_many_times_as_it_says_it():
+    for p in sorted(q for q in STATIC.rglob("*") if q.is_file()):
+        text = p.read_text(encoding="utf-8")
+        for sentence, where in DISPLAY_SENTENCES.items():
+            assert text.count(sentence) == where.get(p.name, 0), (p.name, sentence)
+
+
+def test_page_makes_no_external_requests():
+    import re
+    from pathlib import Path
+    static = Path("app/static")
+    for f in static.glob("*"):
+        text = f.read_text()
+        assert not ABSOLUTE_URL.search(_besides_the_display_sentences(text)), f
+        assert "EventSource" not in text, f
+
+
+# ---- beyond the brief: what P4-B..D and the 375 px target depend on -------------------------------------------------
+
+class _Tags(HTMLParser):
+    """index.html as (tag, attributes) pairs in document order; a valueless attribute such as `hidden` maps to ''."""
+
+    def __init__(self, text):
+        super().__init__()
+        self.tags = []
+        self.feed(text)
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.append((tag, {k: v or "" for k, v in attrs}))
+
+
+def _html():
+    return (STATIC / "index.html").read_text(encoding="utf-8")
+
+
+def _tags():
+    return _Tags(_html()).tags
+
+
+def _by_id():
+    return {a["id"]: (t, a) for t, a in _tags() if "id" in a}
+
+
+def _rules(css):
+    """A stylesheet's top-level (prelude, body) pairs, braces balanced, comments dropped. An at-rule's body is itself a
+    stylesheet, so _rules(body) reads the rules inside a @media block."""
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    rules, depth, start, head_from, head = [], 0, 0, 0, ""
+    for i, ch in enumerate(css):
+        if ch == "{":
+            if depth == 0:
+                head, start = css[head_from:i].strip(), i + 1
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                rules.append((head, css[start:i]))
+                head_from = i + 1
+    return rules
+
+
+def _stylesheet():
+    css = re.sub(r"/\*.*?\*/", "", (STATIC / "styles.css").read_text(encoding="utf-8"), flags=re.S)
+    assert css.count("{") == css.count("}")   # _rules would silently drop what follows an unbalanced brace
+    return _rules(css)
+
+
+def _media(query):
+    """The rules inside every @media block whose query matches the pattern."""
+    return [rule for head, body in _stylesheet() if re.fullmatch(query, head) for rule in _rules(body)]
+
+
+def _walk(rules, trail=()):
+    """Every style rule as (enclosing at-rules, selector, declarations), @media nesting included. @keyframes and other
+    at-rules without selectors of this page are skipped."""
+    for head, body in rules:
+        if head.startswith("@media"):
+            yield from _walk(_rules(body), trail + (head,))
+        elif not head.startswith("@"):
+            yield trail, head, body
+
+
+def _vertical_margins(declarations):
+    """The top and bottom margins that declarations give, as written ('0', '-4px', ...)."""
+    found = []
+    for prop, value in re.findall(r"(?<![\w-])(margin(?:-top|-bottom)?)\s*:\s*([^;]+);", declarations):
+        parts = value.split()
+        found += [parts[0], parts[2] if len(parts) > 2 else parts[0]] if prop == "margin" else [parts[0]]
+    return found
+
+
+def _declared(rules):
+    """{custom property: value} over the :root rules among (selector, declarations) pairs."""
+    return {k: v.strip() for head, body in rules if head == ":root" for k, v in re.findall(r"(--[\w-]+)\s*:\s*([^;]+);", body)}
+
+
+def test_the_page_is_what_the_server_serves(client):
+    assert server.STATIC_DIR == STATIC
+    page, css = client.get("/"), client.get("/static/styles.css")
+    assert page.status_code == 200 and page.headers["content-type"].startswith("text/html")
+    assert page.content == (STATIC / "index.html").read_bytes()   # the file, not the placeholder
+    assert css.status_code == 200 and css.headers["content-type"].startswith("text/css")
+    assert css.content == (STATIC / "styles.css").read_bytes()
+
+
+def test_the_page_and_its_files_are_revalidated_after_a_redeploy(client):
+    for path in ("/", "/static/styles.css"):   # an rsync redeploy must show at once: no heuristic reuse
+        assert client.get(path).headers["cache-control"] == "no-cache", path
+    css = client.get("/static/styles.css")
+    assert css.headers["etag"] and css.headers["last-modified"]   # what the browser revalidates with
+    again = client.get("/static/styles.css", headers={"If-None-Match": css.headers["etag"]})
+    assert again.status_code == 304 and again.headers["cache-control"] == "no-cache"
+
+
+def test_the_placeholder_page_is_not_cached_either(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "STATIC_DIR", tmp_path / "not_built_yet")
+    with TestClient(create_app(engine="tiny", home=str(tmp_path / "home"))) as c:
+        assert c.get("/").headers["cache-control"] == "no-cache"
+
+
+def test_static_files_are_self_contained():
+    files = [p for p in STATIC.rglob("*") if p.is_file()]
+    assert {"index.html", "styles.css"} <= {p.name for p in files}   # the brief's scan passes on an empty directory
+    forbidden = [r"https?://", r"EventSource", r"<svg", r"@import", r"@font-face",    # no CDN, no web font, no SVG icon
+                 r"""(?:src|href)\s*=\s*["']\s*//""", r"""url\(\s*["']?\s*//"""]   # nor a protocol-relative URL
+    for p in files:
+        assert p.suffix != ".svg", p
+        if p.suffix in (".html", ".css", ".js", ".mjs"):
+            text = _besides_the_display_sentences(p.read_text(encoding="utf-8"))   # P9-B: what the page says of its API server is no URL it loads
+            for pattern in forbidden:
+                assert not re.search(pattern, text, re.I), (p.name, pattern)   # in any letter case (P9-B fix 2)
+
+
+def test_every_module_a_script_imports_is_a_file_of_the_page_and_the_server_serves_it(client):   # P6-H: render.js imports glossary.js
+    """A script that imports a module the server does not have takes the whole page down (the browser refuses the module graph), and the page is
+    served from a checkout that is synced file by file: so every `from './x.js'` of every script is a file of app/static, and it is served."""
+    imported = {}
+    for script in sorted(STATIC.glob("*.js")):
+        for name in re.findall(r"""from\s+['"]\./([\w-]+\.js)['"]""", script.read_text(encoding="utf-8")):
+            imported.setdefault(name, []).append(script.name)
+    assert imported["glossary.js"] == ["render.js"], imported   # the plain explanations of the report card
+    for name, importers in imported.items():
+        assert (STATIC / name).is_file(), (name, importers)
+        response = client.get("/static/" + name)
+        assert response.status_code == 200 and "javascript" in response.headers["content-type"], (name, response.status_code)
+
+
+def test_every_element_id_the_scripts_use_is_there_exactly_once():
+    ids = Counter(a["id"] for _, a in _tags() if "id" in a)
+    assert {i: ids[i] for i in IDS if ids[i] != 1} == {}
+    assert max(ids.values()) == 1
+    tag_of = {"sidebar": "nav", "conversation": "main", "drawer": "aside", "composer": "form", "session-list": "ol",
+              "prompt": "textarea", "file": "input", "send": "button", "stop": "button", "settings": "button",
+              "new-session": "button", "sidebar-toggle": "button"}
+    by_id = _by_id()
+    assert {i: by_id[i][0] for i in tag_of} == tag_of
+
+
+def test_initial_state_and_aria_the_scripts_rely_on():
+    by_id = _by_id()
+    for ident in HIDDEN_AT_START:
+        assert "hidden" in by_id[ident][1], ident
+    assert by_id["file"][1]["type"] == "file" and by_id["send"][1]["type"] == "submit"
+    assert by_id["conversation"][1]["aria-live"] == "polite" and by_id["health"][1]["aria-live"] == "polite"
+    assert by_id["settings"][1]["aria-controls"] == "drawer"
+    assert by_id["viewer"][1]["role"] == "dialog" and by_id["viewer"][1]["aria-modal"] == "true"
+
+
+def test_banner_is_a_landmark_with_the_disclaimer_in_a_paragraph_and_the_toggle_first():
+    html = _html()
+    header = re.search(r"<header([^>]*)>(.*?)</header>", html, re.S)
+    assert header.group(1).strip() == 'class="banner"'   # no role="note": a top-level header is the banner landmark
+    assert header.group(2).lstrip().startswith('<button id="sidebar-toggle"')
+    assert '<p class="disclaimer">' + BANNER + "</p>" in header.group(2)   # one unbroken string, em dash included
+    assert _by_id()["sidebar-toggle"][1] == {"id": "sidebar-toggle", "type": "button", "aria-controls": "sidebar",
+                                              "aria-expanded": "false", "aria-label": "Sessions"}
+    assert re.search(r'id="sidebar-toggle"[^>]*>☰</button>', html)   # a Unicode glyph, never an SVG
+
+
+def test_the_test_model_badge_follows_the_toggle_in_the_banner_and_says_test_model_and_the_notice_style_is_in_the_sheet():   # P9-G5b
+    html = _html()
+    banner = re.search(r"<header([^>]*)>(.*?)</header>", html, re.S).group(2)
+    assert re.search(r'>☰</button>\s*<span id="test-badge" hidden>test model</span>\s*<p class="disclaimer">', banner)   # in the toggle's row on a phone
+    css = re.sub(r"/\*.*?\*/", "", (STATIC / "styles.css").read_text(encoding="utf-8"), flags=re.S)
+    assert re.search(r"#test-badge\s*\{[^}]*var\(--warn\)", css), "the badge has its own rule, in the warning colour"
+    assert re.search(r"\.test-notice\s*\{[^}]*var\(--warn\)", css), "the card's notice has its own rule, in the warning colour"
+    assert "test-notice" in (STATIC / "render.js").read_text(encoding="utf-8")
+
+
+def test_the_page_calls_the_random_weights_engine_what_the_server_names_it_and_no_real_model_has_that_name():   # P9-G5b
+    from app.engine import build_engine
+    name = build_engine("tiny").card()["name"]
+    assert re.search(r"export const TEST_MODEL = '{}';".format(re.escape(name)), (STATIC / "render.js").read_text(encoding="utf-8"))
+    assert name not in server.MODEL_NAMES and name not in server.HOME_MODELS   # the name that marks a test model is no real model's
+
+
+def test_a_busy_composer_on_a_phone_tightens_its_buttons_so_that_settings_send_and_stop_share_one_row():   # P9-G5b (2c)
+    """Layout check k (busy, 320 x 568) is the proof in a browser; this keeps the rule from going unnoticed. It applies between the widths where
+    the three buttons do not fit as they are (319 px and under) and where the drawer-open rule takes over (260 px and under), only while Stop is
+    shown, and takes nothing but the sides' padding."""
+    css = re.sub(r"/\*.*?\*/", "", (STATIC / "styles.css").read_text(encoding="utf-8"), flags=re.S)
+    rule = re.search(r"@container composer \(min-width: 261px\) and \(max-width: 319px\)\s*\{(.*?)\}\s*\}", css, re.S)
+    assert rule, "the container rule for the phone's busy composer is in the sheet"
+    assert re.fullmatch(r"\s*#composer:has\(#stop:not\(\[hidden\]\)\) > button\s*\{\s*padding-inline:\s*6px;\s*", rule.group(1)), rule.group(1)
+    assert "@container composer (max-width: 260px)" in css and css.index("max-width: 260px") < css.index("min-width: 261px")
+
+
+def test_composer_controls_have_names_and_states():
+    by_id = _by_id()
+    assert by_id["chips"][1].get("role") == "group" and by_id["chips"][1].get("aria-label")
+    assert by_id["prompt"][1].get("aria-label") == "Note or command"
+    assert by_id["settings"][1].get("aria-expanded") == "false"   # P4-D toggles it with the drawer
+    visible = " ".join(re.search(r'<div id="image-well"[^>]*>(.*?)</div>', _html(), re.S).group(1).split())
+    assert visible.startswith("Drop, paste or click to attach an X-ray")
+    label = by_id["image-well"][1].get("aria-label")
+    assert label is None or visible in label   # the accessible name contains the visible text (WCAG 2.5.3)
+
+
+def test_page_declares_a_viewport_and_loads_only_its_own_files():
+    tags = _tags()
+    viewport = [a["content"] for t, a in tags if t == "meta" and a.get("name") == "viewport"]
+    assert viewport and "width=device-width" in viewport[0] and "initial-scale=1" in viewport[0]
+    assert ("html", {"lang": "en"}) in tags
+    loaded = [a["href"] for t, a in tags if t == "link" and a.get("rel") == "stylesheet"]
+    loaded += [a["src"] for t, a in tags if t == "script"]
+    assert {"/static/styles.css", "/static/app.js"} <= set(loaded)
+    assert all(url.startswith("/static/") for url in loaded)
+    assert [a["type"] for t, a in tags if t == "script"] == ["module"]
+    assert {"rel": "icon", "href": "data:,"} in [a for t, a in tags if t == "link"]   # no /favicon.ico request
+
+
+def test_colour_tokens_are_on_root_and_redefined_for_dark():
+    light, dark = _declared(_stylesheet()), _declared(_media(DARK))
+    assert set(TOKENS) <= set(light), sorted(set(TOKENS) - set(light))
+    assert set(TOKENS) <= set(dark), sorted(set(TOKENS) - set(dark))
+    assert all(light[t] != dark[t] for t in ("--bg", "--fg", "--card", "--border"))   # a second palette, not a copy
+
+
+def _luminance(colour):
+    r, g, b = [int(colour[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    r, g, b = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in (r, g, b)]
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _contrast(a, b):
+    hi, lo = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+def test_text_and_control_colours_are_readable_in_both_palettes(scheme):
+    tokens = _declared(_stylesheet() if scheme == "light" else _media(DARK))
+    pairs = [("--fg", "--bg", 7), ("--fg", "--card", 7), ("--muted", "--bg", 4.5), ("--muted", "--card", 4.5),
+             ("--accent", "--bg", 4.5), ("--accent", "--card", 4.5), ("--on-accent", "--accent", 4.5),
+             ("--ok", "--bg", 4.5), ("--ok", "--card", 4.5), ("--warn", "--bg", 4.5), ("--warn", "--card", 4.5),
+             ("--bad", "--bg", 4.5), ("--bad", "--card", 4.5), ("--control", "--bg", 3), ("--control", "--card", 3),
+             ("--muted", "--soft", 4.5)]   # a disabled setting in the drawer: muted text on the soft fill
+    for fore, back, least in pairs:   # WCAG 2: 7 for body text, 4.5 for text, 3 for the border of a control
+        for name in (fore, back):
+            assert re.fullmatch(r"#[0-9a-f]{6}", tokens[name]), (scheme, name)   # #rrggbb keeps this check honest
+        assert _contrast(tokens[fore], tokens[back]) >= least, (scheme, fore, back)
+
+
+def test_body_sets_an_explicit_background_and_colour():
+    body = " ".join(b for h, b in _stylesheet() if h == "body")
+    assert re.search(r"(?<![\w-])background(-color)?:\s*var\(--bg\)", body)
+    assert re.search(r"(?<![\w-])color:\s*var\(--fg\)", body)
+
+
+def test_a_disabled_setting_in_the_drawer_looks_disabled():
+    rule = " ".join(b for _, h, b in _walk(_stylesheet()) if h == "#drawer input:disabled, #drawer select:disabled")
+    assert re.search(r"border-style:\s*dashed", rule) and re.search(r"color:\s*var\(--muted\)", rule)
+    assert re.search(r"cursor:\s*not-allowed", rule) and re.search(r"background:\s*var\(--soft\)", rule)
+    assert any(h == "#drawer .check:has(:disabled)" and "var(--muted)" in b for _, h, b in _walk(_stylesheet()))   # and its checkbox's words
+
+
+def test_the_rerun_hint_is_a_row_of_the_composer_that_wraps_a_long_file_name():
+    rule = " ".join(b for _, h, b in _walk(_stylesheet()) if h == "#rerun-hint")
+    assert re.search(r"flex:\s*1\s+0\s+100%", rule) and re.search(r"overflow-wrap:\s*anywhere", rule)   # a row of its own that never widens it
+    assert re.search(r"margin:\s*0", rule)   # a gap, not a margin: nothing is left when it is hidden
+
+
+def test_a_short_page_or_a_narrow_composer_puts_the_well_and_the_rerun_hint_on_one_line_each():
+    """P6-A (5a): at 801-834 x 568-650 px with the drawer open the composer is about 170 px wide, and a hint with a long file name (or the
+    well's own text) wrapped into many lines and pushed Send under the composer's fold. Under 720 px of height, and in a composer 260 px wide
+    or less (a container query: whatever made it narrow), each is one line cut short with an ellipsis. scripts/chat_ui_layout_check.py
+    (check k) measures Send in sight at those sizes; this pins the rules it depends on."""
+    composer = " ".join(b for h, b in _stylesheet() if h == "#composer")
+    assert re.search(r"container:\s*composer\s*/\s*inline-size", composer)
+    for query in (r"@media\s*\(\s*max-height:\s*720px\s*\)", r"@container\s+composer\s*\(\s*max-width:\s*260px\s*\)"):
+        rules = _media(query)
+        assert rules, query
+        one_line = " ".join(b for h, b in rules if h == "#image-well, #rerun-hint")
+        for declaration in (r"white-space:\s*nowrap", r"text-overflow:\s*ellipsis", r"overflow:\s*hidden"):
+            assert re.search(declaration, one_line), (query, declaration)
+
+
+def test_the_preview_puts_a_long_name_on_a_line_of_its_own_cut_short_and_keeps_the_sizes_in_sight():
+    """P6-A (5a): composer.js writes the preview's line as the name, a separator and the sizes, each a span; the name and the sizes are a line
+    each, cut short where the composer is narrow (the title has the line whole), and the separator is left to the text."""
+    rules = {h: b for _, h, b in _walk(_stylesheet())}
+    assert re.search(r"flex-direction:\s*column", rules["#preview > span"]) and re.search(r"min-width:\s*0", rules["#preview > span"])
+    name = rules["#preview .preview-name"]
+    assert re.search(r"white-space:\s*nowrap", name) and re.search(r"text-overflow:\s*ellipsis", name) and re.search(r"overflow:\s*hidden", name)
+    size = rules["#preview .preview-size"]   # P6 fix 1: the pixel size and the MB wrap rather than being cut short, at 801-890 px too
+    assert re.search(r"overflow-wrap:\s*anywhere", size) and not re.search(r"nowrap|ellipsis", size)
+    assert re.search(r"display:\s*none", rules["#preview .preview-sep"])
+
+
+def test_the_narrow_composers_remove_is_a_32_px_target_each_way():   # P6 fix 2 (5)
+    """In a composer 260 px wide or less the preview's Remove is compacted (P6 fix 1) to leave the file's line the room it needs; it stays a
+    target of 32 px each way, whatever its label."""
+    remove = " ".join(b for h, b in _media(r"@container\s+composer\s*\(\s*max-width:\s*260px\s*\)") if h == "#preview > button")
+    assert re.search(r"min-width:\s*32px", remove) and re.search(r"min-height:\s*32px", remove)
+
+
+def test_the_cancel_strings_are_written_once():   # P6 fix 2 (6)
+    """What the status says after a cancel, and what Stop reads while the page checks it, are each written once in app.js and used by name."""
+    source = (STATIC / "app.js").read_text(encoding="utf-8")
+    for text in ("'Upload cancelled.'", "'Send cancelled.'", "'Cancelling…'"):
+        assert source.count(text) == 1, (text, source.count(text))
+
+
+def test_the_viewer_stacks_below_700px_holds_the_page_still_and_stays_on_a_short_screen():
+    """P6-E: two panes side by side, stacked below 700 px; the page behind does not scroll while it is open; and where the page scrolls (480
+    px tall or less) the viewer is fixed under the banner and scrolls inside itself, each picture with a height of its own, so that every
+    control can be reached (scripts/chat_ui_layout_check.py, check l, measures it)."""
+    stacked = _media(r"@media\s*\(\s*max-width:\s*699\.98px\s*\)")
+    assert any(h == ".viewer-panes" and re.search(r"flex-direction:\s*column", b) for h, b in stacked)
+    held = " ".join(b for h, b in _stylesheet() if h == "body.viewer-open")
+    assert re.search(r"overflow:\s*hidden", held)
+    short = _media(r"@media\s*\(\s*max-height:\s*480px\s*\)")
+    viewer = " ".join(b for h, b in short if h == "#viewer")
+    for declaration in (r"position:\s*fixed", r"top:\s*var\(--viewer-top", r"overflow-y:\s*auto"):
+        assert re.search(declaration, viewer), declaration
+    assert any(h == ".viewer-stage" and re.search(r"(?<![\w-])height:\s*max\(", b) for h, b in short)
+    both = _media(r"@media\s*\(\s*max-height:\s*480px\s*\)\s*and\s*\(\s*max-width:\s*699\.98px\s*\)")
+    assert any(h == ".viewer-pane" and re.search(r"flex:\s*none", b) for h, b in both)   # stacked in a viewer that scrolls: a pane is its content
+
+
+def test_the_hidden_attribute_beats_display_rules():
+    hidden = [b for h, b in _stylesheet() if h == "[hidden]"]   # else `#drawer { display: ... }` would show it
+    assert hidden and re.search(r"display:\s*none\s*!important", hidden[0])
+
+
+def test_layout_collapses_below_800px_to_one_column_with_a_16px_gutter():
+    css, narrow = _stylesheet(), _media(NARROW)
+    assert narrow, "no @media (max-width: 800px)"
+    tokens = _declared(css)
+    assert (tokens["--sidebar-w"], tokens["--drawer-w"]) == ("260px", "320px")
+    assert re.search(r"--gutter:\s*16px", " ".join(b for h, b in narrow))
+    assert any("sidebar-open" in h for h, b in narrow)   # P4-D sets body.sidebar-open to show the off-canvas sidebar
+    assert any(h == "#sidebar-toggle" and re.search(r"display:\s*(inline-)?flex", b) for h, b in narrow)
+    assert any(h == "#sidebar-toggle" and re.search(r"display:\s*none", b) for h, b in css)   # gone at 801 px and up
+
+
+def test_long_words_wrap_in_the_conversation_focus_is_visible_and_the_banner_sticks():
+    css = _stylesheet()
+    conversation = " ".join(b for h, b in css if h == "#conversation")   # its own rule, not just any rule
+    assert re.search(r"overflow-wrap:\s*anywhere", conversation)
+    assert any(":focus-visible" in h for h, b in css)
+    assert any(h == ".banner" and re.search(r"position:\s*sticky", b) for h, b in css)
+
+
+def test_narrow_rules_make_one_column_confine_the_drawer_and_park_the_sidebar():
+    narrow = _media(NARROW)
+
+    def rule(selector):
+        return " ".join(b for h, b in narrow if h == selector)
+
+    assert re.search(r"grid-template-columns:\s*minmax\(0,\s*1fr\)\s*;", rule("body"))   # one column
+    assert re.findall(r'"([^"]+)"', rule("body")) == ["banner", "conversation", "composer"]
+    assert re.search(r"grid-area:\s*2\s*/\s*1\s*/\s*3\s*/\s*2\s*;", rule("#drawer"))   # the conversation row only
+    assert re.search(r"transform:\s*translateX\(-100%\)", rule("#sidebar"))   # off-canvas ...
+    assert re.search(r"visibility:\s*hidden", rule("#sidebar"))   # ... and out of the tab order
+    shown = rule("body.sidebar-open #sidebar")
+    assert re.search(r"visibility:\s*visible", shown) and re.search(r"transform:\s*none", shown)
+
+
+def test_composer_gives_each_row_its_width_and_lets_the_buttons_wrap():
+    css = _stylesheet()
+
+    def rule(selector):
+        return " ".join(b for h, b in css if h == selector)
+
+    assert re.search(r"display:\s*flex", rule("#composer")) and re.search(r"flex-wrap:\s*wrap", rule("#composer"))
+    assert re.search(r"flex:\s*1\s+0\s+100%", rule("#image-well, #preview, #prompt, #chips"))   # chips: a row of their own
+    assert re.search(r"flex:\s*none", rule("#composer > button")) and "nowrap" in rule("#composer > button")
+    assert not [h for h, b in _media(NARROW) if re.search(r"#composer|#chips|#prompt|#image-well", h)]   # at every width
+
+
+def test_send_comes_before_stop_in_the_dom_and_no_rule_reorders_or_places_the_buttons():
+    assert [a["id"] for t, a in _tags() if a.get("id") in ("settings", "send", "stop")] == ["settings", "send", "stop"]
+    rules = list(_walk(_stylesheet()))
+    assert not re.search(r"(?<![\w-])order\s*:", " ".join(b for _, _, b in rules))   # border: is not order:
+    placed = [h for _, h, b in rules if h in ("#settings", "#send", "#stop", "#composer > button")
+              and re.search(r"(?<![\w-])(grid-area|grid-row|grid-column)\s*:", b)]
+    assert not placed, placed   # they flow in DOM order: a grid area would put Stop before Send again
+
+
+def test_the_sidebar_toggle_has_no_negative_vertical_margin_to_clip_its_focus_ring():
+    margins = [m for _, h, b in _walk(_stylesheet()) if h == "#sidebar-toggle" for m in _vertical_margins(b)]
+    assert margins and not [m for m in margins if m.startswith("-")]
+
+
+def test_a_short_viewport_scrolls_the_page_instead_of_pinning_and_capping():
+    short = _media(r"@media\s*\(\s*max-height:\s*480px\s*\)")
+    assert short, "no @media (max-height: 480px)"
+
+    def rule(selector):
+        return " ".join(b for h, b in short if selector in h.split(", "))
+
+    assert re.search(r"overflow:\s*visible", rule("body")) and re.search(r"(?<![\w-])height:\s*auto", rule("body"))
+    assert re.search(r"overflow:\s*visible", rule("#conversation")) and re.search(r"overflow:\s*visible", rule("#composer"))
+    assert not re.search(r"max-height", " ".join(b for h, b in short))   # nothing is capped
+
+
+def test_motion_exists_only_under_no_preference():
+    css = _stylesheet()
+    motion = r"@media\s*\(\s*prefers-reduced-motion:\s*no-preference\s*\)"
+    declares = r"(?<![\w-])(transition|animation)(-[a-z-]+)?\s*:"
+    inside, outside = [], []
+    for trail, selector, body in _walk(css):
+        if re.search(declares, body):
+            (inside if any(re.fullmatch(motion, t) for t in trail) else outside).append(selector)
+    assert inside and not outside, {"inside": inside, "outside": outside}
+    assert not [h for h, b in css if h.startswith("@keyframes")]   # the keyframes sit inside that block too
+
+
+# ---- P4-C: the card parts render.js builds ---------------------------------------------------------------------------
+
+def test_the_banner_stays_above_the_viewer_the_drawer_the_sidebar_and_the_scrim():
+    """Where the page scrolls (a viewport 480 px tall or less) the drawer, the sidebar and the scrim would paint over the
+    sticky banner unless it is the topmost layer."""
+    layers = [(h, int(v)) for _, h, b in _walk(_stylesheet()) for v in re.findall(r"(?<![\w-])z-index:\s*(-?\d+)", b)]
+    assert [z for h, z in layers if h == ".banner"] == [60], layers
+    others = {h: z for h, z in layers if h != ".banner"}
+    assert others and all(z < 60 for z in others.values()), others
+
+
+# Classes render.js gives an element for the scripts to find and the tests to read, that no rule needs to style.
+HOOK_ONLY = {"label", "notice", "stopped", "error", "truncated", "unknown", "user", "values", "more", "clip", "clip-text",
+             "report-body", "mark", "error-hint"}
+
+
+def test_every_class_render_js_emits_is_styled_or_a_plain_hook():
+    js = (STATIC / "render.js").read_text(encoding="utf-8")
+    expressions = re.findall(r"class:\s*([^,}]+)", js) + re.findall(r"CHIP_CLASS = \{([^}]*)\}", js)   # `class: a ? 'x' : 'y'`
+    emitted = {c for expression in expressions for literal in re.findall(r"'([^'$]+)'", expression) for c in literal.split()}
+    css = re.sub(r"/\*.*?\*/", "", (STATIC / "styles.css").read_text(encoding="utf-8"), flags=re.S)
+    styled = set(re.findall(r"\.([A-Za-z_][\w-]*)", css))
+    assert emitted >= {"card", "chip", "timeline", "provisional", "report", "label-chips", "thumb", "provenance"}, emitted
+    assert emitted - styled - HOOK_ONLY == set(), sorted(emitted - styled - HOOK_ONLY)
+
+
+def test_a_compare_card_is_wider_than_the_column_and_stands_its_two_reports_side_by_side_from_900_px():   # P9-F
+    """A compare card's two report columns stand side by side when the card is at least 900 px wide, and are stacked below that. The column of
+    turns is 760 px, so the compare card alone may be wider; the query asks the card itself (a size container), whatever made it narrow (the
+    window, the sidebar, the drawer)."""
+    css = _stylesheet()
+    tokens = _declared(css)
+
+    def rule(selector):
+        return " ".join(b for h, b in css if h == selector)
+
+    assert tokens["--column-w"] == "760px" and int(tokens["--compare-w"][:-2]) >= 900   # wide enough to reach the 900 px
+    assert re.search(r"max-width:\s*var\(--compare-w\)", rule("#conversation > .card.compare-card"))
+    assert re.search(r"container:\s*compare-card\s*/\s*inline-size", rule(".compare-card"))
+    queries = [(h, b) for h, b in css if h.startswith("@container compare-card")]
+    # a container query measures the card's content box: 900 px less 16 px of padding and 1 px of border on each side (the .card rule)
+    assert [h for h, _ in queries] == ["@container compare-card (min-width: 866px)"]
+    assert re.search(r"padding:\s*16px", rule(".card")) and re.search(r"border:\s*1px solid", rule(".card"))
+    assert re.search(r"grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)", queries[0][1])
+    assert re.search(r"grid-template-columns:\s*minmax\(0,\s*1fr\)\s*;", rule(".compare-columns"))   # one column below that: stacked
+
+
+def test_visually_hidden_is_the_standard_one_pixel_clipped_box():
+    """The class a chip's spoken state and the page's live status node both use: out of sight, in the accessibility tree."""
+    rule = " ".join(b for _, h, b in _walk(_stylesheet()) if h == ".visually-hidden")
+    for declaration in (r"position:\s*absolute", r"width:\s*1px", r"height:\s*1px", r"overflow:\s*hidden", r"white-space:\s*nowrap"):
+        assert re.search(r"(?<![\w-])" + declaration, rule), declaration
+    assert re.search(r"clip-path:\s*inset\(\s*50%\s*\)|(?<![\w-])clip:\s*rect\(", rule)   # clipped to nothing
+    assert not re.search(r"display:\s*none|visibility:\s*hidden", rule)   # either would hide it from a screen reader too
+
+
+def test_the_stage_glyphs_have_empty_alt_text_after_a_fallback_so_that_no_screen_reader_hears_them():
+    """The shapes before a stage's label (open circle, dot, tick, dash, cross) are decoration: the state is also said in words
+    (render.js). Left as plain `content`, Chrome puts them in the accessible name ("tick preprocess ..."). `content: "x" / ""` gives
+    each empty alt text; the declaration before it is what an engine without alt text keeps (it drops the one it cannot read)."""
+    glyphs = [(h, b) for _, h, b in _walk(_stylesheet())
+              if re.fullmatch(r"\.timeline > li(\[data-state=\"\w+\"\])?::before", h) and re.search(r"(?<![\w-])content:", b)]
+    assert len(glyphs) == 5, [h for h, _ in glyphs]   # the pending shape and the four states (the pulse of a running one has no content)
+    for selector, declarations in glyphs:
+        contents = re.findall(r'(?<![\w-])content:\s*("[^"]*")(?:\s*/\s*("[^"]*"))?\s*;', declarations)
+        assert len(contents) == 2, (selector, declarations)
+        (plain, plain_alt), (shape, alt) = contents
+        assert plain_alt == "" and alt == '""' and plain == shape and plain != '""', (selector, contents)   # a fallback, then the same shape with empty alt text
+
+
+# ---- P4-G: the settings drawer ends in Save, and says what it saved ----------------------------------------------------------------
+
+def _rule(selector):
+    return " ".join(b for _, h, b in _walk(_stylesheet()) if h == selector)
+
+
+def test_the_drawers_save_bar_sticks_to_the_bottom_and_covers_what_scrolls_under_it():
+    bar = _rule(".drawer-actions")
+    assert re.search(r"position:\s*sticky", bar)
+    # A sticky box sticks to the scroll container's content edge, not its padding edge, so the bar is pulled out over the padding by the
+    # padding's own width (--drawer-pad is the drawer's padding): flush with the bottom, and with both sides, of the drawer.
+    assert re.search(r"(?<![\w-])bottom:\s*calc\(-1\s*\*\s*var\(--drawer-pad\)\)", bar)
+    assert re.search(r"(?<![\w-])margin:\s*\d+px\s+calc\(-1\s*\*\s*var\(--drawer-pad\)\)\s+0", bar)
+    assert re.search(r"(?<![\w-])padding:\s*var\(--drawer-pad\)", _rule("#drawer")) and _declared(_stylesheet())["--drawer-pad"] == "16px"
+    assert re.search(r"background:\s*var\(--card\)", bar)   # opaque: the fields scroll under it
+    assert re.search(r"scroll-padding-bottom:\s*\d+px", _rule("#drawer"))   # and a focused field is scrolled to above it
+    save = _rule("#drawer-save")
+    assert "var(--accent)" in save and "var(--on-accent)" in save   # a primary button, as Send is
+    short = " ".join(b for h, b in _media(r"@media\s*\(\s*max-height:\s*480px\s*\)") if h == ".drawer-actions")
+    assert re.search(r"position:\s*static", short)   # where the page scrolls instead nothing sticks (WCAG 1.4.10)
+
+
+def test_a_field_that_is_wrong_shows_its_line_and_its_border_in_the_error_colour():
+    assert re.search(r"color:\s*var\(--bad\)", _rule("#drawer .field-error"))
+    assert re.search(r"border-color:\s*var\(--bad\)", _rule('#drawer input[aria-invalid="true"]'))
+
+
+def test_the_saved_line_is_a_row_of_the_composer_that_takes_no_room_while_it_is_empty():
+    shown, empty = _rule("#saved"), _rule("#saved:empty")
+    assert re.search(r"flex:\s*1\s+0\s+100%", shown) and re.search(r"color:\s*var\(--ok\)", shown)   # a row of its own, in the confirming colour
+    assert re.search(r"position:\s*absolute", empty)   # out of the flex row, so that it leaves no gap ...
+    assert not re.search(r"display:\s*none|visibility:\s*hidden", empty)   # ... and still in the accessibility tree, a live region before its first message
+
+
+def test_a_confirmation_that_is_a_warning_is_in_the_warning_colour():   # P4-G fix 1: Save with refused storage says so in the same region
+    assert re.search(r"color:\s*var\(--warn\)", _rule('#saved[data-state="warn"]'))

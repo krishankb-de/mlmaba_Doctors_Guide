@@ -1,0 +1,1199 @@
+"""Phase 11A: report-generation evaluation harness (ROUGE-L / BLEU-1/4 / METEOR).
+
+This script needs no PhysioNet data and no trained image-conditioned generator —
+it is built during the Phase 8 fetch wait per H100_SCALING_PLAN.md's "unblocked
+work" list. It provides two independent pieces, both usable today:
+
+  1. Corpus-level text metrics (rouge_l_score, corpus_bleu, meteor_score_corpus)
+     over any (hypothesis, reference) string pairs — e.g. the retrieval-NN
+     baseline's output (Phase 11C, below), or real generator output.
+  2. A fixed decoding harness (greedy_decode, beam_search_decode with beam=3)
+     built on Phase 10A's HybridLanguageModel.forward(inputs_embeds=...) /
+     .generate(prefix_embeds=...) additive hooks — exercised end-to-end here
+     against a tiny random-init model + random prefix embeddings (--smoke-test)
+     so the decoding code itself is proven correct before any checkpoint exists.
+
+--checkpoint mode (added 2026-08-23, after the first real Phase 10E arm0
+checkpoint existed) loads a trained ReportGenerationLightningModule from a
+Lightning .ckpt and generates from real images — a qualitative check, NOT yet
+the full official-subject-disjoint-test-split scoring run Phase 11D's plan
+entry describes. Loader pattern follows scripts/evaluate_lm.py's convention
+(defensive key-prefix stripping, missing/unexpected key counts printed).
+CONFIRMED LIVE 2026-08-24 (jobs 2478647, 2482543): the arm0 checkpoint --
+with and without Phase 9D image augmentation -- generates byte-identical
+boilerplate for different images rather than conditioning on content.
+
+--retrieval-baseline mode (added 2026-08-24, Phase 11C) retrieves the nearest
+TRAINING report by stock BiomedCLIP pooled-image cosine similarity and emits
+it verbatim — "the real floor; a generator that does not beat it has
+contributed nothing" (H100_SCALING_PLAN.md). No Phase-9 best contrastive
+checkpoint exists yet, so this uses stock BiomedCLIP (matches 10C's current
+frozen-tower default).
+
+--chexbert (added 2026-08-28, Phase 11B) is an opt-in flag, usable alongside
+--checkpoint, --retrieval-baseline, or --hyp-file/--ref-file: micro/macro F1
+over the 14 CheXpert labels + the 5-label RRG subset, via the f1chexbert
+package (pip install f1chexbert; auto-downloads chexbert.pth on first use).
+CONFIRMED LIVE 2026-08-29 (job 2492037): a first version of this integration
+guessed a wrong f1chexbert API (an imagined per-report `.get_label()` method)
+-- it degraded to a clean "skipped: ModuleNotFoundError" (f1chexbert wasn't
+installed) rather than crashing or silently mis-scoring, exactly per its
+design contract, but would still have called the wrong API once installed.
+Fixed against the real, verified API: `F1CheXbert()(hyps=[...], refs=[...])`
+returns (accuracy, accuracy_per_sample, chexbert_all, chexbert_5) where
+chexbert_all/chexbert_5 are sklearn classification_report(output_dict=True)
+dicts (per-label + "micro avg"/"macro avg" entries) -- it computes CheXbert
+F1 end-to-end internally, so no separate label-matrix math is needed here.
+No per-report label vector is exposed publicly, so the originally-planned
+ground-truth-CSV cross-check (comparing our own labeling of the reference
+text against mimic-cxr-2.0.0-chexpert.csv.gz) is NOT implementable against
+this package's public API and has been dropped, not merely deferred.
+
+2026-08-29: f1chexbert==0.0.2 (last released 2023) is INCOMPATIBLE with a
+modern `transformers` install -- its tokenize() helper calls the legacy
+`tokenizer.encode_plus(...)` method, removed in transformers>=5.0. The main
+.venv used for report generation/training needs a recent transformers (GPT-2
+tokenizer, BiomedCLIP text tower, BioMedLM teacher), so downgrading it just to
+satisfy this one old package is the wrong tradeoff. FIX: run CheXbert scoring
+in a SEPARATE, isolated venv pinned to `transformers<5` (see
+score_chexbert_standalone.py + score_chexbert_h100.sh), decoupled from this
+script and the main venv entirely via plain hyps.txt/refs.txt files -- hence
+the new --dump-dir flag below, which writes those files from --checkpoint or
+--retrieval-baseline mode so their generated text can be scored in that
+separate venv without re-running generation.
+
+2026-08-30: CONFIRMED LIVE that --dump-dir works end-to-end at n=1433 (job
+2493923) -- ROUGE-L/BLEU reproduced bit-for-bit against every earlier run of
+this eval, and hyps.txt/refs.txt were written correctly. The isolated venv's
+own CheXbert scoring step then hit a FOURTH f1chexbert-package bug (unrelated
+to this file): scikit-learn>=1.8.0 changed a private API f1chexbert depends
+on from a 3-tuple to a 4-tuple return, breaking its own unpack. Fixed with a
+version pin in scripts/setup_chexbert_venv_h100.sh (scikit-learn<1.8), not a
+change here -- see that script's docstring and H100_SCALING_PLAN.md's 11B
+entry for the full root-cause writeup.
+
+Usage:
+    # Metrics over precomputed hypothesis/reference pairs (one line each, aligned)
+    python scripts/evaluate_report_generation.py \\
+        --hyp-file preds.txt --ref-file refs.txt \\
+        --output-dir results/report_gen_baseline
+
+    # Prove the decoding harness (prefix-conditioned greedy + beam=3) runs
+    # end-to-end on a tiny random model — no checkpoint, no data required
+    python scripts/evaluate_report_generation.py --smoke-test
+
+    # Qualitative check against a real trained checkpoint + real images
+    python scripts/evaluate_report_generation.py \\
+        --checkpoint outputs/h100_report_gen_arm0/checkpoints/last.ckpt \\
+        --parquet /sc/home/$USER/dataset/mimic_full/arm0/validate.parquet \\
+        --num-samples 10 --decode greedy
+
+    # Phase 11C retrieval-NN baseline — the real floor a generator must beat
+    python scripts/evaluate_report_generation.py \\
+        --retrieval-baseline \\
+        --train-parquet /sc/home/$USER/dataset/mimic_full/arm0/train.parquet \\
+        --parquet /sc/home/$USER/dataset/mimic_full/arm0/validate.parquet \\
+        --num-samples 10
+
+    # Dump this run's hyps/refs for later CheXbert scoring in an isolated venv
+    # (see score_chexbert_standalone.py) instead of --chexbert here
+    python scripts/evaluate_report_generation.py \\
+        --checkpoint outputs/h100_report_gen_full/checkpoints/last.ckpt \\
+        --parquet /sc/home/$USER/dataset/mimic_full/validate.parquet \\
+        --num-samples 1433 --dump-dir results/report_gen_full_n1433
+
+    # P9-G2: a model trained with dataset.report_eos_target (P9-G1), decoded so that it can stop at its own EOS
+    python scripts/evaluate_report_generation.py \\
+        --checkpoint <run>/checkpoints/last.ckpt --model-config hybrid_150m_m3_rrg \\
+        --parquet /sc/home/$USER/dataset/mimic_full/test.parquet \\
+        --decode beam --beam-size 3 --max-new-tokens 200 --stop-at-eos --cached-decode
+
+    # P9-G6: the same, ranking by log-probability / length ** 1.5 instead of the published 1.0 (from 0.5 to 3.0, EOS-stop decoding only)
+    python scripts/evaluate_report_generation.py \\
+        --checkpoint <run>/checkpoints/last.ckpt --model-config hybrid_150m_m3_rrg \\
+        --parquet /sc/home/$USER/dataset/mimic_full/test.parquet \\
+        --decode beam --beam-size 3 --max-new-tokens 200 --stop-at-eos --cached-decode --length-penalty 1.5
+"""
+
+import sys
+import json
+import math
+import argparse
+from pathlib import Path
+from datetime import datetime
+from collections import Counter
+from typing import Dict, List, Optional, Tuple
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+import torch
+
+from hybrid_xmamba.models.configuration_hybrid import HybridConfig
+from hybrid_xmamba.models.hybrid_lm import HybridLanguageModel, StopDecoding
+from hybrid_xmamba.models.prefix_mapper import ImagePrefixMapper
+
+# P9-G6: what --length-penalty takes. 1.0 is the published exponent of the ranking; only the EOS-stop search (--stop-at-eos) takes another.
+LENGTH_PENALTY_RANGE = (0.5, 3.0)
+
+
+# ---------------------------------------------------------------------------
+# Decoding harness — fixed config: greedy + beam=3, fixed max_new_tokens
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def greedy_decode(
+    model: HybridLanguageModel,
+    input_ids: torch.Tensor,
+    prefix_embeds: Optional[torch.Tensor] = None,
+    max_new_tokens: int = 100,
+) -> torch.Tensor:
+    """Deterministic argmax decoding. Delegates to generate()'s prefix-conditioned
+    path (Phase 10A) with top_k=1, which forces the sampler onto the single
+    highest-logit token at every step — reusing already-tested code rather than
+    duplicating the prefix/hidden-state bookkeeping.
+    """
+    return model.generate(
+        input_ids,
+        prefix_embeds=prefix_embeds,
+        max_new_tokens=max_new_tokens,
+        temperature=1.0,
+        top_k=1,
+    )
+
+
+@torch.no_grad()
+def beam_search_decode(
+    model: HybridLanguageModel,
+    input_ids: torch.Tensor,
+    prefix_embeds: Optional[torch.Tensor] = None,
+    beam_size: int = 3,
+    max_new_tokens: int = 100,
+    length_penalty: float = 1.0,
+    on_step=None,
+) -> torch.Tensor:
+    """Standard beam search. Operates on ONE sample at a time (input_ids/
+    prefix_embeds batch dim must be 1) — model.generate() has no beam-search
+    mode, so this is new code built directly on forward(inputs_embeds=...).
+    Callers with a batch loop per-sample.
+    """
+    if input_ids.shape[0] != 1:
+        raise ValueError(
+            "beam_search_decode operates on one sample at a time "
+            "(got batch size {})".format(input_ids.shape[0])
+        )
+    device = input_ids.device
+
+    if prefix_embeds is not None:
+        base_hidden = torch.cat([prefix_embeds, model.embeddings(input_ids)], dim=1)
+    else:
+        base_hidden = model.embeddings(input_ids)
+
+    # Each beam: (hidden_states, token_ids, cumulative_log_prob)
+    beams = [(base_hidden, input_ids, 0.0)]
+
+    for step in range(max_new_tokens):
+        candidates = []
+        for hidden_states, token_ids, score in beams:
+            logits = model.forward(inputs_embeds=hidden_states, return_dict=True).logits
+            log_probs = torch.log_softmax(logits[:, -1, :], dim=-1).squeeze(0)
+            topk_logp, topk_idx = log_probs.topk(beam_size)
+            for lp, idx in zip(topk_logp.tolist(), topk_idx.tolist()):
+                next_token = torch.tensor([[idx]], device=device, dtype=token_ids.dtype)
+                new_hidden = torch.cat([hidden_states, model.embeddings(next_token)], dim=1)
+                new_tokens = torch.cat([token_ids, next_token], dim=1)
+                candidates.append((new_hidden, new_tokens, score + lp))
+
+        def _ranked(c):
+            return c[2] / (c[1].shape[1] ** length_penalty)
+
+        candidates.sort(key=_ranked, reverse=True)
+        beams = candidates[:beam_size]
+        if on_step is not None:   # CHAT_UI_PLAN.md P2-B: observe only; beams[0] is the current best
+            on_step(step, beams[0][1][0].tolist())
+
+    best = max(beams, key=lambda c: c[2] / (c[1].shape[1] ** length_penalty))
+    return best[1]
+
+
+@torch.no_grad()
+def beam_search_decode_eos(
+    model: HybridLanguageModel,
+    input_ids: torch.Tensor,
+    prefix_embeds: Optional[torch.Tensor] = None,
+    beam_size: int = 3,
+    max_new_tokens: int = 100,
+    length_penalty: float = 1.0,
+    eos_token_id: int = 50256,
+    on_step=None,
+) -> Tuple[torch.Tensor, bool]:
+    """`beam_search_decode` that stops at an end-of-report token (CHAT_UI_PLAN.md P9-G2). -> (ids, ended_by_eos).
+
+    The published search runs exactly max_new_tokens steps and takes an EOS for any other token, which is all a model that never
+    learned one can use. A model trained with dataset.report_eos_target (P9-G1) ends its reports, and this search lets it. It sits
+    beside the published one, which is untouched; both rank the same way. At every step:
+      1. take the candidates published-first: each live beam offers exactly the `topk(beam_size)` tokens beam_search_decode takes, in
+         its order, and then the rest of its top 2 * beam_size, after every published one. Ties break as there, because the first
+         beam_size candidates after the stable sort ARE the published ones (an extra ranks after its own parent's beam_size
+         published candidates, so never among the first beam_size); the extras only fill a live slot that an EOS has freed;
+      2. walk them in rank order. An EOS candidate within the first beam_size is set aside as finished, scored like any other
+         candidate (the EOS counts in the length); the rest fill the beam_size live slots; an EOS further down is dropped, and so is
+         one at step 0, before any token has been generated: no turn ends with an empty report (Hugging Face's min_new_tokens=1);
+      3. the ANSWER is the best normalised score of the best finished hypothesis and the live beams (a tie goes to the finished one,
+         then to the live beams in rank order). on_step gets its ids, and the search returns right after that call once the answer
+         is a finished hypothesis (OpenNMT-style top-hypothesis stopping), or at max_new_tokens. A live answer at the budget has the
+         full length, and ended_by_eos is False.
+    `ids` is shaped like beam_search_decode's (prompt + generated), without the EOS of a finished hypothesis. With no EOS among the
+    first beam_size candidates at any step nothing ever finishes, and this is beam_search_decode: the same ids and the same on_step
+    stream, ties included (tests build exact ties on purpose).
+
+    `on_step(step, answer_ids)` is called once per step, after its selection. It only observes, with one exception: raising
+    `StopDecoding` (hybrid_xmamba.models.hybrid_lm) ends the search, which returns the best finished hypothesis if there is one, and
+    lets the same exception propagate if there is none. Any other exception propagates (the chat app's cancel).
+    """
+    if input_ids.shape[0] != 1:
+        raise ValueError(
+            "beam_search_decode_eos operates on one sample at a time "
+            "(got batch size {})".format(input_ids.shape[0])
+        )
+    device = input_ids.device
+
+    if prefix_embeds is not None:
+        base_hidden = torch.cat([prefix_embeds, model.embeddings(input_ids)], dim=1)
+    else:
+        base_hidden = model.embeddings(input_ids)
+
+    # Live beams, best first: (hidden_states, token_ids, cumulative_log_prob). Best hypothesis that ended: (normalised score, token_ids
+    # sans EOS), the earliest of equals.
+    beams = [(base_hidden, input_ids, 0.0)]
+    best_done = None
+
+    for step in range(max_new_tokens):
+        length = beams[0][1].shape[1] + 1      # every live beam has this many tokens once it takes one more
+        candidates, extras = [], []            # (parent beam, token, cumulative_log_prob); hidden states only for those that stay live
+        for parent, (hidden_states, token_ids, score) in enumerate(beams):
+            logits = model.forward(inputs_embeds=hidden_states, return_dict=True).logits
+            log_probs = torch.log_softmax(logits[:, -1, :], dim=-1).squeeze(0)
+            topk_logp, topk_idx = log_probs.topk(beam_size)                     # exactly the published call, and its order ...
+            taken = topk_idx.tolist()
+            for lp, idx in zip(topk_logp.tolist(), taken):
+                candidates.append((parent, idx, score + lp))
+            wide_logp, wide_idx = log_probs.topk(min(2 * beam_size, log_probs.shape[-1]))   # ... then what else its top 2 * beam_size holds
+            for lp, idx in zip(wide_logp.tolist(), wide_idx.tolist()):
+                if idx not in taken:
+                    extras.append((parent, idx, score + lp))
+
+        candidates += extras                   # every published candidate first, so that the stable sort breaks ties as the published one does
+        candidates.sort(key=lambda c: c[2] / (length ** length_penalty), reverse=True)
+        stay = []
+        for rank, (parent, idx, score) in enumerate(candidates[:2 * beam_size]):
+            if idx == eos_token_id:
+                if step > 0 and rank < beam_size:   # at step 0 an EOS is dropped like a later one: no empty report
+                    done = score / (length ** length_penalty)
+                    if best_done is None or done > best_done[0]:
+                        best_done = (done, beams[parent][1])
+                continue
+            stay.append((parent, idx, score))
+            if len(stay) == beam_size:
+                break
+
+        next_beams = []
+        for parent, idx, score in stay:
+            hidden_states, token_ids, _ = beams[parent]
+            next_token = torch.tensor([[idx]], device=device, dtype=token_ids.dtype)
+            next_beams.append((torch.cat([hidden_states, model.embeddings(next_token)], dim=1),
+                               torch.cat([token_ids, next_token], dim=1), score))
+        beams = next_beams
+        # beams[0] is the best live beam: what beam_search_decode shows and returns.
+        live_score = beams[0][2] / (beams[0][1].shape[1] ** length_penalty)
+        answer_done = best_done is not None and best_done[0] >= live_score
+        answer = best_done[1] if answer_done else beams[0][1]
+        if on_step is not None:
+            try:
+                on_step(step, answer[0].tolist())
+            except StopDecoding:
+                if best_done is None:
+                    raise
+                return best_done[1], True
+        if answer_done:
+            return answer, True
+
+    return beams[0][1], False
+
+
+# ---------------------------------------------------------------------------
+# Real-checkpoint loading + generation (--checkpoint mode). Split into a
+# heavy loader (needs a real checkpoint + BiomedCLIP weights, not unit-tested)
+# and a light decode step (generate_from_patch_grid, unit-tested with a
+# synthetic patch_grid — same pattern as
+# test_report_generation_step_produces_finite_loss_and_gradients).
+# ---------------------------------------------------------------------------
+
+def build_decoder_config(model_cfg: Dict) -> HybridConfig:
+    """Filter a raw model-yaml dict down to HybridConfig's declared fields —
+    same pattern as test_hybrid_150m_v2_rrg_config_matches_150m_v2_architecture."""
+    import dataclasses
+    fields = {f.name for f in dataclasses.fields(HybridConfig)}
+    return HybridConfig(**{k: v for k, v in model_cfg.items() if k in fields})
+
+
+def resolve_prefix_k(checkpoint_path, yaml_prefix_k: int, override: Optional[int] = None) -> int:
+    """Determine the prefix_k a checkpoint was TRAINED with.
+
+    WHY THIS IS NOT OPTIONAL (Phase 14, 2026-09-10). `prefix_k` sets only the
+    output width of `F.adaptive_avg_pool1d`, which has NO PARAMETERS -- both
+    `token_proj` and `out_proj` are k-independent. So a k=8 checkpoint loads into
+    a k=32 module with `Missing keys: 0, Unexpected: 0` and then silently
+    generates from 32 prefix tokens instead of 8. It is a train/inference
+    mismatch that produces plausible-looking metrics, and NO key-count guard can
+    detect it, because the parameter set is genuinely identical.
+
+    `ReportGenerationLightningModule` does not call `save_hyperparameters()`, so
+    k is not in the checkpoint either. It IS in `run_metadata.json`, which
+    `write_run_metadata()` drops beside the run's output dir with the fully
+    resolved Hydra config -- that is what this reads.
+
+    Precedence: explicit override > run_metadata.json > the model YAML.
+    A conflict between an override and run_metadata is a hard error, not a
+    warning: one of the two is wrong and guessing which would silently corrupt
+    the evaluation.
+    """
+    import json as _json
+
+    detected = None
+    meta_path = Path(checkpoint_path).resolve().parent.parent / "run_metadata.json"
+    if meta_path.exists():
+        try:
+            with open(meta_path) as fh:
+                cfg = _json.load(fh).get("resolved_config", {})
+            detected = cfg.get("model", {}).get("prefix_k")
+        except Exception as exc:  # malformed metadata must not block an eval
+            print("  WARNING: could not read %s (%s)" % (meta_path, exc))
+
+    if override is not None:
+        if detected is not None and int(detected) != int(override):
+            raise RuntimeError(
+                "prefix_k conflict: --prefix-k=%d was passed but %s records the "
+                "checkpoint was TRAINED with prefix_k=%d. One of these is wrong; "
+                "resolve it rather than guessing -- an incorrect k silently "
+                "changes the number of image-prefix tokens at inference and "
+                "cannot be detected from the state dict."
+                % (override, meta_path, detected)
+            )
+        return int(override)
+
+    if detected is not None:
+        if int(detected) != int(yaml_prefix_k):
+            print("  prefix_k=%d detected from run_metadata.json (the model YAML "
+                  "says %d) -- using the trained value."
+                  % (int(detected), int(yaml_prefix_k)))
+        return int(detected)
+
+    print("  WARNING: no run_metadata.json beside the checkpoint; falling back to "
+          "prefix_k=%d from the model YAML. If this checkpoint was trained with a "
+          "different k, the evaluation is silently WRONG -- pass --prefix-k."
+          % int(yaml_prefix_k))
+    return int(yaml_prefix_k)
+
+
+def load_report_generation_module(checkpoint_path, model_config_name: str = "hybrid_150m_v2_rrg", device: str = "cpu", prefix_k: Optional[int] = None, scan_impl: Optional[str] = None, tfla_impl: Optional[str] = None, chunk_size: Optional[int] = None):
+    """Load a trained ReportGenerationLightningModule from a Lightning .ckpt
+    for inference. Mirrors evaluate_lm.py's checkpoint-loading convention
+    (defensive _orig_mod. prefix strip, missing/unexpected key counts printed)."""
+    from omegaconf import OmegaConf
+    from hybrid_xmamba.training.lightning_module import ReportGenerationLightningModule
+
+    model_cfg_path = PROJECT_ROOT / "configs" / "model" / f"{model_config_name}.yaml"
+    raw = OmegaConf.to_container(OmegaConf.load(model_cfg_path), resolve=True)
+    # MAMBA3_PLAN_V2.md V5-A: evaluate TRAINED weights under a different recurrence than they were
+    # trained with. This is how "does the operator defect affect the reported numbers?" becomes a
+    # measurement: same checkpoint, same split, scan_impl/tfla_impl flipped to "exact". Both flags
+    # are parameter-invisible, so the weights load identically either way -- which is exactly why
+    # an override has to be announced in the log rather than inferred later.
+    # EFFICIENCY_PLAN.md E6 adds `mamba3_chunk_size` to the same mechanism. It is a pure
+    # performance knob -- the chunked decomposition is exact at any chunk size -- but it changes
+    # floating-point association, so "the optimised inference configuration produces the same
+    # reports" is a claim that has to be decoded, not inferred from a logits tolerance.
+    # A chunk_size override on a config with no Mamba-3 layer is a SILENT no-op: the key is
+    # simply absent, gets set, and nothing ever reads it. That is what job 2583277 did -- it
+    # decoded hybrid_150m_v2_rrg (9x mamba-1 + 3x mlstm) and produced ROUGE-L 0.18358 against the
+    # chunk_size=64 reference's 0.1836, a "tie" that measured nothing at all. The give-away was in
+    # the log the whole time: "the checkpoint was TRAINED with None". Refuse it instead.
+    if chunk_size is not None:
+        pattern = raw.get("layer_pattern") or []
+        if "mamba3" not in pattern:
+            raise ValueError(
+                "--chunk-size={} was requested but model config '{}' has no 'mamba3' layer "
+                "(layer_pattern={}). mamba3_chunk_size would be set and never read, so the run "
+                "would silently measure the UNMODIFIED model. Use a Mamba-3 config such as "
+                "hybrid_150m_m3_rrg together with a Mamba-3 checkpoint.".format(
+                    chunk_size, model_config_name, pattern)
+            )
+
+    for name, override in (("scan_impl", scan_impl), ("tfla_impl", tfla_impl),
+                           ("mamba3_chunk_size", chunk_size)):
+        if override is not None and override != raw.get(name):
+            print("  [operator] %s: %s -> %s (OVERRIDE; the checkpoint was TRAINED with %s)"
+                  % (name, raw.get(name), override, raw.get(name)))
+            raw[name] = override
+    decoder_config = build_decoder_config(raw)
+
+    resolved_k = resolve_prefix_k(
+        checkpoint_path, int(raw.get("prefix_k", 32)), override=prefix_k
+    )
+    module = ReportGenerationLightningModule(
+        decoder_config=decoder_config,
+        image_patch_dim=int(raw.get("image_patch_dim", 768)),
+        prefix_k=resolved_k,
+    )
+    print("  prefix_k = %d" % resolved_k)
+    module.load_image_encoder()  # registers image_encoder as a submodule so its
+                                  # keys (saved in the .ckpt — see 10E's note that
+                                  # the frozen ViT is checkpointed too) actually load.
+
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = ckpt.get("state_dict", ckpt)
+    state_dict = {
+        (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+        for k, v in state_dict.items()
+    }
+    missing, unexpected = module.load_state_dict(state_dict, strict=False)
+    print(f"Loaded checkpoint: {checkpoint_path}")
+    print(f"  Missing keys: {len(missing)}, Unexpected: {len(unexpected)}")
+
+    # Phase 14A guard (2026-09-09). --model-config DEFAULTS to hybrid_150m_v2_rrg
+    # and the architecture is NOT auto-detected from the checkpoint: the module is
+    # built from the named YAML, then weights are loaded with strict=False. Point
+    # this at a Transformer checkpoint without overriding MODEL_CONFIG and it does
+    # NOT fail -- it builds a hybrid, matches almost nothing, and generates from a
+    # RANDOMLY INITIALISED decoder. The resulting ROUGE-L/CheXbert numbers look
+    # plausible and are meaningless, which is worse than a crash: they would be
+    # reported as "the baseline generates badly" when the eval was simply
+    # misconfigured. Same trap as the decoder init in train_report_generation.py.
+    n_module_keys = len(module.state_dict())
+    missing_frac = len(missing) / max(n_module_keys, 1)
+    if missing_frac > 0.5:
+        raise RuntimeError(
+            f"Checkpoint init matched almost nothing: {len(missing)}/{n_module_keys} keys "
+            f"missing ({missing_frac:.0%}). --model-config is '{model_config_name}', whose "
+            f"layer_pattern is {list(raw.get('layer_pattern', []))}. This checkpoint is "
+            f"almost certainly a DIFFERENT architecture. Generating now would produce "
+            f"meaningless text from a randomly-initialised decoder -- pass the matching "
+            f"--model-config (MODEL_CONFIG=... for the SLURM wrapper) instead."
+        )
+    if missing_frac > 0.05:
+        print(
+            f"  WARNING: {len(missing)}/{n_module_keys} keys ({missing_frac:.0%}) were NOT "
+            f"loaded from the checkpoint. Verify --model-config matches before trusting "
+            f"any metric from this run."
+        )
+
+    module.to(device)
+    module.eval()
+    return module
+
+
+@torch.no_grad()
+def generate_from_patch_grid(
+    module,
+    patch_grid: torch.Tensor,
+    decode: str = "greedy",
+    beam_size: int = 3,
+    max_new_tokens: int = 100,
+    cached: bool = False,
+) -> torch.Tensor:
+    """(1, N, patch_dim) ViT patch grid -> (1, max_new_tokens) generated token
+    ids. Seeds generation with an EMPTY input_ids (no BOS token) -- matches
+    training exactly, where report_labels start immediately after the k
+    image-prefix positions (ReportGenerationLightningModule._step); the model
+    has never seen a start-of-sequence marker, so inventing one here would be
+    a train/inference mismatch, not a neutral seed."""
+    device = patch_grid.device
+    prefix_embeds = module.prefix_mapper(patch_grid)
+    input_ids = torch.zeros((patch_grid.shape[0], 0), dtype=torch.long, device=device)
+    if decode == "greedy":
+        return greedy_decode(module.decoder, input_ids, prefix_embeds=prefix_embeds,
+                              max_new_tokens=max_new_tokens)
+    if decode == "beam":
+        # MAMBA3_PLAN_V2.md V4: the O(1) recurrent cache (M6) decodes 5.19x faster per token and
+        # is token-identical to this uncached path by test. OFF by default so the protocol that
+        # produced every published number is untouched, and because it is only available when
+        # EVERY mixer has a step(): mamba3 + mlstm at tfla_impl=exact qualifies, mamba-1 and
+        # attention do not. Verify identity on a handful of samples before trusting a full sweep.
+        if cached:
+            if not module.decoder.supports_cached_decode():
+                raise RuntimeError(
+                    "--cached-decode was requested but this stack has no O(1) step path "
+                    "(mamba-1 and attention mixers have none, and mLSTM needs tfla_impl=exact). "
+                    "Re-run without it.")
+            return module.decoder.beam_search_cached(
+                input_ids, prefix_embeds=prefix_embeds,
+                beam_size=beam_size, max_new_tokens=max_new_tokens)
+        return beam_search_decode(module.decoder, input_ids, prefix_embeds=prefix_embeds,
+                                   beam_size=beam_size, max_new_tokens=max_new_tokens)
+    raise ValueError(f"Unknown decode mode: {decode!r} (expected 'greedy' or 'beam')")
+
+
+@torch.no_grad()
+def generate_from_patch_grid_eos(
+    module,
+    patch_grid: torch.Tensor,
+    beam_size: int = 3,
+    max_new_tokens: int = 100,
+    cached: bool = False,
+    eos_token_id: int = 50256,
+    length_penalty: float = 1.0,
+) -> Tuple[torch.Tensor, bool]:
+    """`generate_from_patch_grid(decode="beam")` with the EOS-stop searches (CHAT_UI_PLAN.md P9-G2): (1, N) ids without the
+    EOS, N from 1 to max_new_tokens (an EOS before the first token is skipped), and whether the report ended in the model's own
+    EOS. Same empty input_ids, no BOS. Beam search
+    only: a greedy run is the beam of one, which beam_size=1 gives. With cached=True it is `beam_search_cached_eos` and needs a
+    stack with a step path, as `generate_from_patch_grid` does. `length_penalty` (P9-G6) is the exponent both searches rank by,
+    log-probability / length ** length_penalty with the EOS counted in the length: 1.0, the default, is the published ranking, and a
+    larger one lets a longer report win over a shorter one that ended first."""
+    prefix_embeds = module.prefix_mapper(patch_grid)
+    input_ids = torch.zeros((patch_grid.shape[0], 0), dtype=torch.long, device=patch_grid.device)
+    if cached:
+        if not module.decoder.supports_cached_decode():
+            raise RuntimeError(
+                "--cached-decode was requested but this stack has no O(1) step path "
+                "(mamba-1 and attention mixers have none, and mLSTM needs tfla_impl=exact). "
+                "Re-run without it.")
+        return module.decoder.beam_search_cached_eos(
+            input_ids, prefix_embeds=prefix_embeds, beam_size=beam_size,
+            max_new_tokens=max_new_tokens, length_penalty=length_penalty, eos_token_id=eos_token_id)
+    return beam_search_decode_eos(module.decoder, input_ids, prefix_embeds=prefix_embeds, beam_size=beam_size,
+                                  max_new_tokens=max_new_tokens, length_penalty=length_penalty, eos_token_id=eos_token_id)
+
+
+def write_hyps_refs(dump_dir: str, hyps: List[str], refs: List[str]) -> None:
+    """Write hyps.txt/refs.txt under dump_dir, one report per line, aligned by
+    line number -- lets a separate process (e.g. score_chexbert_standalone.py
+    in an isolated venv) score this run's generated text without re-running
+    generation. Embedded newlines within a single report (MIMIC findings/
+    impression text can contain literal paragraph breaks) are collapsed to a
+    single space first -- otherwise a multi-line report would silently split
+    across multiple lines and desync the hyp/ref alignment on read-back via
+    .splitlines() (the same convention --hyp-file/--ref-file already uses).
+    Pure I/O, no torch/hybrid_xmamba/f1chexbert needed -- testable directly."""
+    out_dir = Path(dump_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sanitize = lambda s: " ".join(s.split())
+    (out_dir / "hyps.txt").write_text("\n".join(sanitize(h) for h in hyps) + "\n")
+    (out_dir / "refs.txt").write_text("\n".join(sanitize(r) for r in refs) + "\n")
+    print(f"  Dumped {len(hyps)} hyp/ref pairs to {out_dir}/hyps.txt, {out_dir}/refs.txt")
+
+
+# ---------------------------------------------------------------------------
+# EFFICIENCY_PLAN.md E7 — decode under torch.compile.
+#
+# WHY THIS EXISTS. The efficiency headline (1.34x faster than FlashAttention at
+# 16,384 tokens) is measured with torch.compile ON. E6 settled the OTHER lever:
+# mamba3_chunk_size 64 -> 128 leaves all 400 decoded reports byte-identical.
+# torch.compile was only ever checked on LOGITS -- 3.0e-05 against a 1e-4 gate.
+# Logit closeness is not token identity. Beam search flips whenever a
+# perturbation exceeds the top-2 margin, and this project has already watched an
+# operator swap change 227 of 400 reports while moving no metric (V5-A). So the
+# compiled configuration gets decoded rather than argued from a tolerance.
+#
+# THE TRAP THIS CODE IS BUILT AROUND. torch.compile fails OPEN. If Dynamo cannot
+# capture the graph, or the recompile limit is exhausted as the beam grows by one
+# token per step, it falls back to eager and the run still emits perfectly good
+# reports -- which would then agree with the eager arm for the trivial reason
+# that BOTH arms ran eager. That is the same class of silent no-op as job
+# 2583277, where a chunk_size override was set on a config that never read it and
+# produced a "tie" measuring nothing. So:
+#   * dynamic=True, so one graph covers every decode length instead of ~100;
+#   * the recompile limit is raised, so sequence growth cannot exhaust it;
+#   * Dynamo's own counters are read back AFTER decoding, and the run FAILS if
+#     nothing was ever captured.
+# A compile that did not happen is reported as an error, never as agreement.
+#
+# Inference only. The project pins compile_model=false for training and this
+# does not change that.
+# ---------------------------------------------------------------------------
+
+def dynamo_capture_stats() -> Dict[str, int]:
+    """Dynamo's own record of what it captured, read off the live counters."""
+    import torch._dynamo as dynamo
+    stats = dynamo.utils.counters.get("stats", {})
+    return {
+        "calls_captured": int(stats.get("calls_captured", 0)),
+        "unique_graphs": int(stats.get("unique_graphs", 0)),
+    }
+
+
+def compile_decoder_for_inference(module, dynamic: bool = True, recompile_limit: int = 256):
+    """Replace module.decoder with a torch.compile'd view of itself and clear
+    Dynamo's counters, so assert_decoder_was_compiled() measures only this run."""
+    import torch._dynamo as dynamo
+
+    dynamo.reset()
+    dynamo.utils.counters.clear()
+    # Beam search feeds a sequence one token longer at every step. Under the
+    # default static-shape policy that is a fresh graph per length, and the
+    # default cache_size_limit of 8 would be exhausted within 8 generated tokens
+    # -- after which Dynamo serves EAGER for the remaining 92 and says so only in
+    # a warning nobody reads at the bottom of a 13,000-line log.
+    if dynamo.config.cache_size_limit < recompile_limit:
+        dynamo.config.cache_size_limit = recompile_limit
+    module.decoder = torch.compile(module.decoder, dynamic=dynamic)
+    print("  [compile] torch.compile(decoder, dynamic=%s); cache_size_limit=%d"
+          % (dynamic, dynamo.config.cache_size_limit))
+    return module
+
+
+def assert_decoder_was_compiled() -> Dict[str, int]:
+    """Raise unless Dynamo actually captured a graph during this run."""
+    stats = dynamo_capture_stats()
+    print("  [compile] Dynamo captured %d call(s) into %d unique graph(s)."
+          % (stats["calls_captured"], stats["unique_graphs"]))
+    if stats["calls_captured"] == 0:
+        raise RuntimeError(
+            "--compile was requested but Dynamo captured NOTHING: this decode ran in "
+            "eager mode and measures the unmodified path. Agreement with the eager arm "
+            "would be vacuous, so the run fails instead of reporting it. Look further up "
+            "the log for a Dynamo fallback or graph-break message."
+        )
+    return stats
+
+
+def run_checkpoint_inspection(args) -> None:
+    """--checkpoint mode: generate from real images with a real trained
+    checkpoint and print generated-vs-reference text side by side. Qualitative
+    inspection tool, NOT the official-test-split 11D scoring run -- arm0's
+    own parquets are a legacy-training-hash subset, not the subject-disjoint
+    official split (see H100_SCALING_PLAN.md's cross_protocol_number_comparison
+    warning)."""
+    import pandas as pd
+    from PIL import Image
+    import torchvision.transforms as T
+    from transformers import AutoTokenizer
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    module = load_report_generation_module(
+        args.checkpoint, args.model_config, device=device,
+        prefix_k=getattr(args, "prefix_k", None),
+        scan_impl=getattr(args, "scan_impl", None),
+        tfla_impl=getattr(args, "tfla_impl", None),
+        chunk_size=getattr(args, "chunk_size", None),
+    )
+    # E7: compile AFTER the weights are loaded and the module is on-device, so the
+    # graph Dynamo captures is the one that actually decodes.
+    if getattr(args, "compile_decoder", False):
+        module = compile_decoder_for_inference(module)
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+
+    # BiomedCLIP CLIP normalisation — matches cxr_mimic_arm0.yaml/cxr_mimic_full.yaml.
+    img_transform = T.Compose([
+        T.Resize((224, 224)),
+        T.Grayscale(num_output_channels=3),
+        T.ToTensor(),
+        T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                    std=[0.26862954, 0.26130258, 0.27577711]),
+    ])
+
+    if getattr(args, "cached_decode", False):
+        print("Decode path: O(1) recurrent cache (M6). Token-identical to the uncached path by "
+              "test; the published numbers used the uncached path.")
+    stop_at_eos = getattr(args, "stop_at_eos", False)
+    length_penalty = getattr(args, "length_penalty", 1.0)   # P9-G6: only the EOS search takes one; a caller that predates the flag ranks as before
+    if stop_at_eos:
+        print("Decode path: beam search that stops at the model's EOS (P9-G2). NOT the published protocol, which "
+              "decodes the whole budget; meant for a model trained with dataset.report_eos_target.")
+        print(f"Length penalty: {length_penalty}")   # the line scripts/report_eos_stats.py reads back: the log vouches for the exponent
+    df = pd.read_parquet(args.parquet)
+    n = min(args.num_samples, len(df))
+    print(f"Loaded {len(df)} rows from {args.parquet}; inspecting first {n}\n")
+
+    hyps, refs = [], []
+    ended_by_eos = 0
+    for i in range(n):
+        row = df.iloc[i]
+        img = Image.open(row["image"]).convert("RGB")
+        pixel_values = img_transform(img).unsqueeze(0).to(device)
+        patch_grid = module._patch_grid(pixel_values)
+        if stop_at_eos:
+            out_ids, ended = generate_from_patch_grid_eos(
+                module, patch_grid, beam_size=args.beam_size, max_new_tokens=args.max_new_tokens,
+                cached=getattr(args, "cached_decode", False), eos_token_id=tokenizer.eos_token_id,
+                length_penalty=length_penalty,
+            )
+            ended_by_eos += int(ended)
+        else:
+            out_ids = generate_from_patch_grid(
+                module, patch_grid, decode=args.decode,
+                beam_size=args.beam_size, max_new_tokens=args.max_new_tokens,
+                cached=getattr(args, "cached_decode", False),
+            )
+        generated = tokenizer.decode(out_ids[0].tolist(), skip_special_tokens=True)
+        reference = f"Findings: {row.get('findings', '')} Impression: {row.get('impression', '')}".strip()
+
+        print(f"--- sample {i} (study_id={row.get('study_id', '?')}) ---")
+        print(f"GENERATED: {generated}")
+        print(f"REFERENCE: {reference}")
+        print(f"ROUGE-L (single sample): {rouge_l_score(generated.split(), reference.split()):.3f}\n")
+        hyps.append(generated)
+        refs.append(reference)
+
+    if stop_at_eos:   # the dumps hold text only, so this is where a run says how many of its reports the model ended itself
+        print(f"EOS stop: {ended_by_eos}/{n} reports ended at the end-of-report token, {n - ended_by_eos} were cut at "
+              f"max_new_tokens={args.max_new_tokens}")
+
+    # E7: checked BEFORE the dump is written. A dump produced by an accidental
+    # eager run is indistinguishable from a real one on disk, and would be
+    # compared, scored and believed.
+    if getattr(args, "compile_decoder", False):
+        assert_decoder_was_compiled()
+
+    if args.dump_dir:
+        write_hyps_refs(args.dump_dir, hyps, refs)
+
+    metrics = compute_all_metrics(hyps, refs, chexbert=args.chexbert)
+    print(f"=== Aggregate over {n} samples ===")
+    print(json.dumps(metrics, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Phase 11C — retrieval-NN baseline. "Use the Phase-9 model to retrieve the
+# nearest training report and emit it verbatim... this baseline is the real
+# floor; a generator that does not beat it has contributed nothing"
+# (H100_SCALING_PLAN.md). No Phase-9 best contrastive checkpoint exists yet
+# (deferred, per the 2026-08-20 pivot decision) -- this uses STOCK BiomedCLIP
+# pooled-image cosine similarity instead, matching 10C's current frozen-tower
+# default; swap in a fine-tuned checkpoint later without changing this logic.
+# Split the same way as the --checkpoint mode: nearest_neighbor_indices() is
+# pure tensor math (CPU-unit-tested with synthetic embeddings); embedding real
+# images with real BiomedCLIP is the untested heavy path, evaluate_lm.py-style.
+# ---------------------------------------------------------------------------
+
+def nearest_neighbor_indices(query_embeds: torch.Tensor, gallery_embeds: torch.Tensor) -> torch.Tensor:
+    """(Q, D), (G, D) L2-normalized embeddings -> (Q,) argmax cosine-similarity
+    index into the gallery for each query. Pure tensor math, no I/O — the
+    testable core of run_retrieval_baseline()."""
+    sims = query_embeds @ gallery_embeds.T
+    return sims.argmax(dim=1)
+
+
+def run_retrieval_baseline(args) -> None:
+    """Phase 11C: for each query (validation) image, retrieve the training
+    report whose image has the highest BiomedCLIP cosine similarity and emit
+    it verbatim as the hypothesis. Same output format as --checkpoint mode
+    (generated/reference/ROUGE-L per sample + aggregate metrics) for direct
+    side-by-side comparison."""
+    import pandas as pd
+    from PIL import Image
+    import open_clip
+    from omegaconf import OmegaConf
+    from scripts.train_contrastive import build_image_transform
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    biomedclip_id = "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+    clip_model, _ = open_clip.create_model_from_pretrained("hf-hub:" + biomedclip_id)
+    visual = clip_model.visual.to(device).eval()
+
+    # is_train=False unconditionally -- embedding for retrieval is inference,
+    # never training, regardless of which split the image happens to come from.
+    img_transform = build_image_transform(OmegaConf.create({"dataset": {}}), is_train=False)
+
+    @torch.no_grad()
+    def embed_images(image_paths: List[str], batch_size: int = 64) -> torch.Tensor:
+        embeds = []
+        for i in range(0, len(image_paths), batch_size):
+            batch = image_paths[i:i + batch_size]
+            imgs = torch.stack([img_transform(Image.open(p).convert("RGB")) for p in batch]).to(device)
+            feats = torch.nn.functional.normalize(visual(imgs), dim=-1)
+            embeds.append(feats.cpu())
+            print(f"  embedded {min(i + batch_size, len(image_paths))}/{len(image_paths)}")
+        return torch.cat(embeds, dim=0)
+
+    train_df = pd.read_parquet(args.train_parquet)
+    if args.max_gallery:
+        train_df = train_df.iloc[:args.max_gallery]
+    query_df = pd.read_parquet(args.parquet)
+    n = min(args.num_samples, len(query_df))
+    query_df = query_df.iloc[:n]
+
+    print(f"Embedding {len(train_df)} gallery (train) images...")
+    gallery_embeds = embed_images(train_df["image"].tolist())
+    print(f"Embedding {n} query images...")
+    query_embeds = embed_images(query_df["image"].tolist())
+
+    nn_idx = nearest_neighbor_indices(query_embeds, gallery_embeds)
+
+    hyps, refs = [], []
+    for i in range(n):
+        q_row = query_df.iloc[i]
+        g_row = train_df.iloc[nn_idx[i].item()]
+        retrieved = f"Findings: {g_row.get('findings', '')} Impression: {g_row.get('impression', '')}".strip()
+        reference = f"Findings: {q_row.get('findings', '')} Impression: {q_row.get('impression', '')}".strip()
+
+        print(f"\n--- sample {i} (query study_id={q_row.get('study_id', '?')}, "
+              f"nearest train study_id={g_row.get('study_id', '?')}) ---")
+        print(f"RETRIEVED: {retrieved}")
+        print(f"REFERENCE: {reference}")
+        print(f"ROUGE-L (single sample): {rouge_l_score(retrieved.split(), reference.split()):.3f}")
+        hyps.append(retrieved)
+        refs.append(reference)
+
+    if args.dump_dir:
+        write_hyps_refs(args.dump_dir, hyps, refs)
+
+    metrics = compute_all_metrics(hyps, refs, chexbert=args.chexbert)
+    print(f"\n=== Aggregate retrieval-NN baseline over {n} samples ===")
+    print(json.dumps(metrics, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Metrics — pure Python, no network dependency (ROUGE-L, BLEU); METEOR is
+# nltk-backed and gracefully skipped if wordnet isn't staged locally (compute
+# nodes have no internet — same constraint noted for Phase 11B's CheXbert
+# weights in H100_SCALING_PLAN.md).
+# ---------------------------------------------------------------------------
+
+def _lcs_length(a: List[str], b: List[str]) -> int:
+    m, n = len(a), len(b)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if a[i - 1] == b[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1] + 1
+            else:
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+    return dp[m][n]
+
+
+def rouge_l_score(hyp_tokens: List[str], ref_tokens: List[str], beta: float = 1.2) -> float:
+    """Sentence-level ROUGE-L F-measure (Lin, 2004)."""
+    if not hyp_tokens or not ref_tokens:
+        return 0.0
+    lcs = _lcs_length(hyp_tokens, ref_tokens)
+    if lcs == 0:
+        return 0.0
+    p = lcs / len(hyp_tokens)
+    r = lcs / len(ref_tokens)
+    denom = r + (beta ** 2) * p
+    return ((1 + beta ** 2) * p * r) / denom if denom > 0 else 0.0
+
+
+def _ngram_counts(tokens: List[str], n: int) -> Counter:
+    return Counter(tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1))
+
+
+def corpus_bleu(hyps: List[List[str]], refs: List[List[str]], max_n: int = 4) -> float:
+    """Corpus-level BLEU-N with brevity penalty, single reference per hypothesis."""
+    weights = [1.0 / max_n] * max_n
+    precisions = []
+    for n in range(1, max_n + 1):
+        match, total = 0, 0
+        for hyp, ref in zip(hyps, refs):
+            hyp_ngrams = _ngram_counts(hyp, n)
+            ref_ngrams = _ngram_counts(ref, n)
+            match += sum(min(c, ref_ngrams.get(g, 0)) for g, c in hyp_ngrams.items())
+            total += sum(hyp_ngrams.values())
+        precisions.append(match / total if total > 0 else 0.0)
+
+    if any(p == 0.0 for p in precisions):
+        geo_mean = 0.0
+    else:
+        geo_mean = math.exp(sum(w * math.log(p) for w, p in zip(weights, precisions)))
+
+    hyp_len = sum(len(h) for h in hyps)
+    ref_len = sum(len(r) for r in refs)
+    if hyp_len == 0:
+        bp = 0.0
+    elif hyp_len > ref_len:
+        bp = 1.0
+    else:
+        bp = math.exp(1 - ref_len / hyp_len)
+    return bp * geo_mean
+
+
+
+# ---------------------------------------------------------------------------
+# Phase 11B — CheXbert F1 (14-label + the 5-label RRG-literature subset)
+# between generated vs reference reports, via the `f1chexbert` package
+# (pip install f1chexbert; auto-downloads chexbert.pth on first use).
+# `F1CheXbert()(hyps=hyps, refs=refs)` computes labeling AND scoring
+# end-to-end -- no separate label-matrix math needed here (unlike 11C's
+# nearest_neighbor_indices split, there is no CPU-testable pure-math core
+# to extract, since the real API exposes only the aggregate call, not raw
+# per-report labels). Untested-by-design (evaluate_lm.py/embed_images-style)
+# -- needs real weights. Any failure (package missing, download failure,
+# API mismatch) degrades to a printed "skipped" message and None, same
+# contract as meteor_score_corpus's nltk/wordnet guard -- never crashes the
+# surrounding ROUGE/BLEU computation.
+# ---------------------------------------------------------------------------
+
+def compute_chexbert_metrics(hyps: List[str], refs: List[str]) -> Optional[Dict]:
+    """hyps/refs: report text, one pair per example -> CheXbert F1 (14-label
+    + 5-label RRG subset). Returns None (never raises) on any failure --
+    missing package, download failure, API mismatch -- so callers treat this
+    the same as a None METEOR score (not computed, not zero)."""
+    try:
+        from f1chexbert import F1CheXbert
+        labeler = F1CheXbert()
+        accuracy, accuracy_per_sample, chexbert_all, chexbert_5 = labeler(hyps=hyps, refs=refs)
+    except Exception as e:
+        print(f"  CheXbert F1 skipped: {type(e).__name__}: {e}")
+        return None
+
+    return {
+        "accuracy": accuracy,
+        "chexbert_14": chexbert_all,
+        "chexbert_5": chexbert_5,
+    }
+
+
+def meteor_score_corpus(hyps: List[str], refs: List[str]) -> Optional[float]:
+    """Corpus-average METEOR. Returns None (not 0.0) if nltk/wordnet are
+    unavailable — distinguishes "not computed" from "scored zero" for callers.
+    """
+    try:
+        import nltk
+        from nltk.translate.meteor_score import meteor_score
+        nltk.data.find("corpora/wordnet")
+    except (ImportError, LookupError):
+        return None
+    scores = [meteor_score([ref.split()], hyp.split()) for hyp, ref in zip(hyps, refs)]
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def compute_all_metrics(
+    hyps: List[str], refs: List[str], chexbert: bool = False
+) -> Dict[str, Optional[float]]:
+    """hyps/refs: whitespace-tokenized text, one pair per example. CheXbert F1
+    (Phase 11B) is opt-in via chexbert=True -- it needs real weights/network
+    on first use, unlike ROUGE-L/BLEU/METEOR which are always computed."""
+    hyp_toks = [h.split() for h in hyps]
+    ref_toks = [r.split() for r in refs]
+
+    rouge_l = sum(rouge_l_score(h, r) for h, r in zip(hyp_toks, ref_toks)) / max(len(hyps), 1)
+    bleu1 = corpus_bleu(hyp_toks, ref_toks, max_n=1)
+    bleu4 = corpus_bleu(hyp_toks, ref_toks, max_n=4)
+    meteor = meteor_score_corpus(hyps, refs)
+
+    result = {
+        "rouge_l": rouge_l,
+        "bleu_1": bleu1,
+        "bleu_4": bleu4,
+        "meteor": meteor,
+        "num_examples": len(hyps),
+    }
+    if chexbert:
+        result["chexbert"] = compute_chexbert_metrics(hyps, refs)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Smoke test — proves the decoding harness end-to-end without a checkpoint
+# ---------------------------------------------------------------------------
+
+def run_smoke_test(max_new_tokens: int = 16, dim: int = 32, k: int = 4) -> None:
+    print("Building tiny random-init HybridLanguageModel + ImagePrefixMapper...")
+    cfg = HybridConfig(
+        vocab_size=100, dim=dim, num_layers=2,
+        layer_pattern=["mamba", "mlstm"],
+        max_position_embeddings=64,
+        use_fast_path=False,
+        use_tfla=False,
+    )
+    model = HybridLanguageModel(cfg)
+    model.eval()
+    mapper = ImagePrefixMapper(patch_dim=768, decoder_dim=dim, k=k)
+    mapper.eval()
+
+    patch_grid = torch.randn(1, 197, 768)
+    prefix_embeds = mapper(patch_grid)
+    input_ids = torch.randint(0, 100, (1, 5))
+
+    print("Running greedy_decode (prefix-conditioned, max_new_tokens={})...".format(max_new_tokens))
+    greedy_out = greedy_decode(model, input_ids, prefix_embeds=prefix_embeds, max_new_tokens=max_new_tokens)
+    assert greedy_out.shape == (1, 5 + max_new_tokens), greedy_out.shape
+    assert torch.isfinite(greedy_out.float()).all()
+    print("  OK  shape={}".format(tuple(greedy_out.shape)))
+
+    print("Running beam_search_decode (beam=3, prefix-conditioned, max_new_tokens={})...".format(max_new_tokens))
+    beam_out = beam_search_decode(model, input_ids, prefix_embeds=prefix_embeds, beam_size=3, max_new_tokens=max_new_tokens)
+    assert beam_out.shape == (1, 5 + max_new_tokens), beam_out.shape
+    assert torch.isfinite(beam_out.float()).all()
+    print("  OK  shape={}".format(tuple(beam_out.shape)))
+
+    print("\nSmoke test passed: prefix-conditioned greedy + beam=3 decoding both run end-to-end.")
+    print("(Random weights → outputs are not meaningful text; this only proves the harness.)")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Phase 11A report-generation metrics / decoding harness")
+    parser.add_argument("--hyp-file", type=str, default=None,
+                        help="Path to hypotheses, one per line, aligned with --ref-file")
+    parser.add_argument("--ref-file", type=str, default=None,
+                        help="Path to references, one per line, aligned with --hyp-file")
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--smoke-test", action="store_true",
+                        help="Run the decoding harness end-to-end on a tiny random model "
+                             "(no checkpoint/data needed) instead of computing metrics")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to a trained ReportGenerationLightningModule .ckpt — "
+                             "generates from real images (--parquet) and prints "
+                             "generated-vs-reference text instead of computing metrics")
+    parser.add_argument("--prefix-k", type=int, default=None,
+                        help="Number of image-prefix tokens the checkpoint was TRAINED "
+                             "with. Auto-detected from run_metadata.json when present; "
+                             "pass explicitly only when that file is missing. A wrong "
+                             "value cannot be detected from the state dict (k has no "
+                             "parameters) and silently invalidates the evaluation.")
+    parser.add_argument("--model-config", type=str, default="hybrid_150m_v2_rrg",
+                        help="Model config name under configs/model/ (for --checkpoint mode)")
+    parser.add_argument("--parquet", type=str, default=None,
+                        help="Path to a validate.parquet/test.parquet (for --checkpoint mode)")
+    parser.add_argument("--num-samples", type=int, default=5,
+                        help="Number of samples to generate from (for --checkpoint mode)")
+    parser.add_argument("--decode", type=str, default="greedy", choices=["greedy", "beam"],
+                        help="Decoding strategy (for --checkpoint mode)")
+    parser.add_argument("--scan-impl", type=str, default=None, choices=["legacy", "exact"],
+                        help="Evaluate the checkpoint under this selective-scan operator instead "
+                             "of the one its config pins. V5-A: measures what the scan defect is "
+                             "worth on the reported metrics. Announced in the log when it differs.")
+    parser.add_argument("--tfla-impl", type=str, default=None, choices=["legacy", "exact"],
+                        help="Same, for the mLSTM recurrence.")
+    parser.add_argument("--chunk-size", type=int, default=None,
+                        help="EFFICIENCY_PLAN.md E6: override mamba3_chunk_size at decode. "
+                             "The chunked decomposition is exact at any chunk size, so this "
+                             "changes no function -- but it changes float association, which "
+                             "is why the optimised configuration is re-decoded rather than "
+                             "assumed equivalent.")
+    parser.add_argument("--compile", dest="compile_decoder", action="store_true",
+                        help="EFFICIENCY_PLAN.md E7: decode with torch.compile on the decoder "
+                             "(INFERENCE ONLY -- training still pins compile_model=false). The "
+                             "efficiency headline is measured compiled, so this is how 'the fast "
+                             "configuration writes the same reports' gets checked on text instead "
+                             "of inferred from a logit tolerance. The run FAILS if Dynamo captured "
+                             "nothing, because a silent eager fallback would agree trivially.")
+    parser.add_argument("--cached-decode", action="store_true",
+                        help="Use the O(1) recurrent cache for beam search (M6). Token-identical "
+                             "to the default path by test and ~5x faster per token, but only "
+                             "available when every mixer has a step(). Off by default: the "
+                             "published numbers came from the uncached path.")
+    parser.add_argument("--stop-at-eos", action="store_true",
+                        help="P9-G2: beam search that sets a beam aside when it ends in EOS and stops as soon as the best "
+                             "hypothesis, one that ended or a live beam, by normalised score, is one that ended, or at "
+                             "--max-new-tokens; the report is that hypothesis, without its EOS, and never an empty one (an EOS "
+                             "before the first token is skipped). For a model trained with dataset.report_eos_target (P9-G1): "
+                             "the published models never learned an EOS. Needs --checkpoint and --decode beam; with "
+                             "--cached-decode it uses the cached twin. Off by default: the published protocol decodes the "
+                             "whole budget.")
+    parser.add_argument("--length-penalty", type=float, default=1.0,
+                        help="P9-G6: the length exponent of the EOS-stop search's ranking: a hypothesis, one that ended or a live "
+                             "beam, ranks by log-probability / length ** this, the EOS counted in the length. 1.0 is the published "
+                             "ranking; above 1 favours longer reports, so a model that ends early writes fuller ones. From 0.5 to 3.0. "
+                             "Needs --stop-at-eos, because the published searches rank by 1.0 only: other than 1.0 without it is "
+                             "refused instead of ignored.")
+    parser.add_argument("--beam-size", type=int, default=3,
+                        help="Beam size when --decode beam (for --checkpoint mode)")
+    parser.add_argument("--max-new-tokens", type=int, default=100,
+                        help="Max tokens to generate per sample (for --checkpoint mode)")
+    parser.add_argument("--retrieval-baseline", action="store_true",
+                        help="Phase 11C: retrieve the nearest training report by stock "
+                             "BiomedCLIP image similarity instead of generating (--parquet "
+                             "is the query/validation set; --train-parquet is the gallery)")
+    parser.add_argument("--train-parquet", type=str, default=None,
+                        help="Path to the training parquet used as the retrieval gallery "
+                             "(for --retrieval-baseline)")
+    parser.add_argument("--max-gallery", type=int, default=0,
+                        help="Cap the gallery to the first N training rows, 0=all "
+                             "(for --retrieval-baseline)")
+    parser.add_argument("--chexbert", action="store_true",
+                        help="Phase 11B: also compute CheXbert F1 (14-label + "
+                             "5-label RRG subset) between hyps and refs, via the "
+                             "f1chexbert package. Degrades to 'skipped' if the "
+                             "package/weights aren't available (see "
+                             "compute_chexbert_metrics docstring)")
+    parser.add_argument("--dump-dir", type=str, default=None,
+                        help="Write hyps.txt/refs.txt here (one report per line) for "
+                             "--checkpoint or --retrieval-baseline mode, so a separate "
+                             "process/venv can score them later (e.g. CheXbert via "
+                             "score_chexbert_standalone.py -- see module docstring)")
+    args = parser.parse_args()
+
+    if args.stop_at_eos:   # it selects the decoder of --checkpoint mode: anywhere else it would be ignored without a word
+        if args.smoke_test or args.retrieval_baseline or not args.checkpoint:
+            parser.error("--stop-at-eos only applies to --checkpoint decoding, not to {}".format(
+                "--smoke-test" if args.smoke_test else "--retrieval-baseline" if args.retrieval_baseline
+                else "--hyp-file/--ref-file metrics"))
+        if args.decode != "beam":
+            parser.error("--stop-at-eos needs --decode beam")
+
+    if not LENGTH_PENALTY_RANGE[0] <= args.length_penalty <= LENGTH_PENALTY_RANGE[1]:   # a nan fails the comparison too
+        parser.error("--length-penalty must be from {} to {}".format(*LENGTH_PENALTY_RANGE))
+    if args.length_penalty != 1.0 and not args.stop_at_eos:   # the published searches would ignore it, without a word
+        parser.error("--length-penalty other than 1.0 needs --stop-at-eos")
+
+    if args.smoke_test:
+        run_smoke_test()
+        return
+
+    if args.retrieval_baseline:
+        if not args.parquet or not args.train_parquet:
+            parser.error("--parquet and --train-parquet are required with --retrieval-baseline")
+        run_retrieval_baseline(args)
+        return
+
+    if args.checkpoint:
+        if not args.parquet:
+            parser.error("--parquet is required with --checkpoint")
+        run_checkpoint_inspection(args)
+        return
+
+    if not args.hyp_file or not args.ref_file:
+        parser.error("--hyp-file and --ref-file are required unless --smoke-test is given")
+
+    hyps = Path(args.hyp_file).read_text().splitlines()
+    refs = Path(args.ref_file).read_text().splitlines()
+    if len(hyps) != len(refs):
+        parser.error("--hyp-file has {} lines but --ref-file has {}".format(len(hyps), len(refs)))
+
+    results = compute_all_metrics(hyps, refs, chexbert=args.chexbert)
+
+    sep = "=" * 60
+    print("\n" + sep)
+    print("  REPORT GENERATION METRICS  (n={})".format(results["num_examples"]))
+    print(sep)
+    print("  ROUGE-L : {:.4f}".format(results["rouge_l"]))
+    print("  BLEU-1  : {:.4f}".format(results["bleu_1"]))
+    print("  BLEU-4  : {:.4f}".format(results["bleu_4"]))
+    if results["meteor"] is None:
+        print("  METEOR  : (skipped — nltk wordnet corpus not staged locally)")
+    else:
+        print("  METEOR  : {:.4f}".format(results["meteor"]))
+    if args.chexbert:
+        cb = results.get("chexbert")
+        if cb is None:
+            print("  CheXbert F1 : (skipped — see printed reason above)")
+        else:
+            print("  CheXbert F1 (14-label) micro/macro : {:.4f} / {:.4f}".format(
+                cb["chexbert_14"]["micro avg"]["f1-score"], cb["chexbert_14"]["macro avg"]["f1-score"]))
+            print("  CheXbert F1 (5-label)  micro/macro : {:.4f} / {:.4f}".format(
+                cb["chexbert_5"]["micro avg"]["f1-score"], cb["chexbert_5"]["macro avg"]["f1-score"]))
+
+    if args.output_dir:
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        results["hyp_file"] = args.hyp_file
+        results["ref_file"] = args.ref_file
+        results["timestamp"] = datetime.now().isoformat()
+        out_path = out_dir / "report_gen_metrics.json"
+        with open(out_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print("\n  Results saved to " + str(out_path))
+
+    return results
+
+
+if __name__ == "__main__":
+    main()

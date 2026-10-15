@@ -1,0 +1,1157 @@
+// app/static/render.js — the card builders: one turn of the chat, drawn from the view that state.js folds from the log.
+//
+// Every builder is a pure function of a view (and a ctx) and returns a fresh element, so an update is a rebuild: the
+// caller replaces the old card with renderAssistantCard(view, ctx), at most once per animation frame (scheduleRender).
+// Nothing here touches the page (no #conversation, no fetch, no storage) and nothing writes to the view, whose arrays
+// and objects alias the stored log. Every field of a view may be missing: a public turn lacks what the server redacts,
+// a turn that has not started has no card and no stage, a skipped stage leaves its fields null or empty. A builder
+// draws what it has and nothing for the rest, never the word "undefined".
+//
+// Text is always a text node: el() appends a string as text and never parses it, and no script in app/static has an
+// HTML-string API (tests/frontend/render.test.mjs greps for them), so report text (model output) and a note (user
+// input) cannot become markup. The only URLs set on an element are blob: object URLs and data: images; an image comes
+// through ctx.loadImage because an <img src> cannot carry the bearer token.
+//
+// ctx = { loadImage, openViewer, copy, showModels, labelNames, retrieval, ui, turn }. Every member is optional and a missing
+// callback hides its control.
+//   loadImage(path) -> Promise<object URL>   api.js loadImage with the page's auth: a user turn's thumbnail, the card's pictures
+//   openViewer(image | spec, opener)         a click on a picture, and the button it came from, for the focus to go back to. A click on the
+//                                            thumbnail gives the image renderUserTurn was given, and the page says which side that is
+//                                            (ownXraySide, the one the card's "Your X-ray" tile opens); a click on a picture of the card gives
+//                                            viewer.js's { left, right? }, each side { url, label, note, transient }: one picture, or the turn's
+//                                            own X-ray and a similar one side by side (P6-E, P6-G; without openViewer a picture is not a control)
+//   copy(text)                               the report's Copy button; a throw or a rejected promise shows "Copy failed"
+//   showModels()                             the provenance link, which opens /v1/models in the drawer
+//   labelNames: [14 names]                   CHEXBERT_14 order, from /v1/models; else the order of view.labels
+//   retrieval: false                         the server runs no retrieval stage (/v1/models features): a user turn shows no k chip,
+//                                            since k was never used; left out, it is taken to run one
+//   labels: false                            the server runs no labeller (/v1/models features): nothing says "labelling…" while the
+//                                            turn runs, since no labels are coming; left out, it is taken to run one
+//   ui: Map                                  keeps the open stage details and Show raw, per message id, across the
+//                                            whole-card replace; without it a re-rendered card starts closed
+//   turn: 3                                  the turn's number in the session: it names the card and tells the same
+//                                            control of two cards apart ("Copy report, turn 3")
+//   of, key                                  set by a compare card for each of its columns (P9-F): the column's model, which names its
+//                                            report's controls ("Copy report of <model>"), and the data-key of column 1's Copy and Show raw
+// Every control a card rebuilds each frame has a data-action (copy, raw, models, more, stage, view, show), and so does a clamped report
+// (clamp), which takes the focus its Show less had, so the page can give focus back to the same element after the replace: focusKey before it,
+// restoreFocus after.
+//
+// A compare turn (P9-F) has two reports, one per model: the card draws them as two columns (compare.js gives each as a view of its own), each
+// with its model's name over what any card shows of a report, and the rest of the card once, as for every turn. Column 1's Copy and Show raw
+// carry data-key "compare", so that the focus goes back to its own after a replace.
+import { isSameOriginPath } from './api.js';
+import { COMPARE_KEY, columnsOf } from './compare.js';
+import { GLOSSARY, SUMMARY_LABELS } from './glossary.js';
+import { STAGES, initialView, labelsPending, stageState } from './state.js';
+
+export { STAGES };
+
+export function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
+    else if (v !== false && v != null) node.setAttribute(k, v === true ? '' : v);
+  }
+  node.append(...children.filter((c) => c != null));
+  return node;
+}
+
+// ---- small helpers ---------------------------------------------------------------------------------------------------
+
+const NONE = '—';          // what a null or an empty value reads as
+const CLIP = 200;          // a string longer than this is clipped in a detail table until "show more"
+const MAX_DEPTH = 4;       // how deep a detail table nests before it shows the rest as JSON text
+
+const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+const str = (v) => (typeof v === 'string' ? v : isNum(v) ? String(v) : '');   // text comes from a string or a number, nothing else
+const said = (prefix, value, suffix = '') => (str(value) ? `${prefix}${str(value)}${suffix}` : null);   // null when there is none
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const isPrimitive = (v) => v === null || (typeof v !== 'object' && typeof v !== 'function');
+
+// The turn number a ctx (or the options of detailTable) carries, if it is one; and a spoken name with it appended.
+const turnOf = (cx) => (Number.isInteger(cx?.turn) && cx.turn > 0 ? cx.turn : null);
+const named = (text, cx) => (turnOf(cx) ? `${text}, turn ${turnOf(cx)}` : text);
+// A report control's name in a column of a compare card, which says whose report it is ("Copy report of <model>"): ctx.of is that model (P9-F).
+const reportOf = (text, cx) => (typeof cx?.of === 'string' && cx.of ? `${text} of ${cx.of}` : text);
+// The data-key of a report's Copy and Show raw: ctx.key in column 1 of a compare card, and none on any other report (a card's one report).
+const keyOf = (cx) => (typeof cx?.key === 'string' && DATA_KEY.test(cx.key) ? cx.key : null);
+const path = (...parts) => parts.map(str).filter(Boolean).join(' ');   // "retrieve report_matches 2 report"
+const squeezed = (t) => str(t).split(/\s+/).filter(Boolean).join(' ');   // a text as the dumps have it: its whitespace in single spaces
+
+// The view with every field present: what a builder reads, so a field that is missing is the empty value.
+function whole(view) {
+  const base = initialView(null);
+  const given = isObject(view) ? view : {};
+  return Object.fromEntries(Object.keys(base).map((k) => [k, given[k] ?? base[k]]));
+}
+
+const noticesOf = (v) => (Array.isArray(v.notices) ? v.notices.filter((n) => isObject(n) && (str(n.message) || str(n.code))) : []);
+
+// What outlives a re-render: the stage details that are open, the show-more buttons that are expanded ("<stage>:<n>"),
+// Show raw, and the clamped texts a Show all has opened (P6-D: "match:<rank>", "published:<kind>"). ctx.ui keeps it per message
+// id; without a store the record lives and dies with the card.
+function uiOf(view, ctx) {
+  const store = ctx?.ui;
+  const fresh = () => ({ open: new Set(), more: new Set(), raw: false, reports: new Set() });
+  if (!store || typeof store.get !== 'function' || typeof store.set !== 'function') return fresh();
+  let record = store.get(view.id);
+  if (!record) {
+    record = fresh();
+    store.set(view.id, record);
+  }
+  return record;
+}
+
+// ---- the timeline -----------------------------------------------------------------------------------------------------
+
+// A stage with a detail is a disclosure: a <button aria-expanded aria-controls> inside its item carries the label and
+// opens the table, and Enter and Space come with the button. A stage without a detail is plain text: nothing to open,
+// so nothing to focus. The item keeps data-stage, data-state and .open for the stylesheet.
+// What a screen reader gets beyond the visible label is its `said` part, and the name is the label and then that
+// ("encode · 612 ms, done, turn 2"), so the visible text is the start of it (WCAG 2.5.3). A button carries it in its
+// aria-label; a plain item as text the eye does not see, because browse mode reads a list item's text, not its label.
+export function renderTimeline(view, ctx) {
+  const v = whole(view);
+  const cx = ctx ?? {};
+  const ui = uiOf(v, cx);
+  return el('ol', { class: 'timeline', role: 'list', 'aria-label': 'Pipeline stages' }, ...STAGES.map((s) => {
+    const st = stageState(v, s);
+    const state = typeof st.state === 'string' ? st.state : 'pending';
+    const ms = isNum(st.ms) ? Math.round(st.ms) : null;
+    const why = str(st.skipped);
+    // A stop is the user's own doing, so it is said on screen; every other skip reason is said to a screen reader only.
+    const label = state === 'done' ? (ms == null ? `${s} · done` : `${s} · ${ms} ms`)
+                : state === 'skipped' ? `${s} · skipped${why === 'stopped' ? ' (stopped)' : ''}` : s;
+    const said = state === 'done' ? (ms == null ? '' : ', done')   // the glyph is a shape, so the state is also said in words
+               : state === 'skipped' ? (why && why !== 'stopped' ? `: ${why}` : '') : `, ${state}`;
+    if (!(isObject(st.detail) && Object.keys(st.detail).length)) {
+      return el('li', { 'data-stage': s, 'data-state': state }, label, said ? el('span', { class: 'visually-hidden' }, said) : null);
+    }
+    const id = `detail-${str(v.id).replace(/[^\w-]/g, '_') || 'turn'}-${s}`;   // unique per message, and a usable id reference
+    const table = detailTable(st.detail, `${s} details`, { id, name: s, turn: turnOf(cx), more: ui.more });
+    const open = ui.open.has(s);
+    const toggle = el('button', {
+      type: 'button', 'data-action': 'stage', 'data-stage': s, 'aria-expanded': String(open), 'aria-controls': id,
+      'aria-label': named(`${label}${said}`, cx),
+    }, label);
+    const li = el('li', { 'data-stage': s, 'data-state': state, class: open ? 'open' : null }, toggle, table);
+    toggle.addEventListener('click', () => {
+      const now = li.classList.toggle('open');
+      toggle.setAttribute('aria-expanded', String(now));
+      if (now) ui.open.add(s); else ui.open.delete(s);
+    });
+    return li;
+  }));
+}
+
+// A stage's detail as a table: a row per key; an array of objects as a nested table with a row per object and a column
+// per key; an object as a table of its own; a long string clipped with "show more". label names the table. options:
+// { id } for the table (what a button's aria-controls names), { name } the stage, and { turn }, which together name each
+// show-more button so no two sound alike ("show more of retrieve report_matches 2 report, turn 3"). { more } is a Set the
+// table reads and writes the expanded strings to, as "<stage>:<n>" with n the string's number in this table in document
+// order (the n of focusKey's more:<stage>:<n>): the page keeps it across rebuilds. Without it a table starts clipped.
+export function detailTable(detail, label, options) {
+  const o = isObject(options) ? options : {};
+  const entries = isObject(detail) ? Object.entries(detail) : [];
+  const env = { turn: turnOf(o), stage: str(o.name), more: o.more instanceof Set ? o.more : null, count: 0 };
+  return el('table', { id: str(o.id) || null, 'aria-label': label },
+    el('tbody', {}, ...entries.map(([key, value]) => row(key, value, 1, env, str(o.name)))));
+}
+
+const row = (key, value, depth, env, parent) => el('tr', {},
+  el('th', { scope: 'row' }, key), el('td', {}, valueNode(value, depth, path(parent, key), env)));
+
+const numberText = (n) => (Number.isInteger(n) ? String(n) : Number.isFinite(n) ? String(Number(n.toPrecision(6))) : NONE);
+
+function valueNode(v, depth, name, env) {
+  if (v == null) return NONE;
+  if (typeof v === 'string') return v.length > CLIP ? clipped(v, name, env) : v;
+  if (typeof v === 'number') return numberText(v);
+  if (typeof v !== 'object') return String(v);
+  if (depth >= MAX_DEPTH) return valueNode(jsonText(v), depth, name, env);
+  if (Array.isArray(v)) return arrayNode(v, depth, name, env);
+  const entries = Object.entries(v);
+  if (!entries.length) return NONE;
+  return el('table', { class: 'nested' }, el('tbody', {}, ...entries.map(([key, value]) => row(key, value, depth + 1, env, name))));
+}
+
+function jsonText(v) {
+  try { return JSON.stringify(v); } catch { return NONE; }
+}
+
+function arrayNode(items, depth, name, env) {
+  if (!items.length) return NONE;
+  const inline = (x) => isPrimitive(x) && !(typeof x === 'string' && x.length > CLIP);
+  if (items.every(inline)) return items.map((x) => (x == null ? NONE : typeof x === 'number' ? numberText(x) : String(x))).join(', ');
+  if (items.every(isObject)) return recordsTable(items, depth, name, env);
+  return el('ol', { class: 'values' }, ...items.map((x, i) => el('li', {}, valueNode(x, depth + 1, path(name, i + 1), env))));
+}
+
+function recordsTable(items, depth, name, env) {
+  const columns = [...new Set(items.flatMap((item) => Object.keys(item)))];
+  if (!columns.length) return NONE;
+  return el('table', { class: 'nested' },
+    el('thead', {}, el('tr', {}, ...columns.map((c) => el('th', { scope: 'col' }, c)))),
+    el('tbody', {}, ...items.map((item, i) => el('tr', {}, ...columns.map(
+      (c) => el('td', {}, valueNode(Object.hasOwn(item, c) ? item[c] : undefined, depth + 1, path(name, i + 1, c), env)))))));
+}
+
+// The first CLIP characters and a button that shows the rest, and hides it again. name says which string it is. env.more,
+// when there is one, remembers that it is expanded: the next frame builds it expanded again.
+function clipped(text, name, env) {
+  let end = CLIP;
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;   // not between the halves of a surrogate pair
+  const head = `${text.slice(0, end)}…`;
+  const key = `${env.stage}:${env.count++}`;   // built in document order, so the nth call of a table is its nth show-more button
+  let open = !!env.more?.has(key);
+  const shown = el('span', { class: 'clip-text' }, open ? text : head);
+  const of = name ? ` of ${name}` : '';
+  const verb = () => (open ? 'show less' : 'show more');
+  const more = el('button', {
+    type: 'button', class: 'more', 'data-action': 'more', 'aria-expanded': String(open), 'aria-label': named(`${verb()}${of}`, env),
+  }, verb());
+  more.addEventListener('click', () => {
+    open = !open;
+    shown.textContent = open ? text : head;
+    more.textContent = verb();
+    more.setAttribute('aria-expanded', String(open));
+    more.setAttribute('aria-label', named(`${verb()}${of}`, env));
+    if (open) env.more?.add(key); else env.more?.delete(key);
+  });
+  return el('span', { class: 'clip' }, shown, ' ', more);
+}
+
+// ---- notes: warnings, a stop, an error ---------------------------------------------------------------------------------
+
+const errorText = (v) => `Error: ${str(v.error?.message) || 'the turn failed'}`;
+// The server says "Internal error (<class>)" for a failure it did not foresee, and only the class: never the exception's text, which can
+// hold report text and paths (a public server says a fixed sentence instead). A line under it says what to try (P4-H A3): the one such
+// error users have met is a server that ran on while its code changed on disk, which a restart cures.
+const INTERNAL_ERROR = /^Internal error \(/;
+const INTERNAL_ERROR_HINT = 'The server hit an internal error. If you just updated the code, restart the server.';
+
+export function renderNotes(view) {
+  const v = whole(view);
+  const notes = noticesOf(v).map((n) => el('p', { class: 'note notice', 'data-code': str(n.code) || null }, str(n.message) || str(n.code)));
+  if (v.error || v.status === 'error') {
+    notes.push(el('p', { class: 'note error' }, errorText(v)));
+    if (INTERNAL_ERROR.test(str(v.error?.message))) notes.push(el('p', { class: 'note error-hint' }, INTERNAL_ERROR_HINT));
+  } else if (v.status === 'aborted') {
+    notes.push(el('p', { class: 'note stopped' }, 'Turn stopped'));
+  }
+  return el('div', { class: 'notes', hidden: !notes.length }, ...notes);
+}
+
+// What the live region says: the stage that runs, then how the turn ended. Not set on the card itself: the page owns
+// the announcement (a polite status node that changes only when this text does).
+export function statusText(view) {
+  const v = whole(view);
+  if (v.error || v.status === 'error') return errorText(v);
+  if (v.status === 'aborted') return 'Turn stopped';
+  if (v.status === 'done') return v.report ? 'Report ready' : str(noticesOf(v).at(-1)?.message) || 'Turn finished';
+  const running = STAGES.find((s) => stageState(v, s).state === 'running');
+  if (running) return `${running} running`;
+  return v.lastSeq ? 'Working' : 'Queued';
+}
+
+// ---- the report --------------------------------------------------------------------------------------------------------
+
+const COPY_FAILED_MS = 2000;   // how long the Copy button says "Copy failed"
+
+// The text as sections: before the first header, then one per literal "Findings:" or "Impression:" in text order.
+export function splitReport(text) {
+  const parts = str(text).split(/(Findings:|Impression:)/);
+  const sections = [];
+  if (parts[0].trim()) sections.push({ title: null, body: parts[0].trim() });
+  for (let i = 1; i < parts.length; i += 2) sections.push({ title: parts[i].slice(0, -1), body: parts[i + 1].trim() });
+  return sections;
+}
+
+// Why the report ends where it does (P4-G, P9-G2), from the generate stage's detail ({stopped, tokens}) and the options the turn ran with:
+//   stopped on a repeat   a quiet note, and never the budget's: the turn chose to stop
+//   stopped on the model's own end of report (eos)   no note at all: the report ends where the model meant it to, so nothing was cut off
+//   the budget, with the display repair on and a sentence cut off   what the card hides, and where Show raw has it
+//   the budget, otherwise   the plain note (a repaired card hides the unfinished sentence, an unrepaired one shows it)
+// A log from before the stop reason was recorded has no `stopped`: it ran to the budget, as every report then did.
+function reportNote(v) {
+  const generate = isObject(v.stages.generate?.detail) ? v.stages.generate.detail : {};
+  const stopped = str(generate.stopped);
+  if (stopped === 'repeat') return el('p', { class: 'note', 'data-stopped': 'repeat' }, 'Stopped when the model began repeating itself.');
+  if (stopped === 'eos') return null;   // the engine never flags an EOS stop as cut off; whatever a server sent, no budget is to blame
+  if (!v.truncated) return null;
+  // The card hides something only if the repair left something out of it: with no complete sentence to cut back to, the repair keeps the
+  // text as it is, and the card shows all of it.
+  const hides = squeezed(v.displayReport) !== squeezed(v.report);
+  if (!(isObject(v.options) && v.options.display_repair === true && (stopped === 'budget' || stopped === '') && hides)) {
+    return el('p', { class: 'note truncated' }, 'Report stopped at the token budget mid-sentence');
+  }
+  const budget = isNum(generate.tokens) ? `${generate.tokens}-token budget` : 'token budget';
+  return el('p', { class: 'note truncated' }, `Reached the ${budget}; the unfinished last sentence is hidden (Show raw shows it).`);
+}
+
+// ---- the report card a person can read (P6-H) ----------------------------------------------------------------------------
+//
+// A finished report is drawn as a plain-language summary (made of its labels and the glossary only: never of its text), its sentences one to a
+// line, and what explains them: a note for each kind of mark on the card, and the terms. The text of a sentence is the display copy's own. What is
+// drawn on it is a [removed] for a run of underscores (the mark that the training reports hid text with, which the model copies), a ⚠ before a
+// sentence that refers to an earlier X-ray (the model never saw one), and a number after the first use of a term that the glossary explains.
+// A report that is still being written keeps the plain display, since its earlier text can still change. Show raw and Copy keep the text as it is.
+
+// Words that end in a full stop without ending a sentence. "No." is one only before a digit, and is dealt with where it stands (endsSentence).
+const ABBREVIATIONS = new Set(['dr', 'mr', 'mrs', 'ms', 'prof', 'st', 'vs', 'etc', 'cf', 'fig', 'approx', 'e.g', 'i.e', 'a.m', 'p.m']);
+
+// Does this word of a text end a sentence, given the word that follows it? It does when it ends in ? or !, and when it ends in a full stop that is
+// not an abbreviation's, a list number's ("1."), an initial's ("J."), the "No." of "No. 3", or an ellipsis on its own. A decimal ("1.5") is one word.
+function endsSentence(word, next) {
+  const closed = word.replace(/["')\]}]+$/, '');   // a quote or a bracket after the stop belongs to the sentence
+  if (!/[.?!]$/.test(closed)) return false;
+  if (!closed.endsWith('.')) return true;
+  const stem = closed.replace(/[.?!]+$/, '').replace(/^["'([{]+/, '').toLowerCase();   // "(e.g." -> "e.g", "1." -> "1", "___." -> "___", "..." -> ""
+  if (!stem || /^\d+$/.test(stem) || (stem.length === 1 && /[a-z]/.test(stem)) || ABBREVIATIONS.has(stem)) return false;
+  return !(stem === 'no' && /^\d/.test(next));
+}
+
+// A text as its sentences, each exactly as it was written (its own spacing too), without the space between two. A text with no full stop yet is
+// one sentence; a text that is not a string, or has no word, is none.
+export function splitSentences(text) {
+  const t = typeof text === 'string' ? text : '';
+  const words = [...t.matchAll(/\S+/g)];
+  const sentences = [];
+  let first = 0;
+  words.forEach((m, i) => {
+    if (!endsSentence(m[0], words[i + 1]?.[0] ?? '')) return;
+    sentences.push(t.slice(words[first].index, m.index + m[0].length));
+    first = i + 1;
+  });
+  if (first < words.length) sentences.push(t.slice(words[first].index, words.at(-1).index + words.at(-1)[0].length));
+  return sentences;
+}
+
+// The words that say a sentence is about an earlier X-ray, which the model never saw: what it writes there is the way reports are written, not
+// something it observed. A short list of words and phrases on purpose, so that a sentence is not flagged on a guess: "no pneumothorax", "no acute ...",
+// "new" and "increased opacity" with no word of time are not. "Again" counts only as the first word of a sentence. "Previously" always counts;
+// "prior" and "previous" only where they name a study ("the prior chest radiograph", "as on the previous one") or end a clause ("similar to
+// prior."): before any other word they are the patient's history ("prior surgery", "prior to intubation"), not a comparison.
+const STUDY_WORD = 'stud(?:y|ies)|exam(?:ination)?s?|radiographs?|films?|images?|imaging|x-?rays?|ct|comparison|one';
+const EARLIER_WORDS = ['compar(?:ed|ison)', 'previously',
+                       `(?:prior|previous)(?=\\s+(?:chest\\s+)?(?:${STUDY_WORD})\\b|\\s*(?:[.,;:)]|$))`,
+                       'since\\s+(?:the|prior)', 'interval', 'unchanged', 'stable',
+                       'no\\s+(?:significant\\s+)?change', 'little\\s+(?:overall\\s+)?change', 'persistent', 'persists', 're-?demonstrated',
+                       'as\\s+before', 'improved', 'improving', 'worsened', 'worsening', 'has\\s+(?:increased|decreased)'];
+const EARLIER = new RegExp(`\\b(?:${EARLIER_WORDS.join('|')})\\b|^\\s*again\\b`, 'i');
+export const refersToEarlier = (sentence) => typeof sentence === 'string' && EARLIER.test(sentence);
+
+// The glossary as the page looks words up in it: each way a row is said -> the index of its row (ROW_OF), and one pattern for all of them
+// (termPattern, from rows of { terms }). A term is text and not a pattern: its characters are escaped, so a "(" or a "+" in one is that character
+// and cannot stop the page at load. The longest is tried first, so that "lung opacity" is not "opacity", and "picc line" not "picc"; a space is
+// any run of white space; the match is on word boundaries and ignores case ("nodulectomy" holds the term "nodule" and is not one).
+const ROW_OF = new Map(GLOSSARY.flatMap((row, i) => row.terms.map((term) => [term, i])));
+export function termPattern(rows) {
+  const terms = rows.flatMap((row) => row.terms).sort((a, b) => b.length - a.length);
+  if (!terms.length) return /(?!)/gi;   // no word to find: a pattern that matches nothing, and not the empty text at every boundary
+  const escaped = terms.map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+'));   // a "(" or a "+" of a term is that character
+  return new RegExp(`\\b(?:${escaped.join('|')})\\b`, 'gi');
+}
+const TERM_PATTERN = termPattern(GLOSSARY);
+const spelled = (found) => found.toLowerCase().replace(/\s+/g, ' ');   // a match as the glossary spells it
+
+const NO_FINDING = 'The report mentions no abnormal finding.';
+const known = (value) => isOn(value) || value === 0 || value === false;
+const DEVICES = new Map(SUMMARY_LABELS).get('Support Devices');   // what the summary says of the devices
+
+// What the report says, in plain words, from its CheXbert labels and nothing else: each positive label as the words of SUMMARY_LABELS (a plain
+// phrase of the glossary and then its term), in their fixed order. No finding, or no positive label, is said as no abnormal finding; with
+// Support Devices positive as well, the devices are said after it: the labeller's No Finding stands beside them, and the chip shows them positive.
+// null when the labels name none of the 14 with a 1 or a 0: nothing is said that the labels do not say.
+export function summaryText(labels) {
+  if (!isObject(labels)) return null;
+  const given = (name) => Object.hasOwn(labels, name) && known(labels[name]);
+  if (![...SUMMARY_LABELS.map(([name]) => name), 'No Finding'].some(given)) return null;
+  const on = (name) => given(name) && isOn(labels[name]);
+  if (on('No Finding')) return on('Support Devices') ? `${NO_FINDING} It mentions: ${DEVICES}.` : NO_FINDING;
+  const positives = SUMMARY_LABELS.filter(([name]) => on(name)).map(([, phrase]) => phrase);
+  return positives.length ? `The report mentions: ${positives.join('; ')}.` : NO_FINDING;
+}
+
+const SUMMARY_TITLE = 'What this means (plain language)';
+const SUMMARY_NOTE = "A plain-language summary of the findings detected in the model's report. It is not a diagnosis.";
+const REMOVED = '[removed]';
+const REMOVED_NOTE = `${REMOVED} marks text the training reports hid for privacy, usually a date or a name. The model copies the pattern, so nothing is missing from your image.`;
+const EARLIER_NOTE = '⚠ marks a sentence that refers to an earlier X-ray. The model never saw one; it writes the way reports are written.';
+const EARLIER_LABEL = 'refers to an earlier X-ray';
+const EARLIER_HINT = 'This sentence refers to an earlier X-ray. The model never saw one.';
+const PLACEHOLDER = /_{3,}/g;
+
+// The box at the top of a finished report, with what it is under it. Left out while the report is still being written, while its labels are on
+// their way, and when there are none to say (a server with no labeller, a stage that was skipped): the card is then what it was.
+function summaryBox(v) {
+  const text = !v.provisional && isObject(v.labels) ? summaryText(v.labels) : null;
+  if (!text) return null;
+  return el('div', { class: 'report-summary' },
+    el('div', { class: 'summary-box' }, el('h3', {}, SUMMARY_TITLE), el('p', {}, text)),
+    el('p', { class: 'summary-note' }, SUMMARY_NOTE));
+}
+
+// A sentence as nodes: its own text, with a small [removed] where it has a run of underscores and a numbered term where it has one that has no
+// number yet. `used` is the report's own account, kept across its sentences: the number of each row of the glossary used (by its index, so that
+// "effusion" and "pleural effusion" are one term, numbered once, at its first use) and the terms in the order of their numbers.
+function sentenceNodes(sentence, used) {
+  const marks = [];   // what replaces a stretch of the sentence: { at, to, node }
+  for (const run of sentence.matchAll(PLACEHOLDER)) marks.push({ at: run.index, to: run.index + run[0].length, node: el('span', { class: 'removed' }, REMOVED) });
+  const masked = sentence.replace(PLACEHOLDER, (run) => '#'.repeat(run.length));   // no term reaches into a placeholder, or across one
+  for (const found of masked.matchAll(TERM_PATTERN)) {
+    const name = spelled(found[0]);
+    const row = ROW_OF.get(name);
+    if (used.numbers.has(row)) continue;   // it was numbered where it was first used
+    const n = used.numbers.size + 1;
+    used.numbers.set(row, n);
+    used.terms.push({ name, explanation: GLOSSARY[row].explanation });
+    marks.push({ at: found.index, to: found.index + found[0].length,
+                 node: el('span', { class: 'term', title: `${n}: ${GLOSSARY[row].explanation}` }, found[0], el('sup', {}, String(n))) });
+  }
+  marks.sort((a, b) => a.at - b.at);
+  const nodes = [];
+  let from = 0;
+  for (const mark of marks) {
+    if (mark.at > from) nodes.push(sentence.slice(from, mark.at));
+    nodes.push(mark.node);
+    from = mark.to;
+  }
+  if (from < sentence.length) nodes.push(sentence.slice(from));
+  return nodes;
+}
+
+// One sentence of the card: a line of the list. One that refers to an earlier X-ray has a ⚠ before it and is muted (styles.css); the ⚠ is a shape
+// that is also said in words.
+function sentenceItem(sentence, used) {
+  const earlier = refersToEarlier(sentence);
+  const flag = earlier ? el('span', { class: 'flag', role: 'img', 'aria-label': EARLIER_LABEL, title: EARLIER_HINT }, '⚠') : null;
+  return el('li', { class: earlier ? 'earlier' : null }, flag, ...sentenceNodes(sentence, used));
+}
+
+// The terms of the card, once each, in the order of their numbers in the text: the numbers are the ones an ordered list gives its lines.
+function termsBlock(terms) {
+  return el('div', { class: 'report-terms' }, el('h3', {}, 'Terms'),
+    el('ol', { class: 'term-list' }, ...terms.map(({ name, explanation }) => el('li', {}, `${name}: ${explanation}`))));
+}
+
+// A finished report as the card draws it: -> { body: the sections, each a heading and a list of its sentences, extras: [the notes for the marks
+// that are on the card, then the terms] }. Nothing that is not on the card is explained: a note only where its mark is, the terms only if there are some.
+function structuredReport(text) {
+  const used = { numbers: new Map(), terms: [] };
+  let removed = false;
+  let earlier = false;
+  const sections = splitReport(text).map(({ title, body }) => {
+    const sentences = splitSentences(body);
+    removed = removed || sentences.some((s) => s.includes('___'));   // a run of three or more underscores holds three
+    earlier = earlier || sentences.some(refersToEarlier);
+    const items = sentences.map((s) => sentenceItem(s, used));
+    return el('section', { class: 'report-section' }, title ? el('h3', {}, title) : null, items.length ? el('ul', { class: 'report-list' }, ...items) : null);
+  });
+  const extras = [
+    removed ? el('p', { class: 'report-key', 'data-note': 'removed' }, REMOVED_NOTE) : null,
+    earlier ? el('p', { class: 'report-key', 'data-note': 'earlier' }, EARLIER_NOTE) : null,
+    used.terms.length ? termsBlock(used.terms) : null,
+  ].filter(Boolean);
+  return { body: el('div', { class: 'report-body' }, ...sections), extras };
+}
+
+// The plain display: each section's text as one paragraph, as the card showed every report before P6-H, and still shows one that is being written.
+const plainBody = (text) => el('div', { class: 'report-body' }, ...splitReport(text).map(({ title, body }) => el('section', { class: 'report-section' },
+  title ? el('h3', {}, title) : null, body ? el('p', {}, body) : null)));
+
+export function renderReport(view, ctx) {
+  const v = whole(view);
+  const cx = ctx ?? {};
+  const ui = uiOf(v, cx);
+  const raw = str(v.report) || str(v.displayReport);
+  const shown = str(v.displayReport) || raw;   // the stream has only the raw snapshot until message_stop brings the copy
+  if (!raw) return el('div', { class: 'report', hidden: true });
+  const drawn = v.provisional ? null : structuredReport(shown);   // a report still being written keeps the plain display
+  const bodyOf = () => (ui.raw ? el('pre', { class: 'report-raw' }, raw) : drawn ? drawn.body : plainBody(shown));
+  const explained = () => (drawn && !ui.raw ? drawn.extras : []);   // the notes and the terms explain the drawn text, which Show raw replaces
+  let body = bodyOf();
+  const extras = drawn && drawn.extras.length ? el('div', { class: 'report-extras', hidden: ui.raw }, ...explained()) : null;
+  const toggle = el('button', { type: 'button', 'data-action': 'raw', 'data-key': keyOf(cx), 'aria-pressed': String(ui.raw),
+                                'aria-label': named(reportOf('Show raw report', cx), cx) }, 'Show raw');
+  toggle.addEventListener('click', () => {
+    ui.raw = !ui.raw;
+    toggle.setAttribute('aria-pressed', String(ui.raw));
+    const next = bodyOf();
+    body.replaceWith(next);
+    body = next;
+    if (extras) {
+      extras.hidden = ui.raw;
+      extras.replaceChildren(...explained());
+    }
+  });
+  return el('div', { class: v.provisional ? 'report provisional' : 'report' },
+    summaryBox(v),
+    body,
+    reportNote(v),
+    extras,
+    el('div', { class: 'report-actions' }, typeof cx.copy === 'function' && !v.provisional ? copyButton(cx, () => (ui.raw ? raw : shown)) : null, toggle));
+}
+
+// Copy hands ctx.copy the text. A copy that throws or whose promise is rejected (a refused clipboard) must not pass
+// unnoticed: the button says "Copy failed" for a moment, and the failure is not left as an unhandled rejection. That state
+// lives on the button, and a streaming turn rebuilds the card every frame, so the button is not offered while the report is
+// provisional (the best beam so far, not the report); it appears when the block closes.
+function copyButton(cx, textNow) {
+  const idle = () => { copy.textContent = 'Copy'; copy.setAttribute('aria-label', named(reportOf('Copy report', cx), cx)); };
+  const failed = () => {
+    copy.textContent = 'Copy failed';   // a column's names the model, as its idle label does (P9-F fix 1)
+    copy.setAttribute('aria-label', named(typeof cx.of === 'string' && cx.of ? reportOf('Copy failed for the report', cx) : 'Copy failed', cx));
+    setTimeout(idle, COPY_FAILED_MS);
+  };
+  const copy = el('button', { type: 'button', 'data-action': 'copy', 'data-key': keyOf(cx), 'aria-label': named(reportOf('Copy report', cx), cx) }, 'Copy');
+  copy.addEventListener('click', () => {
+    try {
+      const done = cx.copy(textNow());
+      if (done && typeof done.then === 'function') done.then(undefined, failed);
+    } catch {
+      failed();
+    }
+  });
+  return copy;
+}
+
+// ---- labels and scores -------------------------------------------------------------------------------------------------
+
+const isOn = (x) => x === 1 || x === true;   // a label is 1 or 0
+
+const CHIP_CLASS = { positive: 'chip label positive', negative: 'chip label negative', unknown: 'chip label unknown' };
+const CHIP_SPOKEN = { positive: 'positive', negative: 'negative', unknown: 'not reported' };
+// What each number is, as the thesis scores it for one report: ROUGE-L is the sentence-level F-measure (beta 1.2) of
+// scripts/evaluate_report_generation.py, BLEU-n is its corpus formula applied to this one pair, and the CheXbert F1 is
+// micro-averaged over the 14 labels of this report (the corpus-level tables average over many).
+const SCORES = [['ROUGE-L', 'rouge_l'], ['BLEU-1', 'bleu_1'], ['BLEU-4', 'bleu_4'], ['CheXbert-14 micro F1', 'chexbert_14_micro_f1']];
+const REFERENCES = { user: 'your reference', test_split: 'test-split reference' };
+
+// What the chips say once the label stage has ended skipped (P5-E), so the placeholder never outlives the stage: the user's own
+// setting is "labels off" whatever else is true, and any other reason is named.
+function skippedLabels(why, off) {
+  if (off || why === 'label_off') return 'labels off';
+  return `labels unavailable${why ? ` (${why})` : ''}`;
+}
+
+// Said under the chips while the gallery's own labels are still being built (the label detail's neighbor_agreement_pending): the
+// report is labelled, but no similar X-ray has labels to agree with yet. The agreement itself is private (R1): public mode shows none,
+// so it does not say that one is pending either (P6-C ruling).
+const AGREEMENT_PENDING = 'agreement pending: the gallery is still being labelled';
+
+export function renderLabels(view, ctx) {
+  const v = whole(view);
+  const cx = ctx ?? {};
+  const note = (text) => el('p', { class: 'note' }, text);
+  const off = isObject(v.options) && v.options.label === false;   // the user's own setting: said as that, never as "unavailable"
+  let body = null;
+  let pending = null;
+  let marked = false;
+  if (isObject(v.labels)) {
+    ({ node: body, marked } = chipList(v, cx));
+    if (v.mode !== 'public' && isObject(v.stages.label?.detail) && v.stages.label.detail.neighbor_agreement_pending === true) {
+      pending = note(AGREEMENT_PENDING);
+    }
+  } else if (labelsPending(v) && (off || cx.labels !== false)) {
+    body = note(off ? 'labels off' : 'labelling…');   // off: say so now, not at the end; a server with no labeller has nothing coming
+  } else {
+    const st = stageState(v, 'label');   // a stop or an error settles it; a settled turn that never got here shows nothing
+    const why = str(st.skipped);
+    if (st.state === 'skipped') body = note(skippedLabels(why, off));
+    else if (st.state === 'error') body = note('labels unavailable (error)');
+    else if (st.state === 'done') body = note('labels unavailable');
+  }
+  const score = isObject(v.score) ? scoreBlock(v.score, marked) : null;
+  return el('div', { class: 'labels', hidden: !body && !score }, body, pending, score);
+}
+
+// A chip per name, in the order of ctx.labelNames (a label the list lacks follows, so none is dropped). A chip is
+// positive, negative, or unknown when the labels do not carry its name, and shows whether it agrees with the reference
+// once the score carries the reference's labels (score.reference_chexbert_14, {name: 0|1}).
+function chipList(v, cx) {
+  const labels = v.labels;
+  const given = Array.isArray(cx.labelNames) ? cx.labelNames.filter((n) => typeof n === 'string') : [];
+  const names = [...given, ...Object.keys(labels).filter((n) => !given.includes(n))];
+  const reference = isObject(v.score) && isObject(v.score.reference_chexbert_14) ? v.score.reference_chexbert_14 : null;
+  let marked = false;
+  const chips = names.map((name) => {
+    const value = Object.hasOwn(labels, name) ? labels[name] : null;
+    const kind = value == null ? 'unknown' : isOn(value) ? 'positive' : 'negative';
+    const known = reference && kind !== 'unknown' && Object.hasOwn(reference, name) && reference[name] != null;
+    const agrees = known ? isOn(reference[name]) === (kind === 'positive') : null;
+    if (agrees !== null) marked = true;
+    // The state is text inside the chip, hidden from the eye: a screen reader in browse mode reads the text of a list
+    // item and not its aria-label, so a label there would never be heard.
+    const spoken = `: ${CHIP_SPOKEN[kind]}${agrees === null ? '' : agrees ? ', matches reference' : ', differs from reference'}`;
+    return el('li', {
+      class: CHIP_CLASS[kind], 'data-label': name, 'data-value': kind === 'unknown' ? null : kind === 'positive' ? '1' : '0',
+      'data-agree': agrees === null ? null : String(agrees),
+    }, name, el('span', { class: 'visually-hidden' }, spoken),
+    agrees === null ? null : el('span', { class: 'mark', 'aria-hidden': 'true' }, agrees ? '✓' : '✗'));
+  });
+  const whose = typeof cx.of === 'string' && cx.of ? `the ${cx.of} report` : 'the generated report';   // a compare card's column names its model (P9-F)
+  return { node: el('ul', { class: 'label-chips', role: 'list', 'aria-label': `CheXbert-14 labels of ${whose}` }, ...chips), marked };
+}
+
+function scoreBlock(score, marked) {
+  const entries = SCORES.filter(([, key]) => isNum(score[key])).map(([name, key]) => [name, score[key].toFixed(3)]);
+  if (typeof score.exact_match_14 === 'boolean') entries.push(['CheXbert-14 exact match', score.exact_match_14 ? 'yes' : 'no']);
+  if (!entries.length) return null;
+  const source = typeof score.reference_source === 'string'
+    ? (Object.hasOwn(REFERENCES, score.reference_source) ? REFERENCES[score.reference_source] : score.reference_source) : null;
+  const caption = [source ? `vs ${source}` : null, 'this report only', marked ? '✓ same as the reference, ✗ different' : null]
+    .filter(Boolean).join(' · ');
+  return el('div', { class: 'score-block' },
+    el('dl', { class: 'score' }, ...entries.map(([name, value]) => el('div', {}, el('dt', {}, name), el('dd', {}, value)))),
+    caption ? el('p', { class: 'score-source' }, caption) : null);
+}
+
+// ---- provenance ----------------------------------------------------------------------------------------------------------
+
+// model · ckpt <first 8 of sha256> · scan <impl>/tfla <impl> · prefix_k <k> · beam <n> · <tokens> tok · <total> ms · <device>
+// A part the card does not have is left out. What ran (the generate detail) wins over what was asked (the options).
+export function provenanceText(view) {
+  const v = whole(view);
+  const card = isObject(v.provenance) ? v.provenance : {};
+  const generate = isObject(v.stages.generate?.detail) ? v.stages.generate.detail : {};
+  const options = isObject(v.options) ? v.options : {};
+  const decode = [generate.decode, options.decode].find((d) => typeof d === 'string');   // what ran, else what was asked
+  return [
+    said('', card.name),
+    said('ckpt ', str(card.checkpoint_sha256).slice(0, 8)),
+    [said('scan ', card.scan_impl), said('tfla ', card.tfla_impl)].filter(Boolean).join('/') || null,
+    said('prefix_k ', card.prefix_k),
+    decode === 'greedy' ? 'greedy' : said('beam ', generate.beam_size) ?? said('beam ', options.beam_size),
+    said('', generate.tokens, ' tok'),
+    isNum(v.totalMs) ? `${Math.round(v.totalMs)} ms` : null,
+    said('', card.device) ?? said('', generate.device),
+  ].filter(Boolean).join(' · ');
+}
+
+export function renderProvenance(view, ctx) {
+  const v = whole(view);
+  const cx = ctx ?? {};
+  const card = isObject(v.provenance) ? v.provenance : {};
+  const generate = isObject(v.stages.generate?.detail) ? v.stages.generate.detail : {};
+  const text = provenanceText(v);
+  const drift = str(card.drift_note) || str(generate.drift_note);
+  // A button, not an anchor: a link to a hash would change the page's route.
+  const link = (text || drift) && typeof cx.showModels === 'function'
+    ? el('button', { type: 'button', 'data-action': 'models', 'aria-label': named('model details', cx), onclick: () => cx.showModels() }, 'model details') : null;
+  return el('footer', { class: 'provenance', hidden: !text && !drift },
+    text || link ? el('p', {}, text, text && link ? ' · ' : null, link) : null,
+    drift ? el('p', { class: 'drift' }, drift) : null);
+}
+
+// ---- the user turn -----------------------------------------------------------------------------------------------------
+
+const IMAGE_URL = /^(?:blob:|data:image\/(?:png|jpeg|webp|gif);base64,)/;
+const usable = (url) => typeof url === 'string' && IMAGE_URL.test(url);
+
+// What the chip of the stop switch says (P9-G5b). With the switch on the page says nothing: that is what it does. Off is "full budget", the
+// published protocol, which always decodes every token it is given. A model trained to end its reports (its card says eos_trained) ends
+// at its own end of report whatever the switch says, so "full budget" is wrong for a report that ended there: the chip is then the stop
+// reason, "ended the report". It stays "full budget" for such a model's report that did reach the budget, and says nothing for a turn
+// that has not ended yet (or has not run: the composer's chips), since the model may well end it. outcome = { stopped, eosTrained }: the
+// `stopped` of the generate stage ('eos', 'budget' or 'repeat'; '' while the turn runs) and the model card's eos_trained. A turn whose
+// options do not say (a log from before the switch) makes no claim.
+function stopChip(o, outcome) {
+  if (o.stop_on_repeat !== false) return null;
+  const { stopped, eosTrained } = isObject(outcome) ? outcome : {};
+  if (stopped === 'eos') return 'ended the report';
+  if (stopped === 'repeat') return null;   // the switch was off, so the server did not stop it there; it is no budget either way
+  if (eosTrained === true && stopped !== 'budget') return null;
+  return 'full budget';
+}
+
+// The resolved options as small chips: beam 3 · 100 tok · cached · k 4/3, and what else deviates from the defaults. Display repair is
+// on by default in the page, so only its being off is said: "raw text", the report as the decoder wrote it. So is stopping when the
+// report starts repeating (stopChip, which takes the outcome of the turn when it has one). "compare": a second model decodes the X-ray too (P9-F).
+export function optionChips(options, outcome) {
+  if (!isObject(options)) return [];
+  const o = options;
+  return [
+    o.decode === 'greedy' ? 'greedy' : said('beam ', o.beam_size),
+    said('', o.max_new_tokens, ' tok'),
+    o.cached_decode === true ? 'cached' : o.cached_decode === false ? 'uncached' : null,
+    str(o.k_images) || str(o.k_reports) ? `k ${str(o.k_images) || NONE}/${str(o.k_reports) || NONE}` : null,
+    o.label === false ? 'labels off' : null,
+    o.display_repair === false ? 'raw text' : null,
+    stopChip(o, outcome),
+    o.compile === true ? 'compiled' : null,
+    o.compare === true ? 'compare' : null,
+    typeof o.reference === 'string' && o.reference ? 'reference' : null,
+    Number.isInteger(o.test_row) ? `test row ${o.test_row}` : null,
+  ].filter(Boolean);
+}
+
+// Can this path be fetched with the token? A path on this page's own origin (api.js's filter: the token goes nowhere else), and a loader.
+const fetchable = (path, cx) => isSameOriginPath(path) && typeof cx.loadImage === 'function';
+
+// An <img> whose picture comes through ctx.loadImage, because an <img src> cannot carry the bearer token (D23). It has no source until the
+// load resolves, then its object URL, or data-failed when the load fails. data-src keeps the server path it shows, so that the page (and a
+// check of it) can tell whose picture it is.
+function loadedImage(path, cx, attrs) {
+  const img = el('img', { ...attrs, 'data-src': path });
+  Promise.resolve().then(() => cx.loadImage(path)).then(
+    (url) => { if (usable(url)) img.setAttribute('src', url); },
+    () => img.setAttribute('data-failed', ''));
+  return img;
+}
+
+// msg = { text, image: { url, filename, source? }, options, outcome? }. image.url is either a URL the page can show as it is (the local
+// preview: a blob: or data: image) or a path on the server ("/v1/..."), which ctx.loadImage fetches with the token. source
+// 'test_split' marks a test study's picture (P6-D), which no one uploaded. outcome = { stopped, eosTrained } is what optionChips takes
+// of how the turn went (P9-G5b): the page gives it once it knows, and a message with none is drawn as it always was.
+export function renderUserTurn(msg, ctx) {
+  const m = isObject(msg) ? msg : {};
+  const cx = ctx ?? {};
+  const text = str(m.text).trim();
+  const chips = optionChips(cx.retrieval === false && isObject(m.options) ? { ...m.options, k_images: null, k_reports: null } : m.options, m.outcome);
+  const picture = isObject(m.image) ? thumbnail(m.image, cx) : null;
+  return el('article', { class: 'turn user', 'aria-label': named('Your message', cx), hidden: !picture && !text && !chips.length },
+    el('div', { class: 'bubble' }, picture, text ? el('p', { class: 'user-text' }, text) : null,
+      chips.length ? el('ul', { class: 'options', role: 'list', 'aria-label': 'Settings used' }, ...chips.map((c) => el('li', { class: 'chip' }, c))) : null));
+}
+
+function thumbnail(image, cx) {
+  const name = str(image.filename);
+  const shown = usable(image.url);
+  if (!shown && !fetchable(image.url, cx)) return name ? el('span', { class: 'chip' }, name) : null;
+  const alt = image.source === 'test_split' ? 'Test-split X-ray' : name ? `Uploaded X-ray: ${name}` : 'Uploaded X-ray';
+  const img = shown ? el('img', { class: 'thumb', alt, src: image.url }) : loadedImage(image.url, cx, { class: 'thumb', alt });
+  if (typeof cx.openViewer !== 'function') return img;
+  return el('button', { type: 'button', class: 'thumb-button', 'aria-label': named('Open X-ray in the viewer', cx),
+                        onclick: (event) => cx.openViewer(image, event.currentTarget) }, img);   // the opener: where the focus goes back to, as for the card's pictures (P6-G)
+}
+
+// ---- pictures of the card ------------------------------------------------------------------------------------------------
+
+// A picture of the card, fetched through ctx.loadImage: with ctx.openViewer, a button named `open` that hands the viewer `spec`; without
+// it, the picture alone. key names the button for focusKey whatever comes before it in the card. null when the path cannot be fetched (no
+// loader, or not a path on this origin), so nothing is drawn for it.
+function cardPicture(path, alt, open, spec, cx, key) {
+  if (!fetchable(path, cx)) return null;
+  const img = loadedImage(path, cx, { class: 'picture', alt });
+  if (typeof cx.openViewer !== 'function') return img;
+  return el('button', { type: 'button', class: 'picture-button', 'data-action': 'view', 'data-key': key, 'aria-label': named(open, cx),
+                        onclick: (event) => cx.openViewer(spec, event.currentTarget) }, img);   // the opener: where the focus goes back to
+}
+
+// ---- the images row: the turn's own X-ray and what the model saw (P6-B) ---------------------------------------------------
+
+const MODEL_SAW = 'What the model saw (224×224)';
+const GALLERY_NOTE = '(stored gallery size)';   // what the viewer's footer says after a gallery or test-split picture's size: a 320 px JPEG
+const THUMB_NOTE = '(thumbnail)';               // and after the size of a thumbnail it was given for the turn's X-ray, which is not the picture itself
+const xrayName = (study) => (study ? 'Test-split X-ray' : 'Your X-ray');
+
+// The turn's own X-ray: its image URLs, whether it is a test study's, its name, its label ("Your X-ray · 2544×3056 px"), the path the
+// viewer is given, its original where the mode sends one (public mode sends none, app/redact.py), else its thumbnail, and that path as a
+// side of viewer.js (P6-E): the viewer's footer has the pixel size of what it loaded, so the label is a name; a thumbnail says so; and the
+// original, which no card shows, is transient (the viewer lets go of it when it closes).
+function ownXray(v, cx) {
+  const image = isObject(v.image) ? v.image : {};
+  const urls = isObject(image.urls) ? image.urls : {};
+  const study = image.source === 'test_split';
+  const name = xrayName(study);
+  const size = pixelSize(v);
+  const original = fetchable(urls.original, cx);
+  const full = original ? urls.original : urls.thumb;
+  const note = study ? GALLERY_NOTE : original ? '' : THUMB_NOTE;
+  return { urls, study, name, label: size ? `${name} · ${size}` : name, full, side: { url: full, label: name, note, transient: original } };
+}
+
+// The side viewer.js is given for the turn's own X-ray from either of its two pictures: the card's "Your X-ray" tile and the thumbnail in the user's own
+// message (P6-G). Once the server has said what it holds for the turn (message_start's urls) it is the tile's side whichever was clicked: the
+// original where the mode sends one, else the thumbnail, a test study at its stored size. With no card to say (a live turn before message_start, or
+// a log whose message_start names no picture this page may fetch) it is what the thumbnail itself shows: the page's own preview of the file as it
+// was attached (no note, and nothing for the viewer to let go of: the page made it), else the server's thumbnail, marked as such. view is the
+// turn's assistant view when it has one, image what renderUserTurn was given. null when there is nothing to show: no image, a URL this page may
+// neither show nor fetch with the token, or a server path and no loader.
+export function ownXraySide(view, image, ctx) {
+  const cx = ctx ?? {};
+  const own = ownXray(whole(view), cx);
+  if (fetchable(own.full, cx)) return own.side;
+  const shown = isObject(image) ? image : {};
+  const preview = usable(shown.url);
+  if (!preview && !fetchable(shown.url, cx)) return null;
+  const study = shown.source === 'test_split';
+  return { url: shown.url, label: xrayName(study), note: study ? GALLERY_NOTE : preview ? '' : THUMB_NOTE, transient: false };
+}
+
+// "2544×3056 px", the size preprocess read (after the EXIF orientation), from its detail; '' when it has none to read.
+function pixelSize(v) {
+  const px = isObject(v.stages.preprocess?.detail) ? v.stages.preprocess.detail.input_px : null;
+  return Array.isArray(px) && px.length === 2 && px.every((n) => Number.isInteger(n) && n > 0) ? `${px[0]}×${px[1]} px` : '';
+}
+
+const tile = (shown, caption) => (shown ? el('figure', { class: 'image-tile' }, shown, el('figcaption', {}, caption)) : null);
+
+// The X-ray of the turn (its thumbnail, labelled with the size preprocess read) and the 224×224 image the tower saw, side by side: a crop
+// or an aspect the resize changed is visible there. Both come from message_start.image.urls, served by GET /v1/messages/{id}/image. Public
+// mode sends no original (app/redact.py), so the viewer is then given the thumbnail. Hidden when there is nothing to fetch: no loader, a turn
+// with no image (a question), or no path on this origin.
+export function renderImages(view, ctx) {
+  const v = whole(view);
+  const cx = ctx ?? {};
+  const own = ownXray(v, cx);
+  const tiles = [
+    tile(cardPicture(own.urls.thumb, own.name, own.study ? 'Open the test-split X-ray in the viewer' : 'Open your X-ray in the viewer',
+                     { left: own.side }, cx, 'image:thumb'), own.label),
+    tile(cardPicture(own.urls.model_input, 'What the model saw', 'Open what the model saw in the viewer',
+                     { left: { url: own.urls.model_input, label: 'What the model saw', note: '', transient: false } }, cx, 'image:model_input'),
+         MODEL_SAW),
+  ].filter(Boolean);
+  return el('section', { class: 'images', 'aria-label': named('Images', cx), hidden: !tiles.length },
+    el('h3', { class: 'section-title' }, 'Images'), el('div', { class: 'image-row' }, ...tiles));
+}
+
+// ---- similar X-rays: the gallery's nearest training images, and how many labels each shares with the report (P6-C) --------
+
+// "#3 · 0.913": a retrieval list's rank and similarity, what public mode keeps of them (U2). A part it lacks is left out.
+const scoreText = (rank, similarity) => [Number.isInteger(rank) ? `#${rank}` : null, isNum(similarity) ? similarity.toFixed(3) : null]
+  .filter(Boolean).join(' · ');
+
+// A bar as long as a similarity, held to 0..1. The number beside it is what is said; the bar only draws it.
+function simBar(similarity) {
+  const pct = Math.round(Math.min(1, Math.max(0, similarity)) * 100);
+  return el('span', { class: 'sim-bar', 'aria-hidden': 'true' }, el('span', { class: 'sim-fill', style: `width: ${pct}%` }));
+}
+
+// The gallery row the turn's own upload is, byte for byte (preprocess's identical_to, private mode), or null.
+function identicalRow(v) {
+  const to = isObject(v.stages.preprocess?.detail) ? v.stages.preprocess.detail.identical_to : null;
+  return isObject(to) && to.split === 'train' && Number.isInteger(to.row) ? to.row : null;
+}
+
+// What a similar X-ray's labels say against the report's, where the neighbour carries labels (private mode): "n/14 labels agree" once the
+// label stage has ended, with a chip for each positive only one side has ("neighbour: Edema", "report: Cardiomegaly"); "labels…" while
+// they are on their way; else why there are none. A neighbour without labels (public mode) says nothing about them. -> nodes, maybe none.
+function agreementOf(n, v, cx) {
+  if (!Object.hasOwn(n, 'labels')) return [];
+  const line = (text) => [el('p', { class: 'agreement note' }, text)];
+  if (n.labels === null) return line('labels pending');   // the gallery's own labels are still being built
+  const found = Array.isArray(v.agreement) ? v.agreement.find((a) => isObject(a) && a.rank === n.rank) : null;
+  if (found && Number.isInteger(found.agree) && Number.isInteger(found.of)) {
+    const names = (list) => (Array.isArray(list) ? list.filter((x) => typeof x === 'string') : []);
+    const chips = [...names(found.neighbor_only).map((x) => `neighbour: ${x}`), ...names(found.generated_only).map((x) => `report: ${x}`)];
+    const of = Number.isInteger(n.rank) ? `, similar X-ray #${n.rank}` : '';
+    return [el('p', { class: 'agreement' }, `${found.agree}/${found.of} labels agree`),
+      chips.length ? el('ul', { class: 'diff-chips', role: 'list', 'aria-label': `Labels that differ${of}` },
+        ...chips.map((chip) => el('li', { class: 'chip diff' }, chip))) : null];
+  }
+  const off = (isObject(v.options) && v.options.label === false) || stageState(v, 'label').skipped === 'label_off';
+  if (off) return line('labels off');   // the user's own setting, as the chips say it
+  return line(labelsPending(v, cx.labels) ? 'labels…' : 'labels unavailable');
+}
+
+function neighbourItem(n, i, v, cx, { pub, own, left, identical }) {
+  const rank = Number.isInteger(n.rank) ? n.rank : null;
+  const name = rank === null ? 'Similar X-ray' : `Similar X-ray #${rank}`;
+  const path = pub ? '' : str(n.image_url);   // public mode: never a gallery image, whatever the detail holds (R1)
+  const spoken = `${name.charAt(0).toLowerCase()}${name.slice(1)}`;
+  const open = left ? `Open ${spoken} beside ${own.study ? 'the test-split X-ray' : 'your X-ray'} in the viewer` : `Open ${spoken} in the viewer`;
+  const side = { url: path, label: name, note: GALLERY_NOTE, transient: false };   // a card shows it: the viewer leaves it in the page's cache
+  const spec = left ? { left, right: side } : { left: side };
+  const picture = (path && cardPicture(path, name, open, spec, cx, `neighbor:${rank ?? i}`))
+    || el('div', { class: 'neighbor-placeholder', 'aria-hidden': 'true' });
+  return el('li', { class: 'neighbor', 'data-rank': rank },
+    el('figure', {}, picture, el('figcaption', {},
+      el('span', { class: 'neighbor-score' }, scoreText(n.rank, n.similarity)),
+      isNum(n.similarity) ? simBar(n.similarity) : null,
+      !pub && identical !== null && n.gallery_row === identical ? el('span', { class: 'badge identical' }, 'identical to your upload') : null,
+      ...(pub ? [] : agreementOf(n, v, cx)))));
+}
+
+// The k_images training X-rays the tower finds most like this one (image to image, the 13D tower): each with its stored picture, fetched
+// through ctx.loadImage, "#rank · similarity" and a bar, and how many labels it shares with the report. Public mode keeps rank and
+// similarity only (U2): a neutral box stands where the picture would be, and no gallery image is ever asked for. With ctx.openViewer a
+// picture opens beside the turn's own X-ray. Hidden until the retrieve stage has ended with neighbours.
+export function renderNeighbors(view, ctx) {
+  const v = whole(view);
+  const cx = ctx ?? {};
+  const done = stageState(v, 'retrieve').state === 'done';
+  const neighbours = done && Array.isArray(v.neighbors) ? v.neighbors.filter(isObject) : [];
+  const pub = v.mode === 'public';
+  const own = ownXray(v, cx);
+  const left = fetchable(own.full, cx) ? own.side : null;   // the turn's own X-ray, on the left of the viewer
+  const items = neighbours.map((n, i) => neighbourItem(n, i, v, cx, { pub, own, left, identical: identicalRow(v) }));
+  return el('section', { class: 'neighbors', 'aria-label': named('Similar X-rays', cx), hidden: !items.length },
+    el('h3', { class: 'section-title' }, 'Similar X-rays (13D tower)'),
+    pub ? el('p', { class: 'note section-note' }, 'Public mode shows rank and similarity only.') : null,
+    el('ol', { class: 'neighbor-grid', role: 'list' }, ...items));
+}
+
+// ---- clamped texts: a matching report, a published line (P6-D) ------------------------------------------------------------
+
+// A report as a paragraph clamped to three lines (styles.css), with a Show all that opens it and a Show less that closes it again. Whether
+// the three lines hide anything depends on the width the text is drawn at, so the button's row starts hidden and the page shows it once the
+// card is in it and the text is measured (settleClamps, P6 fix 1). ui.reports keeps the open ones by key, so the next frame builds them open,
+// and an open report keeps its Show less. A report closed again is measured as it closes (P6-A g): the page may have grown wider while it
+// was open, and three lines may hold it all now, so no Show all is left that would reveal nothing; the focus its button had goes to the
+// report itself, which can take it (tabindex -1: never a stop of Tab) and is found again by its key in the next frame's card (P6 fix 1).
+// key also names the button for focusKey. -> nodes.
+function clampedText(text, key, name, v, cx) {
+  const ui = uiOf(v, cx);
+  if (!(ui.reports instanceof Set)) ui.reports = new Set();   // a record made before the field existed
+  let open = ui.reports.has(key);
+  const id = `clamp-${str(v.id).replace(/[^\w-]/g, '_') || 'turn'}-${key.replace(/[^\w-]/g, '_')}`;
+  const body = el('p', { class: open ? 'clamp-text clamped open' : 'clamp-text clamped', id, tabindex: '-1', 'data-action': 'clamp',
+                         'data-key': key }, text);
+  const verb = () => (open ? 'Show less' : 'Show all');
+  const toggle = el('button', { type: 'button', class: 'show-all', 'data-action': 'show', 'data-key': key, 'aria-expanded': String(open),
+                                'aria-controls': id, 'aria-label': named(`${verb()} of ${name}`, cx) }, verb());
+  const row = el('div', { class: 'clamp-actions', hidden: !open }, toggle);
+  toggle.addEventListener('click', () => {
+    open = !open;
+    body.classList.toggle('open', open);
+    toggle.textContent = verb();
+    toggle.setAttribute('aria-expanded', String(open));
+    toggle.setAttribute('aria-label', named(`${verb()} of ${name}`, cx));
+    if (open) ui.reports.add(key); else ui.reports.delete(key);
+    if (open || overflowing(body)) return;
+    if (toggle.matches?.(':focus')) body.focus({ preventScroll: true });   // the button is going: its focus goes to the report it was about
+    row.hidden = true;
+  });
+  return [body, row];
+}
+
+// Does a clamped report hide anything? Its text is taller than the three lines it is given. Read off the layout: a text that has none to read
+// (a card not in the page yet, or in no layout at all) is not taken to overflow.
+const overflowing = (text) => isNum(text.scrollHeight) && isNum(text.clientHeight) && text.scrollHeight > text.clientHeight + 1;
+
+// Shows the Show all of each clamped report under root that overflows its three lines, and hides the one of each that fits them, so no
+// button is offered that would reveal nothing; an open report keeps its Show less. The page calls this once a card is in it, and again when
+// the conversation's width changes (P6 fix 1). measure stands in for the layout in a test. Where the layout cannot be read the fallback is
+// the same rule: nothing is shown to overflow, so no button is offered, and the text keeps its three lines.
+export function settleClamps(root, measure = overflowing) {
+  if (typeof root?.querySelectorAll !== 'function') return;
+  const texts = new Map(Array.from(root.querySelectorAll('.clamp-text[id]'), (text) => [text.getAttribute('id'), text]));
+  for (const toggle of root.querySelectorAll('[data-action="show"]')) {
+    const text = texts.get(toggle.getAttribute('aria-controls'));
+    const row = toggle.parentNode;
+    if (!text || !row) continue;
+    row.hidden = !(text.classList.contains('open') || measure(text));
+  }
+}
+
+const textOf = (value) => (typeof value === 'string' ? value : '');   // a report text is a string, or there is none
+
+// ---- the published lines of a test study (P6-D) ---------------------------------------------------------------------------
+
+const UNCOMPARED = 'Compared with the live report only when the turn is decoded as the published dump was: beam 3, 100 tokens, the whole '
+  + 'budget, not compiled.';
+
+// From the score detail of a private test-split turn: the published model's own (GPU) report for this study, with whether the live report
+// above is identical to it, and the retrieval floor's report beside it. The server compares the two only for a turn decoded as the dump was
+// (live_equals_published is null otherwise, and a note says when it is). Hidden for any other turn: public mode drops the whole score stage.
+export function renderPublished(view, ctx) {
+  const v = whole(view);
+  const cx = ctx ?? {};
+  const block = isObject(v.score) && isObject(v.score.published) ? v.score.published : {};
+  const model = textOf(block.model_report);
+  const floor = textOf(block.floor_report);
+  const same = block.live_equals_published;
+  const verdict = same === true ? el('span', { class: 'verdict same' }, 'identical')
+                : same === false ? el('span', { class: 'verdict differs' }, 'differs') : null;
+  const lines = [
+    model ? el('li', { class: 'published-line', 'data-kind': 'model' },
+      el('p', { class: 'published-head' }, 'Published (GPU) report', verdict ? ' · ' : null, verdict),
+      ...clampedText(model, 'published:model', 'the published report', v, cx)) : null,
+    floor ? el('li', { class: 'published-line', 'data-kind': 'floor' }, el('p', { class: 'published-head' }, 'Retrieval-floor report'),
+      ...clampedText(floor, 'published:floor', 'the retrieval-floor report', v, cx)) : null,
+  ].filter(Boolean);
+  return el('section', { class: 'published', 'aria-label': named('Published reports', cx), hidden: !lines.length },
+    el('h3', { class: 'section-title' }, 'Published reports (test split)'),
+    model && typeof same !== 'boolean' ? el('p', { class: 'note' }, UNCOMPARED) : null,
+    el('ul', { class: 'published-list', role: 'list' }, ...lines));
+}
+
+// ---- matching reports: the report groups the 13D image and text encoders rank highest for this X-ray (P6-D) ------------------
+
+const count = (n) => n.toLocaleString('en-US');   // 2,663
+
+// "Own report: rank 3 of 2,663 test reports · R@10 hit" for a test study, with the dedup-aware rank and the protocol in its tooltip, which
+// a screen reader is given as text too. null without a rank to show: an upload, or public mode, which never sends one (R1).
+function ownRankBadge(rank) {
+  if (!isObject(rank) || !Number.isInteger(rank.rank) || !Number.isInteger(rank.of)) return null;
+  const hit = rank.hit_at_10 === true ? 'R@10 hit' : rank.hit_at_10 === false ? 'R@10 miss' : null;
+  const tied = Number.isInteger(rank.n_tied) && rank.n_tied > 0 ? rank.n_tied : 0;
+  const tip = [
+    Number.isInteger(rank.rank_dedup) ? `Dedup-aware rank ${count(rank.rank_dedup)}: every identical report counted once.` : null,
+    tied ? `${count(tied)} other ${tied === 1 ? 'report scores' : 'reports score'} exactly the same.` : null,
+    str(rank.protocol) ? `Protocol: ${str(rank.protocol)}.` : null,
+  ].filter(Boolean).join(' ');
+  return el('p', { class: 'own-rank', title: tip || null },
+    [`Own report: rank ${count(rank.rank)} of ${count(rank.of)} test reports`, hit].filter(Boolean).join(' · '),
+    tip ? el('span', { class: 'visually-hidden' }, ` ${tip}`) : null);
+}
+
+// A label row's names in ctx.labelNames order, then any the list lacks, as the report's own chips order them.
+function labelOrder(labels, cx) {
+  const given = Array.isArray(cx.labelNames) ? cx.labelNames.filter((n) => typeof n === 'string') : [];
+  return [...given.filter((n) => Object.hasOwn(labels, n)), ...Object.keys(labels).filter((n) => !given.includes(n))];
+}
+
+function matchItem(m, i, v, cx, pub) {
+  const rank = Number.isInteger(m.rank) ? m.rank : null;
+  const name = `matching report ${rank ?? i + 1}`;
+  const size = !pub && Number.isInteger(m.group_size) && m.group_size > 1 ? el('span', { class: 'chip group-size' }, `×${count(m.group_size)} identical reports`) : null;
+  const text = pub ? '' : textOf(m.report);   // public mode: never a MIMIC report, whatever the detail holds (R1)
+  const positives = !pub && isObject(m.labels) ? labelOrder(m.labels, cx).filter((n) => isOn(m.labels[n])) : [];
+  return el('li', { class: 'match', 'data-rank': rank },
+    el('div', { class: 'match-head' }, el('span', { class: 'match-score' }, scoreText(m.rank, m.similarity)),
+      isNum(m.similarity) ? simBar(m.similarity) : null, size),
+    ...(text ? clampedText(text, `match:${rank ?? i}`, name, v, cx) : []),
+    positives.length ? el('ul', { class: 'finding-chips', role: 'list', 'aria-label': `Labels of ${name}` },
+      ...positives.map((n) => el('li', { class: 'chip finding' }, n))) : null);
+}
+
+// The k_reports report groups the 13D image and text encoders rank highest for this X-ray (image to report): each with its rank, its
+// similarity and a bar, how many reports read the same, the report itself clamped to three lines with Show all, and its positive labels.
+// A test study adds where its own report ranks among the test reports. Public mode keeps rank and similarity only (U2). Hidden until the
+// retrieve stage has ended with a report or a rank to show.
+export function renderMatches(view, ctx) {
+  const v = whole(view);
+  const cx = ctx ?? {};
+  const done = stageState(v, 'retrieve').state === 'done';
+  const matches = done && Array.isArray(v.matches) ? v.matches.filter(isObject) : [];
+  const pub = v.mode === 'public';
+  const badge = done && !pub ? ownRankBadge(v.trueRank) : null;
+  const items = matches.map((m, i) => matchItem(m, i, v, cx, pub));
+  return el('section', { class: 'matches', 'aria-label': named('Matching reports', cx), hidden: !items.length && !badge },
+    el('h3', { class: 'section-title' }, 'Matching reports (13D image and text encoders)'),
+    badge,
+    pub && items.length ? el('p', { class: 'note section-note' }, 'Public mode shows rank and similarity only.') : null,
+    items.length ? el('ol', { class: 'match-list', role: 'list' }, ...items) : null);
+}
+
+// ---- the tiny engine's notice (P9-G5b) -------------------------------------------------------------------------------------
+
+// The server's name for its random-weights engine (app/engine.py TinyEngine.name, a seeded random-init model that writes words of a toy
+// vocabulary: the laptop's dev server and the tests). What it writes has the shape of a report and is none, and it was once read as a broken
+// one. Every card it answers says so above the report, and the banner has a badge while it is the default model (app.js). A real engine
+// is named for its model, never this. The tiny engine served under a published model's name (compare mode's tests, P9-F) says so on its card
+// instead, test_model: true (P9-F fix 2), and is marked the same way; no real engine's card says it.
+export const TEST_MODEL = 'tiny';
+export const TEST_NOTICE = 'Test model with random weights: this text is not a report. Real reports come from the cluster server.';
+export const isTestModel = (card) => isObject(card) && (card.name === TEST_MODEL || card.test_model === true);
+
+// The notice, above the report: a note about the whole card, so a paragraph of its own and not one of the notes of a turn (they are
+// warnings and errors). It comes with the turn's first stage, and is null when there is none to say: another model, or a turn that ran no
+// model (a question the server answered with a warning has no stage, as the card hides its timeline and provenance, and never shows the
+// notice for the moment it takes), so that every other card is the card it always was. A compare card carries it when either of its two
+// models is a test model (P9-F fix 2).
+export function renderTestNotice(view) {
+  const v = whole(view);
+  const tested = isTestModel(v.provenance) || (isObject(v.compare) && isTestModel(v.compare.card));
+  return tested && Object.keys(v.stages).length ? el('p', { class: 'test-notice', role: 'note' }, TEST_NOTICE) : null;
+}
+
+// ---- compare mode: two reports, a column each (P9-F) ------------------------------------------------------------------------
+
+// A column of a compare card: its model's name, then what a card shows of its report (the summary of its labels, its sentences, why it ends
+// where it does, its notes and terms, its label chips, Copy and Show raw), each control named for the model. Column 1 is written once column 0
+// is done, and says so while the turn runs and block 1 has not started; from its start (P9-F fix 1) it shows what column 0 showed before its
+// first snapshot. Side by side or stacked is styles.css's (the card's width).
+function compareColumn({ index, model, view }, first, v, cx) {
+  const ccx = { ...cx, of: model, key: index === 1 ? COMPARE_KEY : null };
+  const waiting = index === 1 && v.status === 'running' && !(isObject(v.compare) && v.compare.started === true)
+    ? el('p', { class: 'note compare-waiting' }, `Starts once the ${first} report is done.`) : null;
+  return el('section', { class: 'compare-column', 'data-column': String(index), 'aria-label': named(`Report of ${model}`, cx) },
+    el('h3', { class: 'compare-model' }, model), waiting, renderReport(view, ccx), renderLabels(view, ccx));
+}
+
+const renderColumns = (columns, v, cx) => el('div', { class: 'compare-columns' }, ...columns.map((c) => compareColumn(c, columns[0].model, v, cx)));
+
+// ---- the assistant card and the throttle ---------------------------------------------------------------------------------
+
+export function renderAssistantCard(view, ctx) {
+  const v = whole(view);
+  const cx = ctx ?? {};
+  const timeline = renderTimeline(v, cx);
+  const provenance = renderProvenance(v, cx);
+  // A turn that finished having run no stage (a question the server answered with a warning) has no pipeline to show,
+  // and no model to attribute: nothing ran. One that was stopped or failed before its first stage still shows its stages.
+  if (v.status === 'done' && !Object.keys(v.stages).length) {
+    timeline.setAttribute('hidden', '');
+    provenance.setAttribute('hidden', '');
+  }
+  // The sections the P6 tasks add, under the labels: one that has nothing to show is left out of the card, so the card of a turn that
+  // has none of them is the card it always was.
+  const sections = [renderPublished(v, cx), renderImages(v, cx), renderNeighbors(v, cx), renderMatches(v, cx)]
+    .filter((section) => !section.hasAttribute('hidden'));
+  // A compare turn's two reports stand in the place of the one report and its labels (P9-F); everything else on the card is drawn once.
+  const columns = columnsOf(v);
+  const reports = columns ? [renderColumns(columns, v, cx)] : [renderReport(v, cx), renderLabels(v, cx)];
+  return el('article', { class: columns ? 'card compare-card' : 'card', 'aria-label': named('Assistant report', cx), 'data-message-id': str(v.id) || null,
+                         'data-status': str(v.status) || null },
+    timeline, renderNotes(v), renderTestNotice(v), ...reports, ...sections, provenance);
+}
+
+// ---- keeping focus through the whole-card replace -------------------------------------------------------------------------
+
+// Controls a card has several of outside its stages (a picture's viewer button, a report's Show all, the clamped report itself): each names
+// what it is for in its data-key ("match:2", "published:model", "image:thumb", "neighbor:3"), which no section that appears before it can shift
+// (P6 fix 1). So do the Copy and Show raw of column 1 of a compare card ("compare", P9-F); a card's one report, or column 0, has them unkeyed.
+const KEYED_ACTIONS = ['view', 'show', 'clamp', 'copy', 'raw'];
+const DATA_KEY = /^[\w:-]{1,64}$/;
+
+// The control a node is in (or is), as a key that survives the rebuild: copy, raw, models, stage:<stage>, more:<stage>:<n>,
+// the nth show-more button of that stage's table, or view:<data-key>, show:<data-key>, clamp:<data-key>, copy:<data-key> and raw:<data-key>.
+// null when the node is not in one of those.
+export function focusKey(node) {
+  const control = node?.closest?.('[data-action]');
+  if (!control) return null;
+  const action = control.getAttribute('data-action');
+  if (action === 'models' || ((action === 'copy' || action === 'raw') && !control.hasAttribute('data-key'))) return action;
+  if (KEYED_ACTIONS.includes(action)) {
+    const key = control.getAttribute('data-key');
+    return typeof key === 'string' && DATA_KEY.test(key) ? `${action}:${key}` : null;
+  }
+  const item = control.closest('li[data-stage]');
+  const stage = item?.getAttribute('data-stage');
+  if (!stage) return null;
+  if (action === 'stage') return `stage:${stage}`;
+  if (action !== 'more') return null;
+  const index = Array.from(item.querySelectorAll('[data-action="more"]')).indexOf(control);
+  return index < 0 ? null : `more:${stage}:${index}`;
+}
+
+const FOCUS_KEY = /^(?:(copy|raw|models)|stage:([a-z]+)|more:([a-z]+):(\d+)|(view|show|clamp|copy|raw):([\w:-]{1,64}))$/;
+
+// Puts focus on the control of the rebuilt card that key names: after card.replaceWith(next), restoreFocus(next, key),
+// with key taken by focusKey before it. true when the control took focus; false when there is no such control (a Copy
+// the page no longer offers, a stage that has no detail) or it cannot be focused (a stage closed, so its buttons are not
+// shown: keep ctx.ui so it is open again). Never scrolls the pane.
+export function restoreFocus(card, key) {
+  const m = typeof key === 'string' ? FOCUS_KEY.exec(key) : null;
+  if (!m || typeof card?.querySelector !== 'function') return false;
+  let target = null;
+  if (m[1]) target = Array.from(card.querySelectorAll(`[data-action="${m[1]}"]`)).find((c) => !c.hasAttribute('data-key')) ?? null;
+  else if (m[2]) target = STAGES.includes(m[2]) ? card.querySelector(`li[data-stage="${m[2]}"] > [data-action="stage"]`) : null;
+  else if (m[5]) target = Array.from(card.querySelectorAll(`[data-action="${m[5]}"]`)).find((c) => c.getAttribute('data-key') === m[6]) ?? null;
+  else if (STAGES.includes(m[3])) target = Array.from(card.querySelectorAll(`li[data-stage="${m[3]}"] [data-action="more"]`))[Number(m[4])];
+  if (!target) return false;
+  target.focus({ preventScroll: true });
+  return globalThis.document?.activeElement === target;
+}
+
+const pending = new WeakSet();
+
+// Runs fn once on the next animation frame however often it is asked before then. Pass the same function each time and
+// let it read the latest view itself: fifty snapshots in one frame draw one card. A turn in a background tab draws when
+// the tab is shown again. Without requestAnimationFrame (a test) a timer stands in.
+export function scheduleRender(fn) {
+  if (pending.has(fn)) return;
+  pending.add(fn);
+  const run = () => {
+    pending.delete(fn);
+    fn();
+  };
+  if (typeof globalThis.requestAnimationFrame === 'function') globalThis.requestAnimationFrame(run);
+  else setTimeout(run, 16);
+}

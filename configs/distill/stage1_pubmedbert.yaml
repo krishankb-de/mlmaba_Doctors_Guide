@@ -1,0 +1,38 @@
+# Stage 1 Knowledge Distillation — PubMedBERT teacher (pure KD, no SimCSE)
+#
+# PubMedBERT (microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext,
+# 110M) is trained from scratch on PubMed — best biomedical embedding teacher.
+#
+# Why SimCSE was removed:
+# The Stage 0 backbone (PPL=13.10) already separates PubMed abstracts so well
+# that InfoNCE loss starts at ~0.002 from step 1 (expected 2.08 for random
+# embeddings). There is no gradient signal — SimCSE cannot improve geometry
+# that is already excellent. All observed 'collapse' was this fundamental
+# mismatch between SimCSE and a strong pretrained backbone.
+#
+# Pure KD loss: L = 1 - cos(distill_proj(student_z), pubmedbert_cls(text))
+# This directly aligns the student's projection head to PubMedBERT's CLS space.
+# PubMedBERT scores BIOSSES=0.85; expected student result: 0.72-0.80.
+#
+# lambda_max=1.0: pure KD from step 0 — no SimCSE term to balance against.
+# warmup_steps=0, ramp_steps=0: start distillation immediately.
+
+teacher_model: "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
+
+# Full KD weight from step 0 — no contrastive term to balance
+lambda_max: 1.0
+
+# No warmup needed — KD loss is stable from step 1
+warmup_steps: 0
+
+# No ramp needed — start at full lambda immediately (ramp_steps=0 triggers at step 0)
+ramp_steps: 0
+
+# Teacher dtype — bf16 on A100
+teacher_dtype: "bfloat16"
+
+# Teacher max sequence length — PubMedBERT supports up to 512
+teacher_max_length: 512
+
+# Log distillation metrics every N steps
+log_every_n_steps: 25
