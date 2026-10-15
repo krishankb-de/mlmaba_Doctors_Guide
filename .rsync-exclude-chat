@@ -19,6 +19,7 @@
 /.local/
 /.staging/
 /CLAUDE.local.md
+/graphify-out/
 # local tool settings and PhysioNet session cookies are credentials: never ship them
 /.claude/
 .physionet_session

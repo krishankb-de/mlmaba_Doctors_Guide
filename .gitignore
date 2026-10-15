@@ -90,6 +90,7 @@ multirun/
 /.local/
 /.staging/
 /CLAUDE.local.md
+/graphify-out/
 
 # The local PhysioNet MIMIC-CXR-JPG build. DUA-
 # credentialed data — must never be committed/pushed/published, regardless
