@@ -9,7 +9,8 @@
 #             the only workflow
 #   lint      flake8's fatal set (syntax errors, undefined names), bash -n over every tracked script, JSON and YAML parse
 #   validate  bash scripts/validate.sh (Hydra invariants, pytest -m "not cuda and not slow", node --test, model smoke)
-#   browser   tests/e2e, then the layout, browser and features checks, in the runner's Google Chrome
+#   browser   tests/e2e, then the layout, browser and features checks, in the runner's Google Chrome, on macOS: the layout cases are
+#             measured against the system fonts of a Mac (Linux's are wider: a phone-width composer overflowed by 16px there)
 name: Checks
 
 on:
@@ -185,7 +186,7 @@ jobs:
 
   browser:
     needs: [guards, lint]
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -203,7 +204,7 @@ jobs:
             requirements-e2e.txt
             setup.py
 
-      - name: Install (CLAUDE.md; torch from the CPU index)
+      - name: Install (CLAUDE.md; torch from PyPI, whose macOS wheels are CPU builds)
         id: install
         run: |
           git config --global user.name "checks"
@@ -211,11 +212,11 @@ jobs:
           printf 'torch==2.11.0\ntorchvision==0.26.0\n' > "$RUNNER_TEMP/constraints.txt"
           python -m venv venv
           venv/bin/pip install --upgrade pip
-          venv/bin/pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu
           venv/bin/pip install -c "$RUNNER_TEMP/constraints.txt" -r requirements.txt -r requirements_eval.txt -r app/requirements.txt -r requirements-e2e.txt
           venv/bin/pip install -c "$RUNNER_TEMP/constraints.txt" -e .
-          google-chrome --version
-          echo "CHROME=$(command -v google-chrome)" >> "$GITHUB_ENV"
+          chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          "$chrome" --version
+          echo "CHROME=$chrome" >> "$GITHUB_ENV"
 
       - name: e2e (pytest tests/e2e -m e2e; a skip is a failure here)
         run: |

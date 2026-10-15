@@ -760,8 +760,10 @@ def test_the_dev_server_taking_the_port_between_two_forwards_ends_the_tunnel_ins
 
 def test_a_port_the_last_forward_left_in_time_wait_is_free(box):
     """ssh sets SO_REUSEADDR on its listener, so the bind test must too: without it the connections the last forward closed would read as
-    'in use' for a minute after it ended, and a requeue would end the tunnel instead of reconnecting it."""
+    'in use' for a minute after it ended, and a requeue would end the tunnel instead of reconnecting it. The listener here sets it as ssh's
+    does: Linux lets a bind over a TIME_WAIT only when both sockets set it, BSD (macOS) when the new one does."""
     listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", box.port))
     listener.listen(1)
     client = socket.create_connection(("127.0.0.1", box.port))
@@ -879,8 +881,9 @@ def test_a_family_the_host_does_not_have_counts_as_free_and_the_other_is_still_c
 
 
 def test_a_port_the_last_forward_left_in_time_wait_on_ipv6_is_free(box):
-    """The IPv6 twin of the TIME_WAIT test: ssh closes its forward's listener on ::1 as well, and that side's TIME_WAIT must not read busy."""
-    listener, box.port = ipv6_loopback_listener(reuse=False)
+    """The IPv6 twin of the TIME_WAIT test: ssh closes its forward's listener on ::1 as well, and that side's TIME_WAIT must not read busy.
+    The listener sets SO_REUSEADDR, as ssh's does (see the IPv4 test)."""
+    listener, box.port = ipv6_loopback_listener(reuse=True)
     with listener:
         client = socket.create_connection(("::1", box.port))
         served, _ = listener.accept()

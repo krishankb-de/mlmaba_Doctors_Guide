@@ -297,7 +297,7 @@ LOG_JS = """async (id) => {
 STOP_OFF_JS = """try { var s = JSON.parse(localStorage.getItem('cxrchat.settings') || 'null') || {}; s.stop_on_repeat = false;
   localStorage.setItem('cxrchat.settings', JSON.stringify(s)); } catch (e) { /* storage blocked: the page runs with its defaults */ }"""
 
-# A text that is too faint on purpose: Chrome's contrast audit reports it, so that its silence about everything else is a result and
+# A text that is too faint on purpose: the contrast audit reports it, so that its silence about everything else is a result and
 # not an audit that did not run. It is put on the page for the audit and taken off again.
 CANARY_JS = """() => {
   const s = document.createElement('span');
@@ -466,24 +466,153 @@ def faint_texts(found: List[Dict[str, Any]]) -> List[str]:
             if "contrast-canary" not in i["selector"] and not screen_reader_only(i["selector"])]
 
 
+# Marks what holds text of its own (data-contrast-probe = its index in the answer): every element with a text node that has a box (not under
+# display: none; Chrome's CSS.getBackgroundColors answers for an element there too, so this is the only test of that), and every form control
+# with a box, whose text (value, placeholder, chosen option) Chrome draws in its user-agent shadow tree. Answers each one's name in the form
+# Chrome's audit gave (tag, #id, .classes), its text color (a control's is read from its shadow tree) and the opacity it is drawn with, its
+# own and its ancestors'. As Chrome's audit did, text under visibility: hidden or opacity 0 is read too.
+PROBE_JS = """() => {
+  const out = [];
+  const name = (el) => el.localName + (el.id ? '#' + el.id : '') + Array.from(el.classList, (c) => '.' + c).join('');
+  const probe = (el, kind) => {
+    let opacity = 1;
+    for (let e = el; e; e = e.parentElement) opacity *= parseFloat(getComputedStyle(e).opacity);
+    el.setAttribute('data-contrast-probe', String(out.length));
+    out.push({selector: name(el), kind, color: getComputedStyle(el).color, opacity});
+  };
+  const marked = new Set();
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  for (let t = walker.nextNode(); t; t = walker.nextNode()) {
+    const el = t.parentElement;
+    if (!el || marked.has(el) || !t.data.trim()) continue;
+    marked.add(el);
+    if (el.matches('textarea, select, option, script, style, template') || el.getClientRects().length === 0) continue;
+    probe(el, 'text');
+  }
+  for (const el of document.querySelectorAll('input, textarea, select')) {
+    if (el.getClientRects().length === 0 || (el.localName === 'input' && /^(checkbox|radio|range|color|file|hidden|image)$/.test(el.type))) continue;
+    probe(el, 'control');
+  }
+  return out;
+}"""
+
+# CSS colors, in whatever form Chrome wrote them (rgb(), color(srgb ...), oklch() ...), as sRGB [r, g, b, alpha] with r, g, b in 0-255: what a
+# canvas draws for each.
+RGBA_JS = """(colors) => {
+  const ctx = document.createElement('canvas').getContext('2d', {willReadFrequently: true});
+  return colors.map((c) => {
+    ctx.clearRect(0, 0, 1, 1);
+    ctx.fillStyle = '#000';
+    ctx.fillStyle = c;
+    ctx.fillRect(0, 0, 1, 1);
+    const d = ctx.getImageData(0, 0, 1, 1).data;
+    return [d[0], d[1], d[2], d[3] / 255];
+  });
+}"""
+
+UNPROBE_JS = """() => {
+  document.querySelectorAll('[data-contrast-probe]').forEach((e) => e.removeAttribute('data-contrast-probe'));
+  return true;
+}"""
+
+
+def over(top: List[float], bottom: List[float]) -> List[float]:
+    """`top` (r, g, b, alpha) drawn over an opaque `bottom`: the opaque color that shows."""
+    a = top[3]
+    return [top[i] * a + bottom[i] * (1 - a) for i in range(3)] + [1.0]
+
+
+def luminance(rgb: List[float]) -> float:
+    """WCAG 2 relative luminance of an sRGB color with channels in 0-255."""
+    def linear(c: float) -> float:
+        c = c / 255
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * linear(rgb[0]) + 0.7152 * linear(rgb[1]) + 0.0722 * linear(rgb[2])
+
+
+def contrast_ratio(text: List[float], ground: List[float]) -> float:
+    """WCAG 2 contrast of a text color on a ground, both (r, g, b, alpha): a ground that is not opaque is read over white (a page's canvas),
+    and the text over the ground."""
+    ground = over(ground, [255.0, 255.0, 255.0, 1.0]) if ground[3] < 1 else ground
+    lighter, darker = sorted((luminance(over(text, ground)), luminance(ground)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def threshold_aa(font_size: Optional[str], font_weight: Optional[str]) -> float:
+    """WCAG AA's minimum for a text: 3 for large text (24px, or 18.66px at weight 600 or more, as Chrome's audit counted bold), else 4.5."""
+    size = float(str(font_size or "0").rstrip("px") or 0)
+    try:
+        weight = {"normal": 400.0, "bold": 700.0}.get(str(font_weight)) or float(font_weight or 400)
+    except ValueError:
+        weight = 400.0
+    return 3.0 if size >= 24 or (size >= 18.66 and weight >= 600) else 4.5
+
+
+def shadow_elements(node: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The elements of a DOM.describeNode(pierce=True) node's user-agent shadow trees, at any depth (the host's own children are not in them)."""
+    out = []  # type: List[Dict[str, Any]]
+    todo = [c for root in node.get("shadowRoots", []) if root.get("shadowRootType") == "user-agent" for c in root.get("children", [])]
+    while todo:
+        n = todo.pop(0)
+        if n.get("nodeType") == 1:
+            out.append(n)
+            todo.extend(n.get("shadowRoots", []) + n.get("children", []))
+    return out
+
+
+def measure_contrast(b: Browser) -> List[Dict[str, Any]]:
+    """Every text's WCAG 2 contrast, as Chrome's own audit (Audits.checkContrast, which Chrome dropped after 146) measured it: the text's
+    color, faded by the opacity it is drawn with, against the one color Chrome finds behind it (CSS.getBackgroundColors). A text on a gradient
+    or an image is not read, as Chrome did not read it. A form control's texts are the nodes of its shadow tree that Chrome finds text in and
+    that have a box. -> [{selector, contrastRatio, thresholdAA}]; the page is left as it was."""
+    measured = []  # type: List[Tuple[str, str, float, Dict[str, Any]]]   (selector, text color, opacity, ground)
+    try:
+        probes = b.evaluate("(%s)()" % PROBE_JS)
+        b.call("DOM.enable")
+        b.call("CSS.enable")
+        root = b.call("DOM.getDocument", depth=0)["root"]["nodeId"]
+        for node in b.call("DOM.querySelectorAll", nodeId=root, selector="[data-contrast-probe]")["nodeIds"]:
+            attributes = b.call("DOM.getAttributes", nodeId=node)["attributes"]
+            probe = probes[int(attributes[attributes.index("data-contrast-probe") + 1])]
+            if probe["kind"] == "text":
+                measured.append((probe["selector"], probe["color"], probe["opacity"], b.call("CSS.getBackgroundColors", nodeId=node)))
+                continue
+            inner = shadow_elements(b.call("DOM.describeNode", nodeId=node, depth=-1, pierce=True)["node"])
+            ids = b.call("DOM.pushNodesByBackendIdsToFrontend", backendNodeIds=[n["backendNodeId"] for n in inner])["nodeIds"] if inner else []
+            for n, inner_id in zip(inner, ids):
+                ground = b.call("CSS.getBackgroundColors", nodeId=inner_id) if inner_id else {}
+                if not ground.get("backgroundColors"):
+                    continue
+                try:
+                    b.call("DOM.getBoxModel", nodeId=inner_id)
+                except RuntimeError:   # no box: a placeholder under a value, say
+                    continue
+                style = {p["name"]: p["value"] for p in b.call("CSS.getComputedStyleForNode", nodeId=inner_id)["computedStyle"]}
+                placeholder = dict(zip(n.get("attributes", [])[::2], n.get("attributes", [])[1::2])).get("id") == "placeholder"
+                measured.append((probe["selector"] + ("::placeholder" if placeholder else ""), style["color"], probe["opacity"], ground))
+    finally:
+        b.evaluate("(%s)()" % UNPROBE_JS)
+    measured = [m for m in measured if len(m[3].get("backgroundColors") or []) == 1]   # none: no visible text, or an image; more: a gradient
+    css = sorted({c for _, color, _, ground in measured for c in [color] + ground["backgroundColors"]})
+    rgba = dict(zip(css, b.run(RGBA_JS, css)))
+    out = []
+    for selector, color, opacity, ground in measured:
+        red, green, blue, alpha = rgba[color]
+        out.append({"selector": selector,
+                    "contrastRatio": contrast_ratio([red, green, blue, alpha * opacity], rgba[ground["backgroundColors"][0]]),
+                    "thresholdAA": threshold_aa(ground.get("computedFontSize"), ground.get("computedFontWeight"))})
+    return out
+
+
 def contrast_issues(b: Browser) -> List[str]:
-    """Chrome's own contrast audit (WCAG AA) of what the page shows now: one line per text that is too faint, the canary left out."""
-    b.call("Audits.enable")
+    """A WCAG AA contrast audit of what the page shows now (measure_contrast): one line per text that is too faint, the canary left out."""
     b.evaluate("(%s)()" % CANARY_JS)
-    b.events("Audits.issueAdded")
-    b.call("Audits.checkContrast", reportAAA=False)
-    found = []  # type: List[Dict[str, Any]]
-    deadline = time.time() + 8
-    while time.time() < deadline and not any("contrast-canary" in i["selector"] for i in found):   # the canary says the audit is done
-        time.sleep(0.1)
-        b.evaluate("0")
-        for event in b.events("Audits.issueAdded"):
-            if event["issue"]["code"] == "LowTextContrastIssue":
-                detail = event["issue"]["details"]["lowTextContrastIssueDetails"]
-                found.append(dict(detail, selector=detail["violatingNodeSelector"]))
-    b.evaluate("document.querySelector('#contrast-canary').remove()")
+    try:
+        found = [m for m in measure_contrast(b) if m["contrastRatio"] < m["thresholdAA"]]
+    finally:
+        b.evaluate("document.querySelector('#contrast-canary')?.remove()")
     if not any("contrast-canary" in i["selector"] for i in found):
-        raise Failure("Chrome's contrast audit did not report its canary: the audit did not run")
+        raise Failure("the contrast audit did not report its canary: the audit did not run")
     return faint_texts(found)
 
 

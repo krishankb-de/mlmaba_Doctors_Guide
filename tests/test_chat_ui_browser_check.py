@@ -145,6 +145,38 @@ def test_the_contrast_audit_reports_what_a_user_can_see_and_not_text_made_for_a_
     assert check.faint_texts([found[0], found[2]]) == []
 
 
+def test_the_contrast_audit_measures_as_wcag_2_and_chrome_s_dropped_audit_did():
+    """Chrome dropped Audits.checkContrast after 146 (CI's Chrome 155 answered "'Audits.checkContrast' wasn't found"), so the audit measures
+    itself, from CSS.getBackgroundColors: WCAG 2 luminance, text over its ground, a see-through ground over white, Chrome's large-text rule.
+    On Chrome 146 it gave the dropped audit's every ratio and AA verdict in the a11y check's four states."""
+    import inspect
+    black, white = [0.0, 0.0, 0.0, 1.0], [255.0, 255.0, 255.0, 1.0]
+    assert check.contrast_ratio(black, white) == pytest.approx(21.0)
+    assert check.contrast_ratio(white, white) == pytest.approx(1.0)
+    assert round(check.contrast_ratio([0x76] * 3 + [1.0], white), 2) == 4.54   # the darkest gray that passes on white
+    assert round(check.contrast_ratio([0x77] * 3 + [1.0], white), 2) == 4.48
+    assert round(check.contrast_ratio([0.0, 0.0, 0.0, 0.3], white), 2) == 2.11   # black at opacity 0.3 (Chrome 146's audit said 2.11)
+    assert check.contrast_ratio(black, [255.0, 255.0, 255.0, 0.0]) == pytest.approx(21.0)   # a clear ground is the page's white
+    assert check.threshold_aa("16px", "400") == 4.5
+    assert check.threshold_aa("24px", "400") == 3.0
+    assert check.threshold_aa("19px", "600") == 3.0 and check.threshold_aa("19px", "bold") == 3.0
+    assert check.threshold_aa("18px", "700") == 4.5 and check.threshold_aa("19px", "500") == 4.5
+    assert check.threshold_aa(None, None) == 4.5
+    assert '"Audits.checkContrast"' not in inspect.getsource(check)   # no call to it is left
+
+
+def test_a_form_control_s_texts_are_read_from_its_user_agent_shadow_tree_and_not_from_its_options():
+    """An input's value or placeholder and a select's chosen option are drawn in the control's user-agent shadow tree (DOM.describeNode with
+    pierce): shadow_elements walks that tree at any depth and leaves the host's own children (a select's options) to the page."""
+    node = {"nodeType": 1, "localName": "select", "children": [{"nodeType": 1, "localName": "option", "backendNodeId": 9, "children": []}],
+            "shadowRoots": [{"nodeType": 11, "shadowRootType": "user-agent", "children": [
+                {"nodeType": 1, "localName": "div", "backendNodeId": 2, "children": [
+                    {"nodeType": 3, "backendNodeId": 3}, {"nodeType": 1, "localName": "span", "backendNodeId": 4, "children": []}]}]},
+                {"nodeType": 11, "shadowRootType": "open", "children": [{"nodeType": 1, "localName": "b", "backendNodeId": 5}]}]}
+    assert [n["backendNodeId"] for n in check.shadow_elements(node)] == [2, 4]
+    assert check.shadow_elements({"nodeType": 1, "localName": "input"}) == []
+
+
 def test_the_a11y_item_counts_the_stage_buttons_the_page_has_and_no_longer_a_fixed_three():
     import inspect
     source = inspect.getsource(check.check_a11y)
