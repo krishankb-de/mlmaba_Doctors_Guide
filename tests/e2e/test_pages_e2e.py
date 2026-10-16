@@ -29,6 +29,18 @@ pytestmark = [pytest.mark.e2e, pytest.mark.slow]
 FIRST_RUN = "Set the API server in Settings, for example http://localhost:8000 (your tunnel)."
 SITE = "chat_pages"   # the sub-path the copy is served under, as GitHub Pages serves a project's site
 
+# The static server: python -m http.server's handler and threading server, without the CLI. HTTPServer.server_bind asks socket.getfqdn for
+# the server's name between bind and listen, a reverse lookup that a GitHub macOS runner took over 30 s for; meanwhile macOS drops a connect
+# to the bound port (no refusal: a timeout), so the copy never came up there. The name is the address instead.
+STATIC_SERVER = """import functools, http.server, socketserver, sys
+class Server(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[2])
+Server(("127.0.0.1", int(sys.argv[1])), handler).serve_forever()
+"""
+
 
 class PagesServer(TinyServer):
     """The tiny API with the tiny gallery, letting one origin in, and that origin: the Pages copy, built fresh under /chat_pages/ and served by
@@ -43,7 +55,7 @@ class PagesServer(TinyServer):
                                capture_output=True, text=True, timeout=60)
         assert built.returncode == 0, built.stdout + built.stderr
         self.static_log = open(str(Path(home).parent / "static_server.log"), "a")
-        self.static = subprocess.Popen([sys.executable, "-m", "http.server", str(self.pages_port), "--bind", "127.0.0.1", "--directory", str(root)],
+        self.static = subprocess.Popen([sys.executable, "-c", STATIC_SERVER, str(self.pages_port), str(root)],
                                        stdout=self.static_log, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             deadline = time.time() + 30
@@ -53,7 +65,9 @@ class PagesServer(TinyServer):
                         break
                 except OSError:
                     if time.time() > deadline or self.static.poll() is not None:
-                        raise RuntimeError("the static server of the Pages copy did not start")
+                        self.static_log.flush()
+                        tail = Path(self.static_log.name).read_text(errors="replace")[-1500:]
+                        raise RuntimeError("the static server of the Pages copy did not start (exit {}):\n{}".format(self.static.poll(), tail))
                     time.sleep(0.1)
             super().__init__(home, cors_origin=self.pages_origin, **kwargs)
         except BaseException:

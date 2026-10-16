@@ -714,6 +714,18 @@ def _save_settings(browser: Browser) -> None:
     browser.wait_for("document.querySelector('#saved').textContent.trim() !== ''", what="the saved row")
 
 
+# The page starts after its load event (app.js start): it asks for the models and the chats, then shows the route, and syncs its controls at
+# each step; the re-run hint is one of them, hidden on a page with no X-ray. A case set up before the last step is undone by it: on a slow
+# GitHub runner a composer case's injected hint was hidden again before it was measured. The last step names the route in the address (the
+# page is opened without one), and Send is off while a chat it opens loads.
+STARTED_JS = "location.hash.startsWith('#/') && !document.querySelector('#send').disabled"
+
+
+def open_case(browser: Browser, url: str, width: int, height: int, scheme: str) -> None:
+    """browser.open, and then the page's own start-up to its end, so that a case is set up on a page that will not change it."""
+    browser.open(url, width, height, scheme)
+    browser.wait_for(STARTED_JS, 30, "the page to start: its route in the address, Send on")
+
 def enter_busy(browser: Browser, state: str, drawer: bool) -> Optional[str]:
     """The page in the busy composer of one case, by what a user does (P9-G5b fix 1): the image attached as in the idle cases, then, for
     "busy" and "busy-8-chips", Send with the upload held; for "busy-after-save" Save, the seven chips again (the page drew its own), Send;
@@ -984,7 +996,7 @@ def run_checks(browser: Browser, url: str) -> Tuple[int, List[str]]:
     for width, height, scroll in viewports:
         for scheme in SCHEMES:
             serial += 1
-            browser.open("{}?case={}".format(url, serial), width, height, scheme)
+            open_case(browser, "{}?case={}".format(url, serial), width, height, scheme)
             browser.key("Tab", "Tab", 9)   # keyboard modality, so :focus-visible matches when the toggle is focused
             browser.run(INJECT_JS, {"chips": CHIPS, "word": LONG_WORD, "text": REPORT_TEXT})
             for drawer in ("closed", "open"):
@@ -1029,7 +1041,7 @@ def run_checks(browser: Browser, url: str) -> Tuple[int, List[str]]:
                        + (STRESS_STATES if (width, height, drawer) in COMPOSER_STRESS_CASES else []))   # P9-G5b fix 1
         for scheme in SCHEMES:
             serial += 1
-            browser.open("{}?case={}".format(url, serial), width, height, scheme)
+            open_case(browser, "{}?case={}".format(url, serial), width, height, scheme)
             for state in COMPOSER_STATES:
                 cases += 1
                 where = ("{}x{}".format(width, height), "drawer={} composer {}".format("open" if drawer else "closed", state))
@@ -1040,7 +1052,7 @@ def run_checks(browser: Browser, url: str) -> Tuple[int, List[str]]:
                     seen.setdefault(where + (failure,), []).append(scheme)
             for state in busy_states:   # a busy page is busy for good (an upload held, a chat made): each busy case has a page of its own
                 serial += 1
-                browser.open("{}?case={}".format(url, serial), width, height, scheme)
+                open_case(browser, "{}?case={}".format(url, serial), width, height, scheme)
                 cases += 1
                 where = ("{}x{}".format(width, height), "drawer={} composer {}".format("open" if drawer else "closed", state))
                 reason = enter_busy(browser, state, drawer)
@@ -1052,7 +1064,7 @@ def run_checks(browser: Browser, url: str) -> Tuple[int, List[str]]:
     for width, height in VIEWER_TOUCH_VIEWPORTS:   # the viewer on a landscape phone, where it is stacked and scrolls by touch (P6 fix 1)
         for scheme in SCHEMES:
             serial += 1
-            browser.open("{}?case={}".format(url, serial), width, height, scheme)
+            open_case(browser, "{}?case={}".format(url, serial), width, height, scheme)
             for state in VIEWER_STATES:
                 cases += 1
                 pair = state == "pair"
@@ -1066,7 +1078,7 @@ def run_checks(browser: Browser, url: str) -> Tuple[int, List[str]]:
         for scheme in SCHEMES:
             serial += 1
             cases += 1
-            browser.open("{}?case={}".format(url, serial), width, height, scheme)
+            open_case(browser, "{}?case={}".format(url, serial), width, height, scheme)
             browser.run(INJECT_COMPARE_JS, {"events": compare_events(), "names": CHEXBERT_14})
             for drawer in ("closed", "open"):
                 browser.evaluate("document.querySelector('#drawer').hidden = {}".format("false" if drawer == "open" else "true"))
@@ -1076,7 +1088,7 @@ def run_checks(browser: Browser, url: str) -> Tuple[int, List[str]]:
         for scheme in SCHEMES:
             serial += 1
             cases += 1
-            browser.open("{}?case={}".format(url, serial), width, TALL_HEIGHT, scheme)
+            open_case(browser, "{}?case={}".format(url, serial), width, TALL_HEIGHT, scheme)
             browser.run(INJECT_JS, {"chips": CHIPS, "word": LONG_WORD, "text": REPORT_TEXT})
             browser.run(TALL_JS, {"px": TALL_HEIGHT})
             for failure in check_tall(browser.run(MEASURE_TALL_JS, None), TALL_HEIGHT):

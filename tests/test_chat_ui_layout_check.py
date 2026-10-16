@@ -1649,7 +1649,7 @@ class FakePage:
         self.stop_renders, self.floor, self.save_renders, self.busy_fails = stop_renders, floor, save_renders, busy_fails
         self.width, self.height = 0, 0
         self.drawer, self.stop = False, False
-        self.opened = 0
+        self.opened, self.started = 0, 0   # pages opened, and waits for a page's start-up (open_case)
         self.sections_drawn, self.sections_measured, self.picker_measured = 0, 0, 0
         self.composer_set_up, self.composer_measured = [], 0
         self.flow, self.chips, self.held, self.injected_drawer, self.state = [], 0, False, False, "hint"
@@ -1671,6 +1671,9 @@ class FakePage:
         self.flow.append(selector)
 
     def wait_for(self, expression: str, timeout: float = 15.0, what: Optional[str] = None, interval: float = 0.04) -> bool:
+        if expression == layout.STARTED_JS:   # the page starts; a page that never gets busy fails only what a click should do
+            self.started += 1
+            return True
         if self.busy_fails:
             raise TimeoutError("waited {:g} s for {}".format(timeout, what or expression))
         return True
@@ -1810,6 +1813,16 @@ def test_the_loop_reports_a_page_that_never_gets_busy_as_a_failure_of_the_busy_c
     assert failures and all("the page did not get to the busy composer" in f and "waited 15 s for" in f for f in failures), failures
     named = {state for state in layout.BUSY_STATES if any("composer {}:".format(state) in f for f in failures)}
     assert named == set(layout.BUSY_STATES), named   # every busy state is named, and every failure is of one
+
+
+def test_every_case_is_set_up_after_the_page_has_started():
+    """The page syncs its controls at each step of its start-up (app.js start: models and chats, then the route), and the chats' answer hides a
+    re-run hint set up before it: on a slow GitHub runner 'composer hint: #rerun-hint is not rendered' came and went. So every page the loop
+    opens is waited for to the end of its start-up (open_case) before a case is set up on it."""
+    page = FakePage()
+    layout.run_checks(page, "http://x/")
+    assert page.opened > 0 and page.started == page.opened
+    assert "location.hash" in layout.STARTED_JS and "#send" in layout.STARTED_JS
 
 
 def test_the_loop_reports_a_save_button_that_never_renders_in_the_save_cases_only():
