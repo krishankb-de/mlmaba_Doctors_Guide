@@ -295,11 +295,11 @@ LOG_JS = """async (id) => {
 
 # Run by Chrome before the page's own scripts on every load (Context.stop_off): the stored settings, with the stop switch off.
 # How a turn is shown (reveal.js, cxrchat.display): every check but reveal watches a turn as it streams, so the page is given "live" before it
-# loads, unless the storage already says something (the reveal check stores the page's own default, in order with a 3 s pause, first).
+# loads, unless the storage already says something (the reveal check stores the page's own default, in order with a 5 s pause, first).
 LIVE_DISPLAY_JS = """try { if (localStorage.getItem('cxrchat.display') === null) localStorage.setItem('cxrchat.display', '{"reveal":"live","hold_s":3}'); }
 catch (e) { /* storage blocked: the page runs with its defaults */ }"""
-ORDERED_DISPLAY_JS = "localStorage.setItem('cxrchat.display', '{\"reveal\":\"ordered\",\"hold_s\":3}')"
-REVEAL_HOLD_S = 3
+ORDERED_DISPLAY_JS = "localStorage.setItem('cxrchat.display', '{\"reveal\":\"ordered\",\"hold_s\":5}')"
+REVEAL_HOLD_S = 5
 # The welcome page as the page shows it, and the page behind it.
 WELCOME_STATE_JS = """() => {
   const q = (s) => document.querySelector(s);
@@ -1808,7 +1808,7 @@ def settings_walk(ctx: Context) -> Tuple[str, Dict[str, Any]]:
 def check_reveal(ctx: Context) -> Tuple[str, Dict[str, Any]]:
     """The page opened with no address opens on the welcome page, the chat behind it inert; Start reading, a click on its centre, opens a new
     chat with the focus on the image well. With Show results in order (the page's own default, which every other check sets to live), a turn is
-    the reading card from Send (its X-ray on the lightbox, the stages as they run, no report) until it has ended and the 3 s pause since Send is
+    the reading card from Send (its X-ray on the lightbox, the stages as they run, no report) until it has ended and the 5 s pause since Send is
     over; then the whole card is shown, top to bottom (every line of the report before the parts under it), and its reveal ends by itself, Show
     all now gone. A second turn's Show all now, pressed from the keyboard, ends its reveal at once and hands the focus to Copy."""
     b = ctx.browser

@@ -12,14 +12,14 @@ const memoryStorage = (initial = {}) => {
 };
 const brokenStorage = () => ({ getItem() { throw new Error('blocked'); }, setItem() { throw new Error('blocked'); } });
 
-test('the display setting: ordered with a 3 s pause unless set, anything else is the default, and it is kept under cxrchat.display', () => {
-  assert.deepEqual(DEFAULT_DISPLAY, { reveal: 'ordered', hold_s: 3 });
+test('the display setting: ordered with a 5 s pause unless set, anything else is the default, and it is kept under cxrchat.display', () => {
+  assert.deepEqual(DEFAULT_DISPLAY, { reveal: 'ordered', hold_s: 5 });
   assert.equal(DISPLAY_KEY, 'cxrchat.display');
   assert.deepEqual(HOLD_CHOICES, [0, 1, 2, 3, 4, 5]);
   for (const raw of [undefined, null, 42, 'live', [], { reveal: 'fast', hold_s: 7 }, { hold_s: '2' }, { hold_s: 2.5 }]) {
     const s = sanitizeDisplay(raw);
     assert.equal(s.reveal, 'ordered', JSON.stringify(raw));
-    assert.equal(s.hold_s, 3, JSON.stringify(raw));
+    assert.equal(s.hold_s, 5, JSON.stringify(raw));
   }
   assert.deepEqual(sanitizeDisplay({ reveal: 'live', hold_s: 0, other: 'x' }), { reveal: 'live', hold_s: 0 });   // a key it does not know is dropped
   for (const storage of [undefined, null, memoryStorage(), brokenStorage(), memoryStorage({ [DISPLAY_KEY]: '{not json' })]) {

@@ -3,7 +3,7 @@
 // Two ways to show a turn, a setting of the page (the drawer's "Showing results"), stored apart from the turn's options under cxrchat.display:
 // it changes what the page draws and never what the server runs, so it is never sent (app/schemas.py Options refuses any key it does not know).
 //   ordered (the default)   From Send the card is the reading card (render.js renderReadingCard): the X-ray on a lightbox and the stages as they
-//                           really run. It stays until the turn has ended AND the pause the setting names has passed since Send (3 s unless
+//                           really run. It stays until the turn has ended AND the pause the setting names has passed since Send (5 s unless
 //                           changed), so that a fast turn is not thrown at the reader the instant it lands. Then the whole card is drawn and
 //                           shown in order: the report line by line, then each part under it (findings, similar X-rays, matching reports, the
 //                           rest). A turn that fails or is stopped is shown at once: an error is never held back.
@@ -18,7 +18,7 @@
 export const DISPLAY_KEY = 'cxrchat.display';
 export const REVEAL_MODES = Object.freeze(['ordered', 'live']);
 export const HOLD_CHOICES = Object.freeze([0, 1, 2, 3, 4, 5]);   // seconds of pause before a finished turn is shown (the drawer's list)
-export const DEFAULT_DISPLAY = Object.freeze({ reveal: 'ordered', hold_s: 3 });
+export const DEFAULT_DISPLAY = Object.freeze({ reveal: 'ordered', hold_s: 5 });   // 5 s: real reports on the cluster's CPU server took 3.5-3.7 s (2026-10-16)
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 

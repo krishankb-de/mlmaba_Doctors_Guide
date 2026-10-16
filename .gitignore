@@ -85,6 +85,7 @@ multirun/
 !README.md
 !app/README.md
 !CLAUDE.md
+!/.claude/skills/*/SKILL.md
 
 # Local only, never committed: notes and plans kept beside the checkout, and Claude Code's personal memory file
 /.local/

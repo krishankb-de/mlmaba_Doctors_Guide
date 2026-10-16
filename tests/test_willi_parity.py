@@ -10578,12 +10578,12 @@ def test_pytest_ini_is_read_and_an_unregistered_mark_stops_the_run(tmp_path):
 # ---- the Dr. Green redesign (2026-10-16): how a turn is shown is the page's own --------------------------------------------------------
 
 def test_dr_green_how_a_turn_is_shown_is_a_setting_of_the_page_and_never_reaches_the_server():
-    """app/static/reveal.js (new): a turn is read on its reading card, then shown top to bottom after a pause (3 s unless set), or live as before.
+    """app/static/reveal.js (new): a turn is read on its reading card, then shown top to bottom after a pause (5 s unless set), or live as before.
     It is a setting of the page under its own storage key, never one of the options a turn sends, which app/schemas.py Options would refuse
     (extra="forbid"): the decoding protocol and its defaults are untouched. The welcome page opens only from the browser's own start."""
     reveal = _p9b_text("app", "static", "reveal.js")
     assert "export const DISPLAY_KEY = 'cxrchat.display';" in reveal
-    assert "export const DEFAULT_DISPLAY = Object.freeze({ reveal: 'ordered', hold_s: 3 });" in reveal
+    assert "export const DEFAULT_DISPLAY = Object.freeze({ reveal: 'ordered', hold_s: 5 });" in reveal
     assert "fetch" not in reveal and "setTimeout" not in reveal   # pure, but for marking a built card: app.js owns the timers and the page
     app_js = _p9b_text("app", "static", "app.js")
     assert "from './reveal.js';" in app_js

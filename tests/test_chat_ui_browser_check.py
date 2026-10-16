@@ -435,10 +435,10 @@ def test_the_checks_are_the_eleven_in_order():
 
 def test_every_check_but_reveal_watches_a_live_turn_and_reveal_stores_the_page_default_first():
     """reveal.js shows a turn read and then in order unless the page is told live: every check of a streaming card is given live before the page
-    loads (only when the storage says nothing), and the reveal check stores the page's own default, in order with a 3 s pause, first."""
+    loads (only when the storage says nothing), and the reveal check stores the page's own default, in order with a 5 s pause, first."""
     source = SCRIPT.read_text()
     assert "localStorage.getItem('cxrchat.display') === null" in check.LIVE_DISPLAY_JS and '"reveal":"live"' in check.LIVE_DISPLAY_JS
-    assert '"reveal":"ordered"' in check.ORDERED_DISPLAY_JS and '"hold_s":3' in check.ORDERED_DISPLAY_JS and check.REVEAL_HOLD_S == 3
+    assert '"reveal":"ordered"' in check.ORDERED_DISPLAY_JS and '"hold_s":5' in check.ORDERED_DISPLAY_JS and check.REVEAL_HOLD_S == 5
     assert 'browser.call("Page.addScriptToEvaluateOnNewDocument", source=LIVE_DISPLAY_JS)' in source
     assert "localStorage.removeItem('cxrchat.display')" in source   # each check starts from the live default again
 

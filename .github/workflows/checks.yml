@@ -58,10 +58,12 @@ jobs:
           else
             range="$head"
           fi
-          # Paths that stay on the laptop (CLAUDE.md, .gitignore); .claude/settings.json is the shared project settings file.
+          # Paths that stay on the laptop (CLAUDE.md, .gitignore). Of .claude/ only what is shared is committed: the project settings file, and a
+          # project skill's own SKILL.md and VERSION (instructions anyone who clones the repository uses); its local settings, locks and anything
+          # else stay home.
           local_only() {
             grep -E '^(\.local/|\.staging/|CLAUDE\.local\.md$|scripts/chat_cluster\.env$|\.sync_stamp$|venv/|\.venv/|graphify-out/|node_modules/|\.claude/)|(^|/)\.?physionet_session$' \
-              | grep -v -x -F '.claude/settings.json' || true
+              | grep -v -x -E '\.claude/settings\.json|\.claude/skills/[A-Za-z0-9_-]+/(SKILL\.md|VERSION)' || true
           }
           # HEAD = the commit's parent (unborn for a root commit) and the index = the commit: the hook then sees what committing it
           # staged. The working tree is not touched, so the hook and this script stay the head's.

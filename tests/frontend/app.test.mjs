@@ -7410,7 +7410,7 @@ const ordered = (display = {}) => memoryStorage(Object.keys(display).length ? { 
 const stepsOf = (card) => qa(card, '.reading-steps > li').map((li) => [li.getAttribute('data-stage'), li.getAttribute('data-state')]);
 
 test('a turn is read, then shown in order: the reading card while it runs, held for the pause after it ends, then the card top to bottom', async () => {
-  const h = await ready({ options: { storage: ordered() } });   // nothing stored: the page's default, in order with a 3 s pause
+  const h = await ready({ options: { storage: ordered() } });   // nothing stored: the page's default, in order with a 5 s pause
   const events = fullTurn();
   const turn = h.app.send();
   await flush();
@@ -7436,8 +7436,8 @@ test('a turn is read, then shown in order: the reading card while it runs, held 
   card = cardOf();
   assert.deepEqual([card.getAttribute('data-phase'), card.getAttribute('data-status'), q(card, '.card-what').textContent], ['reading', 'done', 'Report ready']);
   assert.deepEqual([$('send').disabled, $('stop').hidden], [false, true]);   // the pause holds the card, not the page
-  h.timers.advance(2999);
-  assert.equal(cardOf().getAttribute('data-phase'), 'reading');   // the pause runs 3 s from Send
+  h.timers.advance(4999);
+  assert.equal(cardOf().getAttribute('data-phase'), 'reading');   // the pause runs 5 s from Send
   h.timers.advance(1);
   card = cardOf();
   assert.equal(card.hasAttribute('data-phase'), false);
@@ -7512,7 +7512,7 @@ test('Showing results in the drawer: kept apart under cxrchat.display and never 
   const reveal = control('Show results');
   const hold = control('Pause before results');
   assert.equal(labelled('Show results').parentNode.querySelector('legend').textContent, 'Showing results');
-  assert.deepEqual([reveal.value, hold.value, hold.disabled], ['ordered', '3', false]);
+  assert.deepEqual([reveal.value, hold.value, hold.disabled], ['ordered', '5', false]);
   assert.deepEqual(texts(qa(reveal, 'option')), ['When complete, top to bottom', 'Live, as the report is written']);
   assert.deepEqual(texts(qa(hold, 'option')), ['No pause', '1 second', '2 seconds', '3 seconds', '4 seconds', '5 seconds']);
   assert.equal(hold.getAttribute('aria-describedby'), 'hold-hint');
@@ -7533,8 +7533,8 @@ test('Showing results in the drawer: kept apart under cxrchat.display and never 
   assert.deepEqual([saved(h).beam_size, saved(h).display_repair], [6, false]);
   buttonOf($('drawer'), 'Restore defaults').click();
   assert.deepEqual([saved(h).beam_size, saved(h).display_repair, saved(h).stop_on_repeat], [3, true, true]);
-  assert.deepEqual([control(BEAM).value, control('Display repair').checked, reveal.value, hold.value, hold.disabled], ['3', true, 'ordered', '3', false]);
-  assert.deepEqual(JSON.parse(h.storage.data.get(DISPLAY_KEY)), { reveal: 'ordered', hold_s: 3 });
+  assert.deepEqual([control(BEAM).value, control('Display repair').checked, reveal.value, hold.value, hold.disabled], ['3', true, 'ordered', '5', false]);
+  assert.deepEqual(JSON.parse(h.storage.data.get(DISPLAY_KEY)), { reveal: 'ordered', hold_s: 5 });
   assert.equal($('status').textContent, 'Defaults restored. They apply from your next Send.');
   assert.equal(q($('drawer'), '.drawer-actions').children.at(-1), $('drawer-save'));   // Save still ends the form
 });
