@@ -11,11 +11,13 @@ from app import server
 from app.server import create_app
 
 STATIC = Path(__file__).resolve().parents[1] / "app" / "static"
-BANNER = "Research prototype — not for clinical use."
+BANNER = "Research prototype; not for clinical use."   # the server's own words (app/schemas.py DISCLAIMER)
 TOKENS = ["--bg", "--fg", "--muted", "--accent", "--card", "--border", "--ok", "--warn", "--bad"]
 IDS = ["mode-badge", "test-badge", "health", "sidebar", "new-session", "session-list", "conversation", "drawer", "composer",
-       "image-well", "preview", "prompt", "chips", "settings", "send", "stop", "file", "viewer", "sidebar-toggle"]
-HIDDEN_AT_START = ["drawer", "preview", "stop", "file", "viewer", "test-badge"]   # the scripts show these by clearing `hidden`
+       "image-well", "preview", "prompt", "chips", "settings", "send", "stop", "file", "viewer", "sidebar-toggle",
+       "brand", "welcome", "welcome-title", "welcome-what", "welcome-start", "welcome-continue"]
+HIDDEN_AT_START = ["drawer", "preview", "stop", "file", "viewer", "test-badge", "welcome", "welcome-continue"]   # the scripts show these by clearing `hidden`
+TEXT_SUFFIXES = (".html", ".css", ".js", ".mjs")   # the page's code: what a browser reads as text (fonts, pictures and licence texts are not)
 DARK = r"@media\s*\(\s*prefers-color-scheme:\s*dark\s*\)"
 NARROW = r"@media\s*\(\s*max-width:\s*800px\s*\)"
 
@@ -28,7 +30,7 @@ def client(tmp_path):
 
 def test_index_is_served_and_has_the_banner(client):
     r = client.get("/")
-    assert r.status_code == 200 and "Research prototype — not for clinical use." in r.text
+    assert r.status_code == 200 and BANNER in r.text
 
 
 # P9-B: what the page says of its API server, word for word, and how many times each file of app/static says it. These sentences, whole, and
@@ -63,7 +65,7 @@ def test_the_absolute_url_guard_takes_out_only_the_display_sentences_whole():
 
 
 def test_each_display_sentence_is_in_the_file_that_says_it_as_many_times_as_it_says_it():
-    for p in sorted(q for q in STATIC.rglob("*") if q.is_file()):
+    for p in sorted(q for q in STATIC.rglob("*") if q.is_file() and q.suffix in TEXT_SUFFIXES):
         text = p.read_text(encoding="utf-8")
         for sentence, where in DISPLAY_SENTENCES.items():
             assert text.count(sentence) == where.get(p.name, 0), (p.name, sentence)
@@ -73,7 +75,7 @@ def test_page_makes_no_external_requests():
     import re
     from pathlib import Path
     static = Path("app/static")
-    for f in static.glob("*"):
+    for f in (q for q in static.rglob("*") if q.is_file() and q.suffix in TEXT_SUFFIXES):
         text = f.read_text()
         assert not ABSOLUTE_URL.search(_besides_the_display_sentences(text)), f
         assert "EventSource" not in text, f
@@ -185,7 +187,7 @@ def test_the_placeholder_page_is_not_cached_either(tmp_path, monkeypatch):
 def test_static_files_are_self_contained():
     files = [p for p in STATIC.rglob("*") if p.is_file()]
     assert {"index.html", "styles.css"} <= {p.name for p in files}   # the brief's scan passes on an empty directory
-    forbidden = [r"https?://", r"EventSource", r"<svg", r"@import", r"@font-face",    # no CDN, no web font, no SVG icon
+    forbidden = [r"https?://", r"EventSource", r"<svg", r"@import",    # no CDN and no SVG icon (fonts: the test below)
                  r"""(?:src|href)\s*=\s*["']\s*//""", r"""url\(\s*["']?\s*//"""]   # nor a protocol-relative URL
     for p in files:
         assert p.suffix != ".svg", p
@@ -244,7 +246,8 @@ def test_banner_is_a_landmark_with_the_disclaimer_in_a_paragraph_and_the_toggle_
 def test_the_test_model_badge_follows_the_toggle_in_the_banner_and_says_test_model_and_the_notice_style_is_in_the_sheet():   # P9-G5b
     html = _html()
     banner = re.search(r"<header([^>]*)>(.*?)</header>", html, re.S).group(2)
-    assert re.search(r'>☰</button>\s*<span id="test-badge" hidden>test model</span>\s*<p class="disclaimer">', banner)   # in the toggle's row on a phone
+    assert re.search(r'>☰</button>\s*<button id="brand"[^>]*>.*?</button>\s*<span id="test-badge" hidden>test model</span>\s*<p class="disclaimer">', banner,
+                     re.S)   # in the toggle's row on a phone, after Dr. Green
     css = re.sub(r"/\*.*?\*/", "", (STATIC / "styles.css").read_text(encoding="utf-8"), flags=re.S)
     assert re.search(r"#test-badge\s*\{[^}]*var\(--warn\)", css), "the badge has its own rule, in the warning colour"
     assert re.search(r"\.test-notice\s*\{[^}]*var\(--warn\)", css), "the card's notice has its own rule, in the warning colour"
@@ -498,13 +501,18 @@ def test_the_banner_stays_above_the_viewer_the_drawer_the_sidebar_and_the_scrim(
     sticky banner unless it is the topmost layer."""
     layers = [(h, int(v)) for _, h, b in _walk(_stylesheet()) for v in re.findall(r"(?<![\w-])z-index:\s*(-?\d+)", b)]
     assert [z for h, z in layers if h == ".banner"] == [60], layers
-    others = {h: z for h, z in layers if h != ".banner"}
+    # The welcome page lies over the whole page, banner and all, until it is closed (app.js); what is inside it stacks inside it (it is fixed
+    # and has a z-index of its own, so it is a stacking context) and never meets the banner.
+    welcome = {h: z for h, z in layers if h.startswith(("#welcome", ".welcome-", ".speech"))}
+    assert welcome.get("#welcome", 0) > 60, welcome
+    others = {h: z for h, z in layers if h != ".banner" and h not in welcome}
     assert others and all(z < 60 for z in others.values()), others
 
 
 # Classes render.js gives an element for the scripts to find and the tests to read, that no rule needs to style.
 HOOK_ONLY = {"label", "notice", "stopped", "error", "truncated", "unknown", "user", "values", "more", "clip", "clip-text",
-             "report-body", "mark", "error-hint"}
+             "report-body", "mark", "error-hint",
+             "findings", "reading"}   # the findings are a section of the card (.card > section); the reading card is styled by its data-phase
 
 
 def test_every_class_render_js_emits_is_styled_or_a_plain_hook():
@@ -531,9 +539,9 @@ def test_a_compare_card_is_wider_than_the_column_and_stands_its_two_reports_side
     assert re.search(r"max-width:\s*var\(--compare-w\)", rule("#conversation > .card.compare-card"))
     assert re.search(r"container:\s*compare-card\s*/\s*inline-size", rule(".compare-card"))
     queries = [(h, b) for h, b in css if h.startswith("@container compare-card")]
-    # a container query measures the card's content box: 900 px less 16 px of padding and 1 px of border on each side (the .card rule)
-    assert [h for h, _ in queries] == ["@container compare-card (min-width: 866px)"]
-    assert re.search(r"padding:\s*16px", rule(".card")) and re.search(r"border:\s*1px solid", rule(".card"))
+    # a container query measures the card's content box: 900 px less 20 px of padding and 1 px of border on each side (the .card rule)
+    assert [h for h, _ in queries] == ["@container compare-card (min-width: 858px)"]
+    assert re.search(r"padding:\s*18px 20px", rule(".card")) and re.search(r"border:\s*1px solid", rule(".card"))
     assert re.search(r"grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)", queries[0][1])
     assert re.search(r"grid-template-columns:\s*minmax\(0,\s*1fr\)\s*;", rule(".compare-columns"))   # one column below that: stacked
 
@@ -597,3 +605,47 @@ def test_the_saved_line_is_a_row_of_the_composer_that_takes_no_room_while_it_is_
 
 def test_a_confirmation_that_is_a_warning_is_in_the_warning_colour():   # P4-G fix 1: Save with refused storage says so in the same region
     assert re.search(r"color:\s*var\(--warn\)", _rule('#saved[data-state="warn"]'))
+
+
+# ---- the Dr. Green redesign: its fonts and pictures are the page's own files ----------------------------------------------------------
+
+def test_web_fonts_are_served_from_the_page_with_their_licence_beside_them():
+    """The user allowed web fonts (2026-10-16): each @font-face loads a woff2 under app/static/fonts by a relative URL (no request leaves the
+    page's origin), the file is a real WOFF2, and the SIL Open Font License text of each family is beside it (NOTICE names them)."""
+    css = re.sub(r"/\*.*?\*/", "", (STATIC / "styles.css").read_text(encoding="utf-8"), flags=re.S)
+    faces = re.findall(r"@font-face\s*\{(.*?)\}", css, re.S)
+    assert len(faces) == 2
+    for face in faces:
+        src = re.search(r'src:\s*url\("(fonts/[\w.-]+\.woff2)"\)\s*format\("woff2"\)', face)
+        assert src, face
+        assert (STATIC / src.group(1)).read_bytes()[:4] == b"wOF2", src.group(1)
+        assert re.search(r"font-display:\s*swap", face)
+    for licence in ("OFL-atkinson-hyperlegible-next.txt", "OFL-literata.txt"):
+        text = (STATIC / "fonts" / licence).read_text(encoding="utf-8")
+        assert "SIL Open Font License, Version 1.1" in text and "Reserved Font Name" not in text.split("PREAMBLE")[0], licence
+    notice = (STATIC.parents[1] / "NOTICE").read_text(encoding="utf-8")
+    assert "Atkinson Hyperlegible Next" in notice and "Literata" in notice
+
+
+def test_every_picture_the_sheet_draws_is_a_png_of_the_page():
+    """The illustration and Dr. Green's face come from app/static/img by relative url() (the commit hook takes PNG and refuses JPEG and WEBP,
+    the formats MIMIC-CXR-JPG ships in), and the scripts set no image URL of their own (the face is the stylesheet's .avatar)."""
+    css = re.sub(r"/\*.*?\*/", "", (STATIC / "styles.css").read_text(encoding="utf-8"), flags=re.S)
+    pictures = set(re.findall(r'url\("(img/[\w.-]+)"\)', css))
+    assert pictures == {"img/dr-green-wide.png", "img/dr-green-tall.png", "img/dr-green-face.png"}
+    for picture in pictures:
+        assert (STATIC / picture).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n", picture
+    assert {p.suffix for p in (STATIC / "img").iterdir()} == {".png"}
+    for script in STATIC.glob("*.js"):
+        assert "/img/" not in script.read_text(encoding="utf-8"), script.name
+
+
+def test_the_welcome_page_starts_hidden_and_says_what_dr_green_is_and_that_it_is_no_clinician():
+    by_id = _by_id()
+    assert by_id["welcome"][0] == "section" and by_id["welcome"][1]["aria-labelledby"] == "welcome-title"
+    html = _html()
+    welcome = html[html.index('<section id="welcome"'):]
+    assert ">Hi there.</h1>" in welcome and ">Hi, I'm Dr. Green.</p>" in welcome   # the greeting, and what he says in the bubble
+    assert '<p class="disclaimer">' + BANNER + "</p>" in welcome   # the welcome page says it too
+    assert ">Start reading</button>" in welcome
+    assert "—" not in html   # no em dash anywhere on the page (antislop R-02)

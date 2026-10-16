@@ -1,4 +1,4 @@
-/* CXR report chat: the page shell (CHAT_UI_PLAN.md P4-A).
+/* CXR report chat: the page shell (CHAT_UI_PLAN.md P4-A), in the Dr. Green reading-room look.
  *
  * Layout: the body is one grid, the banner over sidebar | conversation | drawer, with the composer under the
  * conversation. .layout is display: contents so its three children and the composer share that grid. Each pane
@@ -6,34 +6,67 @@
  * needs of the rest, scrolling inside only when that is not enough. Below 800 px the grid is one column. The sidebar
  * then overlays the conversation and the composer, the drawer only the conversation, so Settings (which closes the
  * drawer) and Send stay in reach; the banner stays in view over both. Below 480 px of height the page scrolls
- * instead and nothing is pinned or capped (WCAG 1.4.10).
+ * instead and nothing is pinned or capped (WCAG 1.4.10). The welcome page (#welcome) lies over all of it, fixed to the
+ * viewport and scrolling by itself, until Start reading or Continue closes it (app.js).
  *
- * Hooks the scripts use: the hidden attribute (drawer, preview, stop, viewer), body.sidebar-open (the off-canvas
- * sidebar; a click on its scrim lands on the body), #image-well.dragging, ol.timeline li[data-state] and li.open,
- * .provisional, and the .card and .chip helpers (render.js). app.js builds the rows of #session-list, #exports,
+ * Hooks the scripts use: the hidden attribute (drawer, preview, stop, viewer, welcome), body.sidebar-open (the off-canvas
+ * sidebar; a click on its scrim lands on the body), body.welcome-open, #image-well.dragging, ol.timeline li[data-state] and
+ * li.open, .provisional, .card[data-phase="reading"] and .card[data-reveal] (the reading card and the ordered reveal, reveal.js),
+ * and the .card and .chip helpers (render.js). app.js builds the rows of #session-list, #exports,
  * #session-more, #notice, #rerun-hint (under the image well), #saved (under the chips), the contents of #drawer (a form that ends in Save)
  * and #health[data-state="down"], styled below. composer.js builds #preview's thumbnail, line and Remove (P6-A); viewer.js builds the
  * contents of #viewer (.viewer-*), and sets body.viewer-open, the inert attribute of the page behind it and --viewer-top (P6-E).
  *
- * System fonts only and no url(): the page makes no request but to its own /static/ files.
+ * Look (the reasons, one line each):
+ *   colour   a cool backlit "lightbox" ground by day and a dim reading-room slate by night; one accent, scrub green (the colour of surgical
+ *            scrubs, and Dr. Green's name), kept for Send, focus, the running stage, positive findings and similarity bars; X-rays on black.
+ *   type     Atkinson Hyperlegible Next for the page: drawn so that letters that look alike (l, 1, I; 0, O) do not, which matters in
+ *            numbers and drug-like terms. Literata for the report: a text face drawn for long reading on screens, so the report reads as
+ *            the document and the rest as its frame. Both are served from /static/fonts/ (no request leaves the page's origin).
+ *   shape    sheets 6 px, controls 8 px, the avatar a circle; no pills. Shadow only where something lies over the page (the drawer and the
+ *            sidebar on a phone, the viewer), so elevation means "over".
+ *   motif    film-mount corners: four small L marks around the image well, the reading lightbox and every picture of a card, as films
+ *            are clipped onto a viewbox.
+ *   motion   one moment per screen: the greeting bubble on the welcome page, the scan line while an X-ray is read, and the report written
+ *            top to bottom when it is shown. None of it for a reader who asked for less.
  */
+
+@font-face {
+  font-family: "Atkinson Hyperlegible Next";
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url("fonts/atkinson-hyperlegible-next-latin-wght.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Literata";
+  font-style: normal;
+  font-weight: 200 900;
+  font-display: swap;
+  src: url("fonts/literata-latin-wght.woff2") format("woff2");
+}
 
 :root {
   color-scheme: light dark;
-  --bg: #faf9f5;
-  --fg: #1f1e1d;
-  --muted: #66645e;
-  --accent: #b4472a;
-  --card: #ffffff;
-  --border: #dcd8cc;
-  --ok: #2b7a4b;
-  --warn: #8a5a00;
-  --bad: #b3261e;
+  --bg: #edf2f5;          /* lightbox */
+  --fg: #18242d;          /* chart ink */
+  --muted: #4f5f6b;       /* film grey */
+  --accent: #1d6650;      /* scrub green */
+  --card: #fbfcfd;        /* the report sheet */
+  --border: #c9d4db;
+  --ok: #1b6e3e;
+  --warn: #8a5300;
+  --bad: #b42318;
   --on-accent: #ffffff;   /* text on an accent fill */
-  --soft: #f0eee6;        /* hover and selected fill */
-  --control: #8a877e;     /* border of a form control: 3:1 against --bg and --card */
-  --shadow: 0 1px 2px rgba(31, 30, 29, 0.06), 0 6px 20px rgba(31, 30, 29, 0.06);
-  --scrim: rgba(31, 30, 29, 0.45);
+  --soft: #e1e9ee;        /* hover and selected fill */
+  --control: #74858f;     /* border of a form control: 3:1 against --bg and --card */
+  --shadow: 0 1px 2px rgba(24, 36, 45, 0.08), 0 10px 28px rgba(24, 36, 45, 0.14);
+  --scrim: rgba(24, 36, 45, 0.45);
+  --wash: rgba(237, 242, 245, 0.9);        /* over the illustration behind the conversation: there, not in the way */
+  --wash-empty: rgba(237, 242, 245, 0.55); /* an empty chat: Dr. Green shows through */
+  --film: #000000;        /* an X-ray is read on black, in both themes */
+  --scan: rgba(108, 195, 160, 0.38);       /* the scan line over the lightbox */
 
   --sidebar-w: 260px;
   --drawer-w: 320px;
@@ -41,27 +74,31 @@
   --column-w: 760px;
   --compare-w: 1200px;    /* a compare card's widest (P9-F): room for its two reports side by side */
   --gutter: 24px;
-  --radius: 12px;
-  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --radius: 6px;          /* a sheet */
+  --radius-control: 8px;  /* a control */
+  --font: "Atkinson Hyperlegible Next", "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --serif: "Literata", "Iowan Old Style", "Sitka Text", Cambria, Georgia, serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #1f1e1d;
-    --fg: #ece9e1;
-    --muted: #a8a59c;
-    --accent: #e8926f;
-    --card: #2b2a28;
-    --border: #3e3c38;
-    --ok: #6fcf97;
-    --warn: #e0b04a;
-    --bad: #f08a80;
-    --on-accent: #1f1e1d;
-    --soft: #33312e;
-    --control: #85827a;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 20px rgba(0, 0, 0, 0.35);
+    --bg: #121b22;        /* reading-room slate */
+    --fg: #e4ecf1;
+    --muted: #9db0bd;
+    --accent: #6cc3a0;
+    --card: #1a252e;
+    --border: #2c3b46;
+    --ok: #74d39b;
+    --warn: #e2b04f;
+    --bad: #f28b82;
+    --on-accent: #0f1a16;
+    --soft: #22303a;
+    --control: #6f8492;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.45), 0 10px 28px rgba(0, 0, 0, 0.4);
     --scrim: rgba(0, 0, 0, 0.6);
+    --wash: rgba(18, 27, 34, 0.9);
+    --wash-empty: rgba(18, 27, 34, 0.62);
   }
 }
 
@@ -87,15 +124,15 @@ body {
   overflow: hidden;
   background: var(--bg);
   color: var(--fg);
-  font: 16px/1.5 var(--font);
+  font: 16px/1.55 var(--font);
 }
 
 .layout { display: contents; }
 
 a { color: var(--accent); text-underline-offset: 2px; }
-h1, h2, h3, h4 { margin: 0 0 8px; line-height: 1.3; }
-h1 { font-size: 1.25rem; }
-h2 { font-size: 1.125rem; }
+h1, h2, h3, h4 { margin: 0 0 8px; line-height: 1.25; }
+h1 { font-size: 1.5625rem; }
+h2 { font-size: 1.25rem; }
 h3, h4 { font-size: 1rem; }
 p { margin: 0 0 8px; }
 pre, code { font-family: var(--mono); font-size: 0.875em; }
@@ -104,7 +141,7 @@ img { max-width: 100%; height: auto; }
 
 table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
 th, td { padding: 4px 8px; border-top: 1px solid var(--border); text-align: left; vertical-align: top; }
-th { color: var(--muted); font-weight: 500; overflow-wrap: normal; }   /* a key keeps its width; the value wraps */
+th { color: var(--muted); font-weight: 600; overflow-wrap: normal; }   /* a key keeps its width; the value wraps */
 
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 ::placeholder { color: var(--muted); opacity: 1; }
@@ -126,10 +163,11 @@ button {
   min-height: 40px;
   padding: 8px 14px;
   border: 1px solid var(--control);
-  border-radius: 10px;
+  border-radius: var(--radius-control);
   background: var(--card);
   color: inherit;
   font: inherit;
+  font-weight: 600;
   cursor: pointer;
 }
 button:hover:not(:disabled) { background: var(--soft); }
@@ -141,12 +179,40 @@ input[type="url"], input[type="search"] {
   max-width: 100%;
   padding: 8px 12px;
   border: 1px solid var(--control);
-  border-radius: 10px;
-  background: var(--bg);
+  border-radius: var(--radius-control);
+  background: var(--card);
   color: inherit;
   font: inherit;
 }
-input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
+input[type="checkbox"], input[type="radio"] { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
+
+/* Dr. Green's face: the illustration's own, cropped (app/static/img). Drawn by the stylesheet, so no script sets an image URL. */
+.avatar {
+  display: inline-block;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--soft) url("img/dr-green-face.png") center / cover no-repeat;
+}
+
+/* The film-mount corners (the motif): four L marks in --mount drawn as eight thin gradients at the corners of the box. */
+.mount, #image-well, .lightbox, #conversation .picture-button {
+  --mount: var(--control);
+  --mount-len: 12px;
+  --mount-w: 2px;
+  background-image:
+    linear-gradient(var(--mount), var(--mount)), linear-gradient(var(--mount), var(--mount)),
+    linear-gradient(var(--mount), var(--mount)), linear-gradient(var(--mount), var(--mount)),
+    linear-gradient(var(--mount), var(--mount)), linear-gradient(var(--mount), var(--mount)),
+    linear-gradient(var(--mount), var(--mount)), linear-gradient(var(--mount), var(--mount));
+  background-position: top left, top left, top right, top right, bottom left, bottom left, bottom right, bottom right;
+  background-size:
+    var(--mount-len) var(--mount-w), var(--mount-w) var(--mount-len), var(--mount-len) var(--mount-w), var(--mount-w) var(--mount-len),
+    var(--mount-len) var(--mount-w), var(--mount-w) var(--mount-len), var(--mount-len) var(--mount-w), var(--mount-w) var(--mount-len);
+  background-repeat: no-repeat;
+}
 
 /* ---- banner -------------------------------------------------------------------------------------------------- */
 
@@ -158,43 +224,53 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px 12px;
-  min-height: 40px;
-  padding: 6px var(--gutter);
+  gap: 4px 14px;
+  min-height: 48px;
+  padding: 4px var(--gutter);
   border-bottom: 1px solid var(--border);
-  background: var(--soft);
-  background: color-mix(in srgb, var(--warn) 10%, var(--bg));
+  background: var(--card);
   font-size: 0.8125rem;
   font-weight: 500;
 }
-.disclaimer { margin: 0; }
+.disclaimer { margin: 0; color: var(--warn); font-weight: 600; }   /* the one thing every screen says: in the warning's colour */
+
+.brand {   /* Dr. Green: the face and the name; in the banner a button that opens the welcome page again */
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 2px 10px 2px 2px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: none;
+  color: var(--fg);
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: -0.005em;
+  white-space: nowrap;
+}
 
 #mode-badge {
-  padding: 0 8px;
+  padding: 1px 8px;
   border: 1px solid var(--control);
-  border-radius: 999px;
+  border-radius: var(--radius);
   font-size: 0.75rem;
   font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
-/* "test model": the server's default is the tiny engine, whose text is no report (app.js, render.js TEST_NOTICE; P9-G5b). It follows the toggle in the
-   markup. At 320 px the disclaimer takes a row of its own with the badge or without it, and the rest of the toggle's row is empty, so the badge costs
-   nothing there, whereas after the mode it would push the health strip onto another row and take 24 px from the composer at 320 x 568. From 360 to
-   414 px the disclaimer fits beside the toggle, and the badge pushes it onto a row of its own: on a page of the tiny engine the banner is 124 px tall,
-   against 100.5 px, a 24 px row. A real engine has no badge, and the banner no such row. */
+/* "test model": the server's default is the tiny engine, whose text is no report (app.js, render.js TEST_NOTICE; P9-G5b). It follows the brand,
+   in the toggle's row: at 320 px the disclaimer takes a row of its own with the badge or without it, and the toggle, the brand and the badge share
+   the first, so the badge costs no row there. A real engine has no badge. */
 #test-badge {
-  padding: 0 8px;
+  padding: 1px 8px;
   border: 1px solid var(--warn);
-  border-radius: 999px;
+  border-radius: var(--radius);
   color: var(--warn);
   font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  font-weight: 700;
 }
 #health { margin-left: auto; color: var(--muted); font-weight: 400; }
-#health[data-state="down"] { color: var(--warn); font-weight: 500; }   /* "server restarting…" */
+#health[data-state="down"] { color: var(--warn); font-weight: 600; }   /* "server restarting…" */
 #mode-badge:empty, #health:empty { display: none; }
 
 #sidebar-toggle { display: none; }   /* shown at 800 px and below */
@@ -208,17 +284,17 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   flex-direction: column;
   gap: 12px;
   min-height: 0;
-  padding: 12px;
+  padding: 14px 12px;
   overflow-y: auto;
   overflow-wrap: anywhere;
   border-right: 1px solid var(--border);
-  background: var(--bg);
+  background: var(--card);
 }
-#new-session { width: 100%; font-weight: 600; }
+#new-session { width: 100%; border-color: var(--accent); color: var(--accent); }
 #session-list { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
-#session-list a { display: block; padding: 8px 10px; border-radius: 8px; color: inherit; text-decoration: none; }
+#session-list a { display: block; padding: 8px 10px; border-radius: var(--radius-control); color: inherit; text-decoration: none; }
 #session-list a:hover, #session-list [aria-current], #session-list .active { background: var(--soft); }
-#session-list [aria-current], #session-list .active { font-weight: 600; }
+#session-list [aria-current], #session-list .active { font-weight: 700; }
 #session-list li { display: flex; align-items: center; gap: 4px; }   /* the link, and a delete button beside it */
 #session-list li > a { flex: 1 1 auto; min-width: 0; }
 .session-title, .session-meta { display: block; }
@@ -230,6 +306,24 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 
 /* ---- conversation: a centred column of turns ------------------------------------------------------------------ */
 
+/* Behind the conversation and the composer, one picture: the welcome page's illustration under a wash of the ground colour, there and light
+   enough that nothing reads over it. It is the body's own first grid item, laid over both rows, so that it does not stop at the composer; every
+   text of a turn lies on an opaque sheet or bubble. An empty chat lets Dr. Green show through. */
+body::before {
+  content: "";
+  grid-area: 2 / 2 / 4 / 3;
+  background:
+    linear-gradient(var(--wash), var(--wash)),
+    url("img/dr-green-wide.png") right bottom / cover no-repeat,
+    var(--bg);
+}
+body:has(#conversation:empty)::before {
+  background:
+    linear-gradient(var(--wash-empty), var(--wash-empty)),
+    url("img/dr-green-wide.png") 80% 20% / cover no-repeat,
+    var(--bg);
+}
+
 #conversation {
   grid-area: conversation;
   display: flex;
@@ -240,34 +334,46 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   padding: 24px var(--gutter) 16px;
   overflow-y: auto;
   overflow-wrap: anywhere;   /* a long word or URL wraps instead of widening the page */
+  scroll-padding-top: 16px;  /* a card shown top to bottom is scrolled to its head with room above it */
 }
 #conversation > * { flex: none; width: 100%; max-width: var(--column-w); margin-inline: auto; }
 
-#conversation:empty { align-items: center; justify-content: center; color: var(--muted); text-align: center; }
-#conversation:empty::before { content: "Attach a chest X-ray below to generate a report."; max-width: 28ch; font-size: 1.125rem; }
-
-.card {
-  padding: 16px;
+#conversation:empty { align-items: flex-start; justify-content: center; }
+#conversation:empty::before {   /* Dr. Green's line, on a sheet of its own so that it reads over the picture */
+  content: "Attach a chest X-ray below and I'll read it.";
+  max-width: 22ch;
+  margin-left: max(0px, calc(50% - var(--column-w) / 2));
+  padding: 14px 18px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--card);
-  box-shadow: var(--shadow);
+  color: var(--fg);
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.card {
+  padding: 18px 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
 }
 
 .chip {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 1px 10px;
+  padding: 1px 8px;
   border: 1px solid var(--control);
-  border-radius: 999px;
+  border-radius: var(--radius);
   font-size: 0.75rem;
   line-height: 1.6;
 }
 
 .provisional { color: var(--muted); font-style: italic; }   /* the best beam so far: earlier text can still change */
 
-.timeline { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; padding: 0; list-style: none; font-size: 0.8125rem; }
+.timeline { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; font-size: 0.8125rem; }
 .timeline > li {
   display: flex;
   flex-wrap: wrap;
@@ -275,18 +381,18 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   gap: 2px 6px;
   padding: 2px 10px;
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: var(--card);
   color: var(--muted);
 }
 /* The state glyphs are shapes: the state is also said in words (render.js), so each has empty alt text and is left out of the accessible
    name. Of each pair of declarations the first is for engines that do not know alt text. */
 .timeline > li::before { content: "○"; content: "○" / ""; }
-#conversation .timeline > li > button {   /* the control of a stage that has a detail: it reads as the label, inside the pill */
+#conversation .timeline > li > button {   /* the control of a stage that has a detail: it reads as the label, inside the item */
   min-height: 24px;
   padding: 0 2px;
   border: 0;
-  border-radius: 999px;
+  border-radius: 4px;
   background: none;
   color: inherit;
   font: inherit;
@@ -302,13 +408,18 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .timeline > li[data-state="error"] { border-color: var(--bad); color: var(--bad); }
 .timeline > li[data-state="error"]::before { content: "✕"; content: "✕" / ""; }
 .timeline > li > table { display: none; flex: 1 1 100%; }
-.timeline > li.open { flex: 1 1 100%; border-radius: var(--radius); }
+.timeline > li.open { flex: 1 1 100%; }
 .timeline > li.open > table { display: table; }
 
 /* ---- cards: the parts render.js builds ---------------------------------------------------------------------------- */
 
-.card { display: flex; flex-direction: column; gap: 12px; }   /* a part that is hidden takes no gap */
-.card > .timeline { margin: 0; }
+.card { display: flex; flex-direction: column; gap: 16px; }   /* a part that is hidden takes no gap */
+
+/* The head of a card: Dr. Green, what the card is, and (while a report is shown top to bottom) Show all now. */
+.card-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin: 0; }
+.card-who { font-weight: 700; }
+.card-what { color: var(--muted); font-size: 0.875rem; }
+#conversation .reveal-skip { margin-left: auto; }
 
 .turn.user { display: flex; justify-content: flex-end; }
 .turn.user > .bubble {
@@ -318,15 +429,16 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   gap: 8px;
   max-width: min(100%, 36rem);
   padding: 10px 14px;
+  border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--soft);
 }
 .user-text { margin: 0; white-space: pre-wrap; }   /* the user's own line breaks */
 .options { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; padding: 0; list-style: none; color: var(--muted); }
-.thumb { display: block; width: 96px; height: 96px; object-fit: cover; border: 1px solid var(--border); border-radius: 8px; }
+.thumb { display: block; width: 96px; height: 96px; object-fit: cover; border: 1px solid var(--border); border-radius: var(--radius); background: var(--film); }
 .thumb:not([src]) { background: var(--card); color: transparent; }   /* still loading: the box, not its alt text */
 .thumb[data-failed] { color: var(--muted); font-size: 0.75rem; overflow: hidden; }   /* failed: the alt text says what belongs here */
-#conversation .thumb-button { min-height: 0; padding: 0; border: 0; border-radius: 8px; background: none; line-height: 0; }
+#conversation .thumb-button { min-height: 0; padding: 0; border: 0; border-radius: var(--radius); background: none; line-height: 0; }
 
 .notes { display: flex; flex-direction: column; gap: 4px; }
 .note { margin: 0; color: var(--muted); font-size: 0.8125rem; }
@@ -336,43 +448,44 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   margin: 0;
   padding: 8px 12px;
   border: 1px solid var(--warn);
-  border-left-width: 4px;
-  border-radius: 10px;
+  border-radius: var(--radius);
   background: var(--soft);
-  background: color-mix(in srgb, var(--warn) 10%, var(--card));
+  background: color-mix(in srgb, var(--warn) 9%, var(--card));
   font-size: 0.875rem;
   font-weight: 600;
 }
 
-.report-section + .report-section { margin-top: 12px; }
-.report-section h3 { margin: 0 0 2px; color: var(--muted); font-size: 0.8125rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+/* The report: the document of the card, in the text face. */
+.report-body { font-family: var(--serif); font-size: 1.0625rem; line-height: 1.7; }
+.report-section + .report-section { margin-top: 14px; }
+.report-section h3 { margin: 0 0 4px; font-family: var(--font); font-size: 0.9375rem; font-weight: 700; }
 .report-section p { margin: 0; }
-.report-raw { padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+.report-raw { padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
 .report .note { margin-top: 8px; }
-.report-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.report-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 .report-actions button[aria-pressed="true"] { border-color: var(--accent); background: var(--soft); }
 
 /* the report card a person can read (render.js, P6-H): a plain summary on top, the sentences one to a line, the notes and the terms under them */
-.report-summary { margin-bottom: 12px; }
-.summary-box { padding: 10px 12px; border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 10px; background: var(--soft); }
-.summary-box h3 { margin: 0 0 2px; color: var(--muted); font-size: 0.8125rem; font-weight: 600; }
+.report-summary { margin-bottom: 14px; }
+.summary-box { padding: 12px 14px; border-radius: var(--radius); background: var(--soft); }
+.summary-box h3 { margin: 0 0 2px; color: var(--muted); font-size: 0.8125rem; font-weight: 700; }
 .summary-box p { margin: 0; }
 .summary-note { margin: 4px 0 0; color: var(--muted); font-size: 0.75rem; }
-.report-list { margin: 0; padding-left: 1.25rem; }
-.report-list li + li { margin-top: 4px; }
+.report-list { margin: 0; padding: 0; list-style: none; }
+.report-list li + li { margin-top: 2px; }
 .report-list li.earlier { color: var(--muted); }   /* a sentence about an earlier X-ray: the model never saw one, so it reads quieter */
 .flag { margin-right: 0.35em; font-size: 0.875em; }
-.removed { padding: 0 4px; border: 1px solid var(--border); border-radius: 4px; color: var(--muted); font-size: 0.8125em; white-space: nowrap; }
+.removed { padding: 0 4px; border: 1px solid var(--border); border-radius: 4px; color: var(--muted); font-family: var(--font); font-size: 0.8125em; white-space: nowrap; }
 .term { text-decoration: underline dotted; text-underline-offset: 3px; cursor: help; }   /* a word the Terms below explain; its title says it too */
 .term sup { display: inline-block; margin-left: 1px; color: var(--muted); font-size: 0.7em; line-height: 0; }   /* inline-block: the underline stops short of the number */
-.report-extras { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.report-extras { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
 .report-key { margin: 0; color: var(--muted); font-size: 0.8125rem; }
-.report-terms h3 { margin: 0 0 2px; color: var(--muted); font-size: 0.8125rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.report-terms h3 { margin: 0 0 2px; color: var(--muted); font-size: 0.8125rem; font-weight: 700; }
 .term-list { margin: 0; padding-left: 1.5rem; color: var(--muted); font-size: 0.8125rem; }
 
 .labels { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px 16px; }
 .label-chips { display: flex; flex: 1 1 18rem; flex-wrap: wrap; gap: 4px; margin: 0; padding: 0; list-style: none; }
-.chip.positive { border-color: var(--accent); background: var(--accent); color: var(--on-accent); font-weight: 600; }   /* filled */
+.chip.positive { border-color: var(--accent); background: var(--accent); color: var(--on-accent); font-weight: 700; }   /* filled */
 .chip.negative { color: var(--muted); }                                                                                /* outlined */
 .chip.unknown { border-style: dashed; color: var(--muted); }
 .chip .mark { font-weight: 700; }   /* a check or a cross: the agreement is a shape, not only a colour */
@@ -381,7 +494,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .score { display: flex; flex-wrap: wrap; gap: 2px 12px; margin: 0; font-size: 0.8125rem; }
 .score > div { display: flex; gap: 4px; }
 .score dt { color: var(--muted); }
-.score dd { margin: 0; font-variant-numeric: tabular-nums; font-weight: 600; }
+.score dd { margin: 0; font-variant-numeric: tabular-nums; font-weight: 700; }
 .score-source { margin: 0; color: var(--muted); font-size: 0.75rem; }
 
 .provenance { color: var(--muted); font-size: 0.75rem; }
@@ -395,6 +508,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   background: none;
   color: var(--accent);
   font-size: inherit;
+  font-weight: 600;
   text-decoration: underline;
   text-underline-offset: 2px;
 }
@@ -402,24 +516,37 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .timeline table.nested { margin: 2px 0; }
 .timeline .values { margin: 0; padding-left: 1.25rem; }
 
-/* ---- the card's sections under the labels (P6-B..D): its images, the similar X-rays, the matching reports ------- */
+/* ---- the card's sections under the report (P6-B..D): findings, the similar X-rays, the matching reports, its images, how it was made ---- */
 
-.section-title { margin: 0 0 6px; color: var(--muted); font-size: 0.8125rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+/* A section of the card after the report starts with a rule and a sentence-case title: the eye finds the parts down the sheet. */
+.card > section { padding-top: 14px; border-top: 1px solid var(--border); }
+.section-title { margin: 0 0 8px; color: var(--fg); font-size: 0.9375rem; font-weight: 700; }
+.process { display: flex; flex-direction: column; gap: 8px; }
+.process .section-title { color: var(--muted); font-size: 0.8125rem; }
 .images .image-row { display: grid; grid-template-columns: repeat(2, minmax(0, 160px)); gap: 12px; }   /* side by side, phones too */
 .image-tile { min-width: 0; margin: 0; }
 .image-tile figcaption { margin-top: 4px; color: var(--muted); font-size: 0.75rem; overflow-wrap: anywhere; }
-.picture {   /* an X-ray, whole, on the dark ground it is read against: an aspect that the resize changed is plain to see */
+.picture {   /* an X-ray, whole, on the black it is read against: an aspect that the resize changed is plain to see */
   display: block;
   width: 100%;
   aspect-ratio: 1 / 1;
   object-fit: contain;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: #0b0b0a;
+  border-radius: 2px;
+  background: var(--film);
 }
 .picture:not([src]) { color: transparent; }   /* still loading: the box, not its alt text */
-.picture[data-failed] { color: #ece9e1; font-size: 0.75rem; overflow: hidden; }   /* failed: the alt text says what belongs here */
-#conversation .picture-button { display: block; width: 100%; min-height: 0; padding: 0; border: 0; border-radius: 8px; background: none; line-height: 0; }
+.picture[data-failed] { color: #e4ecf1; font-size: 0.75rem; overflow: hidden; }   /* failed: the alt text says what belongs here */
+#conversation .picture-button {   /* each picture in its mount */
+  display: block;
+  width: 100%;
+  min-height: 0;
+  padding: 4px;
+  border: 0;
+  border-radius: 2px;
+  background-color: transparent;
+  line-height: 0;
+}
+#conversation .picture-button:hover:not(:disabled) { --mount: var(--accent); background-color: transparent; }
 .section-note { margin: 0 0 8px; }   /* public mode: what the section leaves out, and why */
 
 /* similar X-rays: a grid that takes as many columns as fit, never one narrower than a readable figure */
@@ -434,21 +561,21 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .neighbor { min-width: 0; }
 .neighbor figure { margin: 0; }
 .neighbor figcaption { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; font-size: 0.75rem; overflow-wrap: anywhere; }
-.neighbor-score { font-variant-numeric: tabular-nums; font-weight: 600; }
+.neighbor-score { font-variant-numeric: tabular-nums; font-weight: 700; }
 .neighbor-placeholder {   /* public mode: a neutral box where the picture would be; no gallery image is ever asked for */
   width: 100%;
   aspect-ratio: 1 / 1;
   border: 1px dashed var(--control);
-  border-radius: 8px;
+  border-radius: var(--radius);
   background: var(--soft);
 }
 .sim-bar { display: block; height: 4px; overflow: hidden; border-radius: 2px; background: var(--soft); }   /* drawn, not said: the number is */
 .sim-fill { display: block; height: 100%; background: var(--accent); }
-.badge.identical { align-self: flex-start; padding: 0 6px; border: 1px solid var(--accent); border-radius: 999px; color: var(--accent); font-weight: 600; }
+.badge.identical { align-self: flex-start; padding: 0 6px; border: 1px solid var(--accent); border-radius: var(--radius); color: var(--accent); font-weight: 700; }
 .agreement { margin: 0; }
-.agreement:not(.note) { font-weight: 600; }   /* "12/14 labels agree"; a muted note says why there is no count */
+.agreement:not(.note) { font-weight: 700; }   /* "12/14 labels agree"; a muted note says why there is no count */
 .diff-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; padding: 0; list-style: none; }
-.chip.diff { max-width: 100%; border-radius: 10px; }   /* a name that wraps onto two lines keeps a tidy box */
+.chip.diff { max-width: 100%; }   /* a name that wraps onto two lines keeps a tidy box */
 
 /* matching reports and the published lines: a ranked list, each report clamped to three lines until Show all (P6-D) */
 .own-rank {   /* "Own report: rank 3 of 2,663 test reports · R@10 hit": its tooltip has the dedup-aware rank and the protocol */
@@ -457,19 +584,19 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   margin: 0 0 8px;
   padding: 2px 10px;
   border: 1px solid var(--accent);
-  border-radius: 999px;
+  border-radius: var(--radius);
   color: var(--accent);
   font-size: 0.8125rem;
-  font-weight: 600;
+  font-weight: 700;
   cursor: help;
 }
 .matches .match-list, .published .published-list { display: flex; flex-direction: column; gap: 12px; margin: 0; padding: 0; list-style: none; }
 .match, .published-line { min-width: 0; }
 .match-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-bottom: 4px; font-size: 0.8125rem; }
-.match-score { font-variant-numeric: tabular-nums; font-weight: 600; }
+.match-score { font-variant-numeric: tabular-nums; font-weight: 700; }
 .match-head .sim-bar { flex: 0 1 120px; }
 .chip.group-size { color: var(--muted); }
-.clamp-text { margin: 0; font-size: 0.875rem; overflow-wrap: anywhere; }
+.clamp-text { margin: 0; font-family: var(--serif); font-size: 0.9375rem; line-height: 1.6; overflow-wrap: anywhere; }
 .clamp-text.clamped:not(.open) {   /* three lines, then an ellipsis: Show all opens the rest */
   display: -webkit-box;
   overflow: hidden;
@@ -491,10 +618,49 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 }
 .finding-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 0; padding: 0; list-style: none; }
 .chip.finding { color: var(--muted); }
-.published-head { margin: 0 0 2px; color: var(--muted); font-size: 0.8125rem; font-weight: 600; }
-.verdict { padding: 0 6px; border: 1px solid currentColor; border-radius: 999px; }
+.published-head { margin: 0 0 2px; color: var(--muted); font-size: 0.8125rem; font-weight: 700; }
+.verdict { padding: 0 6px; border: 1px solid currentColor; border-radius: var(--radius); }
 .verdict.same { color: var(--ok); }
 .verdict.differs { color: var(--warn); }
+
+/* ---- the reading card: from Send until the report is shown (render.js renderReadingCard, reveal.js) ---------------------------------- */
+
+/* The X-ray on a lightbox, the scan line passing over it, and the stages as they really run beside it: a list that says what is done. */
+.card.reading { container: reading / inline-size; }   /* its own width decides how its picture and its list share it */
+.reading-body { display: grid; grid-template-columns: minmax(0, 168px) minmax(0, 1fr); gap: 18px; align-items: start; }
+.reading-body:not(:has(.lightbox)) { grid-template-columns: minmax(0, 1fr); }
+.lightbox {
+  --mount: var(--accent);
+  position: relative;
+  aspect-ratio: 1 / 1;
+  padding: 5px;
+  overflow: hidden;
+  border-radius: 2px;
+}
+.lightbox img { display: block; width: 100%; height: 100%; object-fit: contain; border-radius: 2px; background: var(--film); }
+.lightbox::after {   /* the scan line, drawn over the picture: reduced motion leaves it out */
+  content: "";
+  position: absolute;
+  inset: 5px;
+  pointer-events: none;
+}
+.reading-steps { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; font-size: 0.9375rem; }
+.reading-steps > li { display: flex; align-items: baseline; gap: 10px; color: var(--muted); }
+.reading-steps > li::before { content: "○"; content: "○" / ""; flex: none; width: 1em; text-align: center; }
+.reading-steps > li[data-state="running"] { color: var(--fg); font-weight: 700; }
+.reading-steps > li[data-state="running"]::before { content: "●"; content: "●" / ""; color: var(--accent); }
+.reading-steps > li[data-state="done"] { color: var(--fg); }
+.reading-steps > li[data-state="done"]::before { content: "✓"; content: "✓" / ""; color: var(--ok); }
+.reading-steps > li[data-state="error"] { color: var(--bad); }
+.reading-steps > li[data-state="error"]::before { content: "✕"; content: "✕" / ""; }
+@container reading (max-width: 440px) {   /* a phone, or a column the sidebar and the drawer leave narrow */
+  .reading-body { grid-template-columns: minmax(0, 112px) minmax(0, 1fr); gap: 12px; }
+  .reading-steps { font-size: 0.875rem; }
+}
+@container reading (max-width: 300px) {   /* too narrow for the two side by side: the picture over the list */
+  .reading-body { grid-template-columns: minmax(0, 1fr); }
+  .lightbox { width: min(100%, 140px); }
+}
 
 /* ---- compare mode (P9-F): one X-ray, two models, a report column each ----------------------------------------------- */
 
@@ -503,15 +669,15 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 #conversation > .card.compare-card { max-width: var(--compare-w); }
 .compare-card { container: compare-card / inline-size; }
 .compare-columns { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }   /* stacked */
-/* side by side from a card 900 px wide: the query measures its content box, 34 px narrower (16 px of padding and 1 px of border each side) */
-@container compare-card (min-width: 866px) {
+/* side by side from a card 900 px wide: the query measures its content box, 42 px narrower (20 px of padding and 1 px of border each side) */
+@container compare-card (min-width: 858px) {
   .compare-columns { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
-.compare-column { display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 10px; }
-.compare-model { margin: 0; font-size: 0.875rem; font-weight: 600; overflow-wrap: anywhere; }
+.compare-column { display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); }
+.compare-model { margin: 0; font-size: 0.875rem; font-weight: 700; overflow-wrap: anywhere; }
 .compare-waiting { margin: 0; }   /* column 1, until column 0 is done */
 
-/* ---- composer: pinned under the conversation column ----------------------------------------------------------- */
+/* ---- composer: the intake tray, pinned under the conversation column ------------------------------------------- */
 
 #composer {
   grid-area: composer;
@@ -526,28 +692,34 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   padding: 10px;
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: 16px;
+  border-radius: 10px;
   background: var(--card);
-  box-shadow: var(--shadow);
   container: composer / inline-size;   /* its rows ask how wide it is (P6-A), whatever made it narrow */
 }
 #image-well, #preview, #prompt, #chips { flex: 1 0 100%; min-width: 0; }   /* each has a row of its own, at every width */
 #composer > button { flex: none; white-space: nowrap; }   /* never narrower than its label: the row wraps instead */
 
-#image-well {
+#image-well {   /* a lit slot in its mount: where a film goes */
   padding: 10px 12px;
-  border: 1px dashed var(--control);
-  border-radius: 10px;
+  border: 0;
+  border-radius: 2px;
+  background-color: var(--soft);
   color: var(--muted);
   font-size: 0.875rem;
+  font-weight: 600;
   text-align: center;
   cursor: pointer;
   user-select: none;
 }
-#image-well:hover, #image-well.dragging { border-color: var(--accent); background: var(--soft); color: var(--fg); }
+#image-well:hover, #image-well.dragging {
+  --mount: var(--accent);
+  background-color: var(--soft);
+  background-color: color-mix(in srgb, var(--accent) 10%, var(--card));
+  color: var(--fg);
+}
 
 #preview { display: flex; align-items: center; gap: 8px; }   /* composer.js (P6-A): the thumbnail, the file's line, Remove */
-#preview img { flex: none; width: 56px; height: 56px; object-fit: cover; border: 1px solid var(--border); border-radius: 8px; }
+#preview img { flex: none; width: 56px; height: 56px; object-fit: cover; border: 1px solid var(--border); border-radius: var(--radius); background: var(--film); }
 #preview > span {   /* the name, then what the file is: "2544×3056 px · 2.4 MB", each a line of its own */
   display: flex;
   flex: 1 1 auto;
@@ -574,7 +746,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 
 #chips { display: flex; flex-wrap: wrap; gap: 4px; color: var(--muted); font-size: 0.75rem; overflow-wrap: anywhere; }
 #chips:empty { display: none; }
-#chips > * { padding: 0 8px; border: 1px solid var(--border); border-radius: 999px; line-height: 1.6; }
+#chips > * { padding: 0 8px; border: 1px solid var(--border); border-radius: var(--radius); line-height: 1.6; }
 
 #saved {   /* "Settings saved. They apply from your next Send.": a live region beside the chips, for the few seconds that app.js leaves it there */
   flex: 1 0 100%;
@@ -582,7 +754,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   margin: 0;
   color: var(--ok);
   font-size: 0.8125rem;
-  font-weight: 500;
+  font-weight: 600;
   overflow-wrap: anywhere;
 }
 #saved[data-state="warn"] { color: var(--warn); }   /* "Browser storage is unavailable...": Save closed, and this is not a confirmation */
@@ -606,7 +778,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   gap: 8px;
   padding: 8px 12px;
   border: 1px solid var(--bad);
-  border-radius: 10px;
+  border-radius: var(--radius);
   color: var(--bad);
   font-size: 0.875rem;
 }
@@ -621,19 +793,19 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   min-width: 0;
   padding: 8px 10px;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius);
   background: var(--bg);
 }
-.picker-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 0.875rem; font-weight: 600; }
+.picker-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 0.875rem; font-weight: 700; }
 #picker-close { flex: none; min-height: 32px; padding: 0 10px; }
 #picker-search { width: 100%; }
 #picker-status { margin: 0; color: var(--muted); font-size: 0.8125rem; }
 #picker-list { display: flex; flex-direction: column; gap: 2px; max-height: 30vh; margin: 0; padding: 0; overflow-y: auto; list-style: none; }
-#picker-list .study { width: 100%; min-height: 36px; padding: 4px 10px; border-color: transparent; background: none; font-size: 0.875rem; text-align: left; }
+#picker-list .study { width: 100%; min-height: 36px; padding: 4px 10px; border-color: transparent; background: none; font-size: 0.875rem; font-weight: 500; text-align: left; }
 #picker-list .study:hover:not(:disabled) { background: var(--soft); }
 
 #stop { border-color: var(--bad); color: var(--bad); }
-#send { border-color: var(--accent); background: var(--accent); color: var(--on-accent); font-weight: 600; }
+#send { border-color: var(--accent); background: var(--accent); color: var(--on-accent); font-weight: 700; }
 #send:hover:not(:disabled) { background: var(--accent); filter: brightness(1.1); }
 
 /* A page 720 px tall or less, or a composer 260 px wide or less (P6-A: 801 to about 890 px with the sidebar and the drawer open): the image
@@ -660,8 +832,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
    by whether the composer scrolls) the three do not fit at their usual padding, so Stop, whose label is the longest ("Cancel upload"), wrapped onto
    a row of its own, the composer's last, and at 320 x 568 it showed 9 px above the composer's fold (the re-review of P6 fix 2). With 6 px of padding
    each side they fit with room to spare. Below 261 px (801 px with the drawer open) the rule above takes over, and Stop keeps the row it has always had.
-   Above 319 px the three fit as they are. Checked at 320 x 568 by layout check k (busy). That holds while the composer's rows fit the 306 px that the
-   page leaves it at 320 x 568, with 9 px to spare. One row more (the "Settings saved" row, a third row of chips) makes it scroll: its classic scrollbar
+   Above 319 px the three fit as they are. Checked at 320 x 568 by layout check k (busy). That holds while the composer's rows fit the room that the
+   page leaves it at 320 x 568. One row more (the "Settings saved" row, a third row of chips) makes it scroll: its classic scrollbar
    takes 15 px, the container is 251 px, and the three buttons, 260 px wide at that padding, no longer share a row. Stop is then on a row of its own,
    and app.js scrolls the busy composer to its end (keepStopInView, P9-G5b fix 1), so that it is in sight there too; layout check k (busy-after-save,
    busy-save, busy-8-chips) holds it to that. */
@@ -682,33 +854,43 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   border-left: 1px solid var(--border);
   background: var(--card);
 }
-#drawer label { display: block; margin-top: 12px; }
+#drawer label { display: block; margin-top: 12px; font-weight: 600; }
 #drawer select, #drawer textarea, #drawer input:not([type="checkbox"]):not([type="radio"]) {
   display: block;
   width: 100%;
   margin-top: 4px;
+  font-weight: 400;
 }
 .drawer-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .drawer-head h2 { margin: 0; }
 #drawer-close { flex: none; min-width: 40px; padding: 0; }
-#drawer .check { display: flex; align-items: center; gap: 8px; }   /* a checkbox, then its words */
+/* The settings in groups, each a fieldset whose legend says what it is about; a rule parts one group from the next. */
+#drawer fieldset { min-width: 0; margin: 18px 0 0; padding: 0; border: 0; }
+#drawer fieldset + fieldset { padding-top: 16px; border-top: 1px solid var(--border); }
+/* A floated legend is laid out as a heading of the group, under the rule, and not on it (where a browser draws a fieldset's legend). */
+#drawer legend { float: left; width: 100%; margin: 0; padding: 0; color: var(--accent); font-size: 1rem; font-weight: 700; }
+#drawer legend + * { clear: both; }
+#drawer .check { display: flex; align-items: center; gap: 10px; }   /* a checkbox, then its words */
 /* A setting that cannot be used (k_images on a server with no gallery, beam size under greedy, cached decode with no cache) must look it:
    dashed, muted and on the soft fill (still 4.5:1), not the field it is when it works. */
-#drawer input:disabled, #drawer select:disabled { border-style: dashed; background: var(--soft); color: var(--muted); cursor: not-allowed; }
+#drawer input:disabled, #drawer select:disabled { border-style: dashed; background: var(--soft); color: var(--muted); cursor: not-allowed; opacity: 1; }   /* opacity: Chrome's own sheet dims a disabled select below 4.5:1 */
 #drawer .check:has(:disabled) { color: var(--muted); }
-#drawer .note, #drawer .hint { margin: 4px 0 0; color: var(--muted); font-size: 0.8125rem; }
+#drawer .note, #drawer .hint { margin: 4px 0 0; color: var(--muted); font-size: 0.8125rem; font-weight: 400; }
 #drawer .field-error { margin: 4px 0 0; color: var(--bad); font-size: 0.8125rem; }   /* "Enter a whole number from 16 to 200.", under its field */
 #drawer input[aria-invalid="true"] { border-color: var(--bad); }
 .drawer-actions {   /* Save sticks to the bottom of the drawer, so it is in sight however far the fields above it have scrolled */
   position: sticky;
   bottom: calc(-1 * var(--drawer-pad));   /* a sticky box keeps to the content edge: out over the padding, it is flush with the drawer's bottom */
+  display: flex;
+  gap: 8px;
   margin: 16px calc(-1 * var(--drawer-pad)) 0;   /* and with both its sides */
   padding: 12px var(--drawer-pad);
   border-top: 1px solid var(--border);
   background: var(--card);
 }
-#drawer-save { width: 100%; border-color: var(--accent); background: var(--accent); color: var(--on-accent); font-weight: 600; }
+#drawer-save { flex: 1 1 auto; border-color: var(--accent); background: var(--accent); color: var(--on-accent); font-weight: 700; }
 #drawer-save:hover:not(:disabled) { background: var(--accent); filter: brightness(1.1); }
+#drawer-defaults { flex: none; }
 #drawer h3 { margin: 20px 0 4px; }
 #drawer h4 { margin: 12px 0 4px; color: var(--muted); font-size: 0.875rem; }
 #models-section table { table-layout: fixed; }   /* a long checkpoint path wraps in its cell instead of widening the drawer */
@@ -724,22 +906,22 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: #0b0b0a;   /* dark in both themes: an X-ray is read against a dark ground */
-  color: #ece9e1;
+  background: #000000;   /* black in both themes: an X-ray is read against it */
+  color: #e4ecf1;
 }
 body.viewer-open { overflow: hidden; }   /* where the page scrolls (a short viewport) it stays where it is under the viewer */
-#viewer :focus-visible { outline-color: #e8926f; }   /* the dark ground's accent, in both themes: 8:1 against it */
-.viewer-bar { display: flex; flex: none; align-items: flex-start; gap: 8px; padding: 6px 8px; border-bottom: 1px solid #3e3c38; }
+#viewer :focus-visible { outline-color: #6cc3a0; }   /* scrub green on black, in both themes: 10:1 against it */
+.viewer-bar { display: flex; flex: none; align-items: flex-start; gap: 8px; padding: 6px 8px; border-bottom: 1px solid #2c3b46; }
 .viewer-tools { display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center; gap: 6px 12px; min-width: 0; }
-#viewer button { min-height: 36px; padding: 4px 10px; border-color: #85827a; background: #2b2a28; color: #ece9e1; }
-#viewer button:hover:not(:disabled) { background: #3e3c38; }
+#viewer button { min-height: 36px; padding: 4px 10px; border-color: #6f8492; background: #1a252e; color: #e4ecf1; }
+#viewer button:hover:not(:disabled) { background: #2c3b46; }
 .viewer-check, .viewer-range { display: inline-flex; align-items: center; gap: 6px; font-size: 0.8125rem; white-space: nowrap; }
-.viewer-check input, .viewer-range input { margin: 0; accent-color: #e8926f; }
+.viewer-check input, .viewer-range input { margin: 0; accent-color: #6cc3a0; }
 .viewer-range input { width: 112px; }
 .viewer-value { min-width: 3.25em; font-variant-numeric: tabular-nums; }   /* "300%" and "40%" take the same room */
 .viewer-panes { display: flex; flex: 1 1 auto; gap: 2px; min-height: 0; }
 .viewer-pane { display: flex; flex: 1 1 0; flex-direction: column; min-width: 0; min-height: 0; margin: 0; }
-.viewer-panes:not([data-linked]) .viewer-pane[data-active] .viewer-stage { box-shadow: inset 0 0 0 2px #e8926f; }   /* unlinked: where the buttons act */
+.viewer-panes:not([data-linked]) .viewer-pane[data-active] .viewer-stage { box-shadow: inset 0 0 0 2px #6cc3a0; }   /* unlinked: where the buttons act */
 .viewer-stage { position: relative; flex: 1 1 auto; min-height: 0; overflow: hidden; cursor: grab; touch-action: none; user-select: none; }
 .viewer-stage.dragging { cursor: grabbing; }
 .viewer-stage img {   /* at its natural size, drawn where viewer.js puts it (transform) and as bright as the sliders say (filter) */
@@ -750,12 +932,12 @@ body.viewer-open { overflow: hidden; }   /* where the page scrolls (a short view
   height: auto;
   transform-origin: 0 0;
 }
-.viewer-state { position: absolute; inset: 0; display: grid; place-items: center; margin: 0; padding: 12px; color: #a8a59c; font-size: 0.875rem; text-align: center; }
+.viewer-state { position: absolute; inset: 0; display: grid; place-items: center; margin: 0; padding: 12px; color: #9db0bd; font-size: 0.875rem; text-align: center; }
 .viewer-footer {   /* "Similar X-ray #2 · 320×320 px (stored gallery size)": one line */
   flex: none;
   padding: 4px 10px;
   overflow: hidden;
-  color: #a8a59c;
+  color: #9db0bd;
   font-size: 0.8125rem;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -763,6 +945,124 @@ body.viewer-open { overflow: hidden; }   /* where the page scrolls (a short view
 
 @media (max-width: 699.98px) {   /* below 700 px the two pictures are stacked, the turn's own on top */
   .viewer-panes { flex-direction: column; }
+}
+
+/* ---- the welcome page: Dr. Green, over the whole page until Start reading or Continue (app.js) ------------------- */
+
+/* Its stage holds the picture and the words. Wide: the figure fills the stage's height at the picture's own aspect (1600 x 893), anchored on
+   the right; the words stand on the ground colour at the left, and a scrim of that colour fades out before Dr. Green, so they never stand on
+   the busy room. The bubble is placed in the figure's own percentages, beside his head whatever the window. Narrow or tall: the tall crop is a
+   band at the top with the bubble at its foot, the words under it. */
+#welcome {
+  position: fixed;
+  inset: 0;
+  z-index: 80;   /* over the banner (60) and the viewer (50) */
+  display: grid;
+  grid-template-rows: auto 1fr;   /* the stage takes the rest, and grows with its words where they need more: the page then scrolls */
+  overflow-y: auto;
+  background: var(--bg);
+  color: var(--fg);
+}
+body.welcome-open { overflow: hidden; }
+.welcome-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 16px;
+  min-height: 56px;
+  padding: 8px var(--gutter);
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+  font-size: 0.8125rem;
+}
+.welcome-head .brand { padding-right: 0; font-size: 1.0625rem; }
+.welcome-head .avatar { width: 36px; height: 36px; }
+
+.welcome-stage { position: relative; min-height: 520px; overflow: hidden; }
+.welcome-stage::before {   /* the ground colour under the words, fading out before Dr. Green */
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: linear-gradient(90deg, var(--bg) 0, var(--bg) 36%, transparent 56%);
+}
+.welcome-figure { position: absolute; top: 0; right: 0; height: 100%; aspect-ratio: 1600 / 893; margin: 0; }
+.welcome-art {
+  position: absolute;
+  inset: 0;
+  background: url("img/dr-green-wide.png") center / cover no-repeat;
+  -webkit-mask-image: linear-gradient(to right, transparent 0, #000 22%);
+  mask-image: linear-gradient(to right, transparent 0, #000 22%);
+}
+.speech {   /* "Hi, I'm Dr. Green.": what he says, to the left of his head (74% across the picture, 11% to 37% down), level with his brow and
+               above the film; the tail points at him */
+  position: absolute;
+  top: 6%;
+  right: 33%;
+  z-index: 3;
+  margin: 0;
+  padding: 12px 18px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--card);
+  color: var(--fg);
+  font-size: clamp(1.125rem, 1.6vw, 1.5rem);
+  font-weight: 700;
+  white-space: nowrap;
+  box-shadow: var(--shadow);   /* it lies over the picture */
+}
+.speech::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  right: -9px;
+  width: 16px;
+  height: 16px;
+  border-top: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  background: var(--card);
+  transform: translateY(-50%) rotate(45deg);
+}
+.welcome-copy {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 14px;
+  width: min(32rem, 40%);
+  min-height: 100%;
+  margin-left: max(var(--gutter), 6vw);
+  padding: 40px 0;
+}
+.welcome-copy h1 { margin: 0; font-size: clamp(2.44rem, 5vw, 3.8rem); font-weight: 800; letter-spacing: -0.02em; line-height: 1.05; }
+.welcome-copy h1, .welcome-lead, #welcome-what { text-wrap: balance; }   /* "chest X-rays" is not broken at its hyphen on a line of its own */
+.welcome-lead { margin: 0; font-size: 1.25rem; font-weight: 600; line-height: 1.4; }
+#welcome-what { margin: 0; max-width: 34ch; color: var(--muted); font-size: 1.0625rem; }
+.welcome-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+.welcome-actions button { min-height: 48px; padding: 10px 22px; font-size: 1.0625rem; }
+#welcome-start { border-color: var(--accent); background: var(--accent); color: var(--on-accent); }
+#welcome-start:hover:not(:disabled) { background: var(--accent); filter: brightness(1.1); }
+.welcome-note { margin: 4px 0 0; max-width: 40ch; color: var(--muted); font-size: 0.875rem; }
+
+@media (max-width: 859.98px), (max-aspect-ratio: 1 / 1) {
+  .welcome-stage { display: flex; flex-direction: column; min-height: 0; overflow: visible; }
+  .welcome-stage::before { display: none; }
+  .welcome-figure { position: relative; flex: none; width: 100%; height: 46vh; height: clamp(240px, 52svh, 110vw); aspect-ratio: auto; }
+  .welcome-art {
+    background: url("img/dr-green-tall.png") 50% 34% / cover no-repeat;
+    -webkit-mask-image: linear-gradient(to bottom, #000 72%, transparent);
+    mask-image: linear-gradient(to bottom, #000 72%, transparent);
+  }
+  /* at the foot of the band, on the right, where the picture fades: clear of his face and of the film; the tail points up at him */
+  .speech { top: auto; right: var(--gutter); bottom: 34px; font-size: 1.125rem; }
+  .speech::after { top: -9px; right: 38%; transform: rotate(-45deg); }
+  .welcome-copy { flex: none; justify-content: flex-start; width: auto; min-height: 0; margin: -24px var(--gutter) 0; padding: 0 0 32px; }
+  .welcome-copy h1 { font-size: 2.44rem; }
+  .welcome-lead { font-size: 1.125rem; }
+}
+@media (prefers-color-scheme: dark) {
+  .welcome-art { filter: brightness(0.82); }   /* the picture is a bright room: at night it is dimmed to sit in the slate */
 }
 
 /* ---- narrow: one column, the sidebar and the drawer overlay it ------------------------------------------------ */
@@ -789,6 +1089,10 @@ body.viewer-open { overflow: hidden; }   /* where the page scrolls (a short view
     font-size: 1.25rem;
     line-height: 1;
   }
+  .banner .brand { padding-right: 4px; }
+  .banner .brand .avatar { width: 28px; height: 28px; }
+  body::before { grid-area: 2 / 1 / 4 / 2; }
+  #conversation:empty { justify-content: flex-end; }   /* Dr. Green's line at the foot, clear of his face */
 
   #sidebar, #drawer { z-index: 30; box-shadow: var(--shadow); }
 
@@ -808,6 +1112,7 @@ body.viewer-open { overflow: hidden; }   /* where the page scrolls (a short view
     width: min(var(--drawer-w), 100%);
     border-bottom: 1px solid var(--border);
   }
+  .card { padding: 14px; }
 }
 
 /* ---- short: the page scrolls, and nothing is pinned or capped (WCAG 1.4.10, 400% zoom) ------------------------ */
@@ -828,6 +1133,7 @@ body.viewer-open { overflow: hidden; }   /* where the page scrolls (a short view
   #viewer { position: fixed; top: var(--viewer-top, 0px); right: 0; bottom: 0; left: 0; overflow-y: auto; }
   .viewer-panes, .viewer-stage { flex: none; }
   .viewer-stage { height: max(120px, 60vh); }
+  .welcome-stage { min-height: 360px; }
 }
 @media (max-height: 480px) and (max-width: 699.98px) {
   .viewer-pane { flex: none; }   /* stacked, in a viewer that scrolls: each pane is as tall as its picture and its footer */
@@ -837,10 +1143,27 @@ body.viewer-open { overflow: hidden; }   /* where the page scrolls (a short view
   .viewer-stage { height: max(64px, 50cqh); }
 }
 
-/* ---- motion: none for a reader who asked for less ------------------------------------------------------------- */
+/* ---- motion: one moment per screen, and none for a reader who asked for less --------------------------------------- */
 
 @media (prefers-reduced-motion: no-preference) {
   #sidebar { transition: transform 0.2s ease, visibility 0.2s; }
-  .timeline > li[data-state="running"]::before { animation: pulse 1.2s ease-in-out infinite; }
+  .timeline > li[data-state="running"]::before, .reading-steps > li[data-state="running"]::before { animation: pulse 1.2s ease-in-out infinite; }
   @keyframes pulse { 50% { opacity: 0.35; } }
+
+  /* the welcome page: the bubble is written out once, as he says it */
+  #welcome:not([hidden]) .speech { animation: say 0.7s 0.35s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; }   /* backwards: no clip once said (the tail shows) */
+  @keyframes say { from { clip-path: inset(0 100% 0 0 round 14px); } to { clip-path: inset(0 0 0 0 round 14px); } }
+
+  /* the reading card: a band of light passes down the film while the stages run */
+  .card[data-phase="reading"][data-status="running"] .lightbox::after {
+    background: linear-gradient(to bottom, transparent 0, var(--scan) 50%, transparent 100%) 0 0 / 100% 22% no-repeat;
+    animation: scan 2.4s ease-in-out infinite;
+  }
+  @keyframes scan { from { background-position: 0 -30%; } to { background-position: 0 130%; } }
+
+  /* the ordered reveal (reveal.js): each line of the report is written left to right in its turn, then each part under it comes up */
+  .card[data-reveal="run"] .reveal-line { animation: write 0.42s ease-out both; animation-delay: var(--reveal-at, 0ms); }
+  .card[data-reveal="run"] .reveal-part { animation: rise 0.36s ease-out both; animation-delay: var(--reveal-at, 0ms); }
+  @keyframes write { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 }

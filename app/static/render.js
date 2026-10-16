@@ -1069,6 +1069,16 @@ const renderColumns = (columns, v, cx) => el('div', { class: 'compare-columns' }
 
 // ---- the assistant card and the throttle ---------------------------------------------------------------------------------
 
+// The head of every assistant card: Dr. Green's face and name, and what the card is. A report is a draft (a radiologist reviews it); a turn
+// that ran no model (a question the server answered with a warning) is a reply. The face is the stylesheet's (.avatar): no URL is set here.
+function cardHead(what) {
+  return el('header', { class: 'card-head' }, el('span', { class: 'avatar', 'aria-hidden': 'true' }), el('span', { class: 'card-who' }, 'Dr. Green'),
+    el('span', { class: 'card-what' }, what));
+}
+
+// The card, top to bottom as a reader goes down it: who wrote it, its notes, the report, its findings (the CheXbert labels), the similar
+// X-rays, the matching reports, the published lines of a test study, the images of the turn, and last how it was made (the stages and the
+// model). A part that has nothing to show is left out of the card.
 export function renderAssistantCard(view, ctx) {
   const v = whole(view);
   const cx = ctx ?? {};
@@ -1076,20 +1086,97 @@ export function renderAssistantCard(view, ctx) {
   const provenance = renderProvenance(v, cx);
   // A turn that finished having run no stage (a question the server answered with a warning) has no pipeline to show,
   // and no model to attribute: nothing ran. One that was stopped or failed before its first stage still shows its stages.
-  if (v.status === 'done' && !Object.keys(v.stages).length) {
+  const ranNothing = v.status === 'done' && !Object.keys(v.stages).length;
+  if (ranNothing) {
     timeline.setAttribute('hidden', '');
     provenance.setAttribute('hidden', '');
   }
-  // The sections the P6 tasks add, under the labels: one that has nothing to show is left out of the card, so the card of a turn that
-  // has none of them is the card it always was.
-  const sections = [renderPublished(v, cx), renderImages(v, cx), renderNeighbors(v, cx), renderMatches(v, cx)]
+  const process = el('section', { class: 'process', 'aria-label': named('How this was made', cx), hidden: ranNothing },
+    el('h3', { class: 'section-title' }, 'How this was made'), timeline, provenance);
+  // The sections the P6 tasks add, under the findings: one that has nothing to show is left out of the card.
+  const sections = [renderNeighbors(v, cx), renderMatches(v, cx), renderPublished(v, cx), renderImages(v, cx)]
     .filter((section) => !section.hasAttribute('hidden'));
-  // A compare turn's two reports stand in the place of the one report and its labels (P9-F); everything else on the card is drawn once.
+  // A compare turn's two reports stand in the place of the one report and its findings (P9-F); everything else on the card is drawn once.
   const columns = columnsOf(v);
-  const reports = columns ? [renderColumns(columns, v, cx)] : [renderReport(v, cx), renderLabels(v, cx)];
+  let reports;
+  if (columns) {
+    reports = [renderColumns(columns, v, cx)];
+  } else {
+    const labels = renderLabels(v, cx);
+    reports = [renderReport(v, cx), el('section', { class: 'findings', 'aria-label': named('Findings', cx), hidden: labels.hasAttribute('hidden') },
+      el('h3', { class: 'section-title' }, 'Findings (CheXbert labels)'), labels)];
+  }
   return el('article', { class: columns ? 'card compare-card' : 'card', 'aria-label': named('Assistant report', cx), 'data-message-id': str(v.id) || null,
                          'data-status': str(v.status) || null },
-    timeline, renderNotes(v), renderTestNotice(v), ...reports, ...sections, provenance);
+    cardHead(ranNothing ? 'Reply' : 'Draft report'), renderNotes(v), renderTestNotice(v), ...reports, ...sections, process);
+}
+
+// ---- the reading card: from Send until the report is shown (reveal.js) -------------------------------------------------------
+//
+// While a turn is read, its card is this one: the turn's X-ray on a lightbox (the scan line is the stylesheet's) and the stages as plain words,
+// each with the state it really has, so the wait is shown as the work it is. A stage that will not run is left off: retrieval on a server
+// with no gallery, labels with no labeller, and the score unless the turn has a reference to score against; one that ended skipped goes too.
+// ctx.image is the turn's own picture, as the user turn has it ({ url }: the page's preview, or a server path ctx.loadImage fetches).
+export const READING_STEPS = Object.freeze({
+  preprocess: 'Preparing the image', encode: 'Looking at the X-ray', retrieve: 'Finding similar X-rays', generate: 'Writing the report',
+  label: 'Labelling the findings', score: 'Scoring against the reference',
+});
+const STEP_SPOKEN = { pending: 'to do', running: 'in progress', done: 'done', error: 'failed' };
+
+function readingSteps(v, cx) {
+  const options = isObject(v.options) ? v.options : {};
+  const scored = !!str(options.reference) || Number.isInteger(options.test_row);
+  const steps = STAGES.filter((s) => !(s === 'retrieve' && cx.retrieval === false) && !(s === 'label' && (cx.labels === false || options.label === false))
+                                      && !(s === 'score' && !scored))
+    .map((s) => ({ s, state: typeof stageState(v, s).state === 'string' ? stageState(v, s).state : 'pending' }))
+    .filter(({ state }) => state !== 'skipped');
+  return el('ol', { class: 'reading-steps', role: 'list', 'aria-label': 'Progress' }, ...steps.map(({ s, state }) => el('li', { 'data-stage': s, 'data-state': state },
+    READING_STEPS[s], el('span', { class: 'visually-hidden' }, `: ${STEP_SPOKEN[state] ?? state}`))));
+}
+
+const readingWhat = (v) => (v.status === 'running' ? 'Reading your X-ray' : 'Report ready');
+
+function readingPicture(image, cx) {
+  const url = isObject(image) ? str(image.url) : '';
+  const alt = 'The X-ray being read';
+  if (usable(url)) return el('div', { class: 'lightbox' }, el('img', { alt, src: url }));
+  if (fetchable(url, cx)) return el('div', { class: 'lightbox' }, loadedImage(url, cx, { alt }));
+  return null;
+}
+
+export function renderReadingCard(view, ctx) {
+  const v = whole(view);
+  const cx = ctx ?? {};
+  return el('article', { class: 'card reading', 'aria-label': named('Assistant report', cx), 'data-message-id': str(v.id) || null,
+                         'data-status': str(v.status) || null, 'data-phase': 'reading' },
+    cardHead(readingWhat(v)), renderTestNotice(v),
+    el('div', { class: 'reading-body' }, readingPicture(cx.image, cx), readingSteps(v, cx)));
+}
+
+// The reading card brought up to date where it stands, so that its picture is not fetched again and the scan line runs on unbroken: the head's
+// words, the list of stages, the status, and the picture once there is one (a test study's comes with message_start). A node that is not a
+// reading card is left as it is: -> false, and the caller draws one.
+export function refreshReadingCard(card, view, ctx) {
+  if (card?.getAttribute?.('data-phase') !== 'reading') return false;
+  const v = whole(view);
+  const cx = ctx ?? {};
+  card.setAttribute('data-message-id', str(v.id) || '');
+  if (str(v.status)) card.setAttribute('data-status', str(v.status));
+  const what = card.querySelector('.card-what');
+  if (what && what.textContent !== readingWhat(v)) what.textContent = readingWhat(v);
+  const body = card.querySelector('.reading-body');
+  if (!body) return false;
+  const steps = body.querySelector('.reading-steps');
+  const picture = body.querySelector('.lightbox') ? null : readingPicture(cx.image, cx);
+  // Only the list is swapped: a node that is moved is taken out of the page and put back, which would start the scan line over. The picture
+  // and the notice come once each, early in the turn, and only then is the body or the card put together again.
+  if (picture || !steps) body.replaceChildren(...[body.querySelector('.lightbox') ?? picture, readingSteps(v, cx)].filter(Boolean));
+  else steps.replaceWith(readingSteps(v, cx));
+  if (!card.querySelector('.test-notice')) {
+    const notice = renderTestNotice(v);
+    if (notice) card.replaceChildren(...[card.querySelector('.card-head'), notice, body].filter(Boolean));
+  }
+  return true;
 }
 
 // ---- keeping focus through the whole-card replace -------------------------------------------------------------------------

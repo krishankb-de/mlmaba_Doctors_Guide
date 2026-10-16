@@ -456,6 +456,7 @@ def test_chaos_4_a_wrong_token_is_a_401_the_page_asks_for_the_token_in_settings_
     page = ui.page
     page.goto(server.url)
     page.wait_for_function("document.querySelector('#mode-badge').textContent !== '' && !document.querySelector('#notice').hidden", timeout=30000)
+    ui.close_welcome(page)   # the page opens on the welcome page: Start reading, then the notice is in sight
     assert ui.composer()["notice"] == ASK_FOR_TOKEN   # no token at all
     first_refusals = len(ui.refusals)
     assert first_refusals >= 2   # the models and the chats of the page's own start-up

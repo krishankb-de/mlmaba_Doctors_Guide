@@ -10484,11 +10484,13 @@ def test_p9b_the_pages_tag_the_build_writes_is_the_one_the_page_reads():
 
 def test_p9b_the_pages_build_copies_app_static_and_nothing_else():
     """R7. The build reads app/static and no other place of the repository: the one path it makes from the repository's root is app/static, it
-    walks that directory without following a link, it takes only .html, .js and .css, and the places that hold MIMIC-derived data are named in no
-    line of its code (its docstring names them only to say that nothing of theirs is copied). Only the standard library."""
+    walks that directory without following a link, it takes only .html, .js and .css, and in their own folders the page's pictures (img/*.png) and
+    fonts (fonts/*.woff2 and their licences, *.txt), and the places that hold MIMIC-derived data are named in no line of its code (its docstring
+    names them only to say that nothing of theirs is copied). Only the standard library."""
     code = _python_code(_p9b_text("scripts", "pages_build.py"))
     assert re.findall(r"REPO_ROOT / '([^']+)'", code) == ["app"] and "STATIC = REPO_ROOT / 'app' / 'static'" in code
     assert "os.walk(str(STATIC))" in code and "os.path.islink" in code and "KINDS = ('.html', '.js', '.css')" in code
+    assert "ASSETS = {'img': ('.png',), 'fonts': ('.woff2', '.txt')}" in code   # never .jpg, .jpeg or .webp: the formats MIMIC-CXR-JPG ships in
     for word in ("outputs", "results", "chat_sessions", "chat_home", "dataset", "mimic", "gallery", "home"):
         assert word not in code.lower(), word
     roots = {node.names[0].name.split(".")[0] if isinstance(node, ast.Import) else node.module.split(".")[0]
@@ -10571,3 +10573,23 @@ def test_pytest_ini_is_read_and_an_unregistered_mark_stops_the_run(tmp_path):
     assert registered.returncode == 0, registered.stdout + registered.stderr
     assert unregistered.returncode != 0 and "nobody_registered_this" in unregistered.stdout + unregistered.stderr, \
         (unregistered.returncode, unregistered.stdout, unregistered.stderr)
+
+
+# ---- the Dr. Green redesign (2026-10-16): how a turn is shown is the page's own --------------------------------------------------------
+
+def test_dr_green_how_a_turn_is_shown_is_a_setting_of_the_page_and_never_reaches_the_server():
+    """app/static/reveal.js (new): a turn is read on its reading card, then shown top to bottom after a pause (3 s unless set), or live as before.
+    It is a setting of the page under its own storage key, never one of the options a turn sends, which app/schemas.py Options would refuse
+    (extra="forbid"): the decoding protocol and its defaults are untouched. The welcome page opens only from the browser's own start."""
+    reveal = _p9b_text("app", "static", "reveal.js")
+    assert "export const DISPLAY_KEY = 'cxrchat.display';" in reveal
+    assert "export const DEFAULT_DISPLAY = Object.freeze({ reveal: 'ordered', hold_s: 3 });" in reveal
+    assert "fetch" not in reveal and "setTimeout" not in reveal   # pure, but for marking a built card: app.js owns the timers and the page
+    app_js = _p9b_text("app", "static", "app.js")
+    assert "from './reveal.js';" in app_js
+    options = app_js[app_js.index("export function optionsFromSettings"):app_js.index("// ---- identity")]
+    assert not re.search(r"state\.display|\breveal\b|hold_s", options), "the options a turn sends know nothing of how it is shown"
+    from app.schemas import Options
+    assert not {"reveal", "hold_s", "display"} & set(Options.model_fields)
+    assert Options.model_config.get("extra") == "forbid"
+    assert "welcome: true }" in app_js[app_js.index("export function browserEnv"):]

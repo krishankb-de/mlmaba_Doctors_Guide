@@ -14,8 +14,9 @@ nothing of anyone until one is set (app/static/app.js, PAGES_META). The page the
 
 Refused before anything is written (exit 2): an OUT_DIR inside this repository or inside any other checkout of this project, so that a build can
 never be committed; an OUT_DIR that is not empty. Only app/static/ is copied, and of it only regular files of the kinds a page is made of (.html,
-.js, .css): a symlink, or a file of any other kind, refuses the build, so that nothing that strayed in from CHAT_HOME, outputs/ or results/ is
-ever published (R7). Dotfiles (.DS_Store) stay behind.
+.js, .css), and in their own two folders its pictures (img/*.png) and its fonts with their licences (fonts/*.woff2, fonts/*.txt): a symlink, or a
+file of any other kind or in any other place, refuses the build, so that nothing that strayed in from CHAT_HOME, outputs/ or results/ is ever
+published (R7). Dotfiles (.DS_Store) stay behind.
 
 The copy is then checked (exit 1): every module import, and every file that index.html or a stylesheet names, resolves to a file inside the copy,
 and no absolute /static/ reference is left.
@@ -35,7 +36,8 @@ from typing import Iterator, List, Optional
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STATIC = REPO_ROOT / "app" / "static"
 PAGES_TAG = '<meta name="cxr-pages" content="1">'    # what app/static/app.js looks for (PAGES_META)
-KINDS = (".html", ".js", ".css")                     # what a page is made of: nothing else is published
+KINDS = (".html", ".js", ".css")                     # what a page's code is made of: read and checked, as text
+ASSETS = {"img": (".png",), "fonts": (".woff2", ".txt")}   # and what it shows, each kind in its own folder: copied as it is
 CHARSET = re.compile(r'^([ \t]*)<meta charset="utf-8">[ \t]*(\r?\n)', re.M)
 STATIC_REF = re.compile(r'(\b(?:href|src)[ \t]*=[ \t]*["\'])/static/', re.I)
 # A reference that is still absolute: /static/ right after a quote, a backquote, an opening parenthesis (a CSS url) or an = (an unquoted
@@ -82,7 +84,7 @@ def page_files() -> List[Path]:
             if name.startswith(".") or os.path.islink(os.path.join(top, name)):
                 continue
             rel = (Path(top) / name).relative_to(STATIC)
-            if rel.suffix not in KINDS:
+            if rel.suffix not in KINDS and rel.suffix not in ASSETS.get(str(rel.parent), ()):
                 others += 1
                 continue
             found.append(rel)
@@ -91,7 +93,7 @@ def page_files() -> List[Path]:
         refused.append(counted(links, "symlink", "symlinks") + " refused: the build copies regular files only")
     if others:
         refused.append(counted(others, "file of another kind", "files of another kind")
-                       + " refused: a page is made of .html, .js and .css, and nothing else is published")
+                       + " refused: a page is made of .html, .js and .css, img/*.png and fonts/*.woff2 and *.txt, and nothing else is published")
     if refused:
         raise Refused(*refused)
     return found

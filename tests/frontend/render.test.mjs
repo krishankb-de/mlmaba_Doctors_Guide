@@ -1540,8 +1540,10 @@ test('the card of the recorded turn: timeline, report with its note, labels unav
   assert.equal(q(card, '.labels').textContent, 'labels unavailable (labeler_unavailable)');
   assert.equal(q(card, '.provenance p').textContent.startsWith('tiny · scan legacy/tfla exact · prefix_k 4'), true);
   assert.equal(button(card, 'Copy') !== null && button(card, 'Show raw') !== null && button(card, 'model details') !== null, true);
-  assert.deepEqual(['ol.timeline', '.notes', '.test-notice', '.report', '.labels', '.provenance'].map((s) => card.children.indexOf(q(card, s))),
+  assert.deepEqual(['.card-head', '.notes', '.test-notice', '.report', '.findings', '.process'].map((s) => card.children.indexOf(q(card, s))),
                    [0, 1, 2, 3, 4, 5]);   // the recorded turn is the tiny engine's: its card says so, between the notes and the report (P9-G5b)
+  assert.equal(q(card, '.findings').contains(q(card, '.labels')), true);   // the labels are the findings, under the report
+  assert.deepEqual(['h3', 'ol.timeline', '.provenance'].map((s) => q(card, '.process').children.indexOf(q(q(card, '.process'), s))), [0, 1, 2]);   // how it was made, last
 });
 
 test('a card is a pure function of its view: the same view gives the same markup, and a re-render replaces the card whole', () => {
@@ -2018,9 +2020,9 @@ test('the card shows the images row after the labels when the page can load imag
                        stageEnd('generate', 9, GENERATE), skipped('label', 'labeler_unavailable'), skipped('score', 'no_reference'),
                        stopOf('done', { report: 'Findings: ok', display_report: 'Findings: ok' })]);
   const card = renderAssistantCard(view, { loadImage, copy() {}, showModels() {} });
-  assert.deepEqual(card.children.map((c) => c.getAttribute('class')), ['timeline', 'notes', 'report', 'labels', 'images', 'provenance']);
+  assert.deepEqual(card.children.map((c) => c.getAttribute('class')), ['card-head', 'notes', 'report', 'findings', 'images', 'process']);
   const plain = renderAssistantCard(view, { copy() {}, showModels() {} });
-  assert.deepEqual(plain.children.map((c) => c.getAttribute('class')), ['timeline', 'notes', 'report', 'labels', 'provenance']);
+  assert.deepEqual(plain.children.map((c) => c.getAttribute('class')), ['card-head', 'notes', 'report', 'findings', 'process']);
 });
 
 test('a user turn\'s server thumbnail carries its path in data-src, and a test study\'s thumbnail says what it is', async () => {
@@ -2199,10 +2201,10 @@ test('with ctx.openViewer a similar X-ray opens beside your X-ray, its note the 
   assert.equal(q(alone, 'button').getAttribute('aria-label'), 'Open similar X-ray #1 in the viewer');
 });
 
-test('the card puts the similar X-rays after the images row; a skipped retrieve or k 0 leaves the section out', () => {
+test('the card puts the similar X-rays right under the findings, before the images row; a skipped retrieve or k 0 leaves the section out', () => {
   const { loadImage } = loader();
   const card = renderAssistantCard(gridView(stopOf('done', { report: 'Findings: so far', display_report: 'Findings: so far' })), { loadImage });
-  assert.deepEqual(card.children.map((c) => c.getAttribute('class')), ['timeline', 'notes', 'report', 'labels', 'images', 'neighbors', 'provenance']);
+  assert.deepEqual(card.children.map((c) => c.getAttribute('class')), ['card-head', 'notes', 'report', 'findings', 'neighbors', 'images', 'process']);
   const skip = viewOf([imageStart(), PREPROCESSED, skipped('retrieve', 'gallery_unavailable')]);
   assert.equal(renderNeighbors(skip, { loadImage }).hasAttribute('hidden'), true);
   assert.equal(q(renderAssistantCard(skip, { loadImage }), 'section.neighbors'), null);
@@ -2458,7 +2460,7 @@ test('a test study\'s published lines: the GPU report with identical or differs 
   assertClean(renderPublished(scored({ model_report: 7, floor_report: null, live_equals_published: 'yes' }), {}), 'odd published');
 });
 
-test('the card: report, labels, the published lines, then the images, the similar X-rays and the matching reports, then provenance', () => {
+test('the card, top to bottom: report, findings, the similar X-rays, the matching reports, the published lines, the images, then how it was made', () => {
   const { loadImage } = loader();
   const view = viewOf([imageStart({ source: 'test_split', filename: null }), PREPROCESSED, stageStart('retrieve', 2),
                        stageEnd('retrieve', 3, { image_neighbors: [neighbour(1)], report_matches: [match(1)], true_report_rank: OWN_RANK, gallery: {} }),
@@ -2468,7 +2470,7 @@ test('the card: report, labels, the published lines, then the images, the simila
                        stopOf('done', { report: 'Findings: live.', display_report: 'Findings: live.' })]);
   const card = renderAssistantCard(view, { loadImage, labelNames: LABEL_NAMES });
   assert.deepEqual(card.children.map((c) => c.getAttribute('class')),
-                   ['timeline', 'notes', 'report', 'labels', 'published', 'images', 'neighbors', 'matches', 'provenance']);
+                   ['card-head', 'notes', 'report', 'findings', 'neighbors', 'matches', 'published', 'images', 'process']);
   assert.equal(qa(card, 'li.chip.label').length, 14);   // the report's own chips, and only those, carry .label
 });
 
@@ -2753,6 +2755,7 @@ test('a hidden footer keeps its "model details" button out of reach: it cannot t
   assert.equal(restoreFocus(card, 'models'), false);   // the control exists but cannot take focus, so the page is told it failed
   assert.equal(document.activeElement, document.body);
   footer.removeAttribute('hidden');
+  footer.closest('section').removeAttribute('hidden');   // and the card's "how this was made", which holds it
   assert.equal(restoreFocus(card, 'models'), true);   // the same call works once the footer is shown
   assert.equal(document.activeElement, models);
   document.body.replaceChildren();
@@ -2962,4 +2965,88 @@ test('app/static has no EventSource and no absolute URL, and imports only its ow
       assert.match(specifier, /^\.\/[\w-]+\.js$/, `${name} imports ${specifier}`);   // browser-native modules, no packages
     }
   }
+});
+
+// ---- the Dr. Green redesign: the card's head, the reading card and the ordered reveal (reveal.js) -------------------------------------
+
+const renderReadingCard = builder('renderReadingCard');
+const refreshReadingCard = builder('refreshReadingCard');
+const steps = (card) => qa(card, '.reading-steps > li').map((li) => [li.getAttribute('data-stage'), li.getAttribute('data-state')]);
+
+test('every assistant card starts with Dr. Green: a draft report, or a reply for a turn that ran no model', () => {
+  const card = renderAssistantCard(finished(), { copy() {} });
+  const head = card.children[0];
+  assert.equal(head.localName, 'header');
+  assert.equal(head.getAttribute('class'), 'card-head');
+  assert.equal(visibleText(head), 'Dr. GreenDraft report');
+  assert.equal(q(head, '.avatar').getAttribute('aria-hidden'), 'true');   // the face is decoration: the name says who
+  assert.equal(q(head, 'img'), null);   // and it is the stylesheet's: no URL is set from here
+  assert.equal(q(renderAssistantCard(viewOf([START, stopOf('done')]), {}), '.card-what').textContent, 'Reply');
+});
+
+test('the reading card: the X-ray on a lightbox and the stages as they run, leaving off those that will not run', async () => {
+  const running = viewOf([START, stageStart('preprocess', 0), stageEnd('preprocess', 1, {}), stageStart('encode', 1)]);
+  const card = renderReadingCard(running, { image: { url: 'blob:http://localhost/x' }, turn: 2 });
+  assert.equal(card.localName, 'article');
+  assert.deepEqual([card.getAttribute('class'), card.getAttribute('data-phase'), card.getAttribute('data-status'), card.getAttribute('data-message-id')],
+                   ['card reading', 'reading', 'running', 'm_test']);
+  assert.equal(card.getAttribute('aria-label'), 'Assistant report, turn 2');
+  assert.equal(q(card, '.card-what').textContent, 'Reading your X-ray');
+  assert.deepEqual([q(card, '.lightbox img').getAttribute('src'), q(card, '.lightbox img').getAttribute('alt')], ['blob:http://localhost/x', 'The X-ray being read']);
+  // the score has nothing to score against (no reference, no test row): it is left off; the rest wait their turn
+  assert.deepEqual(steps(card), [['preprocess', 'done'], ['encode', 'running'], ['retrieve', 'pending'], ['generate', 'pending'], ['label', 'pending']]);
+  assert.deepEqual(texts(qa(card, '.reading-steps > li')).slice(0, 2), ['Preparing the image: done', 'Looking at the X-ray: in progress']);   // said in words too
+  assert.deepEqual(visibleText(q(card, '.reading-steps > li')), 'Preparing the image');
+  // a server with no gallery and no labeller: those are never coming; a skipped stage goes; a reference adds the score
+  const noStages = renderReadingCard(viewOf([START, skipped('retrieve', 'gallery_unavailable')]), { retrieval: false, labels: false });
+  assert.deepEqual(steps(noStages).map(([s]) => s), ['preprocess', 'encode', 'generate']);
+  const withReference = viewOf([step('message_start', { ...START.data, options: { ...START.data.options, reference: 'Findings: clear.' } })]);
+  assert.equal(steps(renderReadingCard(withReference, {})).at(-1)[0], 'score');
+  assert.equal(q(renderReadingCard(running, {}), '.lightbox'), null);   // no picture to show: no lightbox
+  // a server path comes through ctx.loadImage, as every picture of a card does
+  const { asked, loadImage } = loader();
+  const study = renderReadingCard(running, { image: { url: URLS.thumb }, loadImage });
+  await tick();
+  assert.deepEqual([asked, q(study, '.lightbox img').getAttribute('src')], [[URLS.thumb], 'blob:test/thumb']);
+  const ended = viewOf([START, stageStart('preprocess', 0), stageEnd('preprocess', 1, {}), stopOf('done', { report: 'Findings: x.' })]);
+  assert.equal(q(renderReadingCard(ended, {}), '.card-what').textContent, 'Report ready');   // held for the pause: it says the report is there
+});
+
+test('refreshReadingCard brings the reading card up to date where it stands: the picture is kept, the list swapped; another card is left alone', () => {
+  const ctx = { image: { url: 'blob:http://localhost/x' } };
+  const card = renderReadingCard(viewOf([START, stageStart('preprocess', 0)]), ctx);
+  const lightbox = q(card, '.lightbox');
+  const later = viewOf([START, stageStart('preprocess', 0), stageEnd('preprocess', 1, {}), stageStart('encode', 1), stageEnd('encode', 2, {}),
+                        stageStart('generate', 3)]);
+  assert.equal(refreshReadingCard(card, later, ctx), true);
+  assert.equal(q(card, '.lightbox'), lightbox);   // the same node: the scan line over it runs on
+  assert.deepEqual(steps(card).slice(0, 4), [['preprocess', 'done'], ['encode', 'done'], ['retrieve', 'pending'], ['generate', 'running']]);
+  const bare = renderReadingCard(viewOf([START]), {});   // a test study's picture comes with message_start: added once it is known
+  assert.equal(refreshReadingCard(bare, viewOf([START]), ctx), true);
+  assert.equal(q(bare, '.lightbox img').getAttribute('src'), 'blob:http://localhost/x');
+  const full = renderAssistantCard(later, {});
+  assert.equal(refreshReadingCard(full, later, ctx), false);   // not a reading card: the caller draws one
+  assert.equal(q(full, '.reading-steps'), null);
+});
+
+test('revealCard marks a card for its reveal: the report line by line, then each part under it, in the order they stand, hidden ones left out', async () => {
+  const { revealCard, finishReveal, REVEAL_TIMING } = await import('../../app/static/reveal.js');
+  const view = finished({ report: 'Findings: The lungs are clear. No effusion. Impression: Normal chest.', labels: labelled(['Cardiomegaly']) });
+  const card = renderAssistantCard(view, { copy() {}, labelNames: LABEL_NAMES });
+  const { count, totalMs } = revealCard(card);
+  const marked = qa(card, '.reveal-line, .reveal-part');
+  assert.equal(marked.length, count);
+  const kinds = marked.map((n) => [n.localName, n.classList.contains('reveal-line') ? 'line' : 'part', n.style.getPropertyValue('--reveal-at')]);
+  // the summary, the heading and two sentences of Findings, the heading and sentence of Impression, the terms ("effusion"), the buttons, then the
+  // findings and how it was made
+  assert.deepEqual(kinds.map(([tag, kind]) => `${tag}:${kind}`),
+                   ['div:part', 'h3:line', 'li:line', 'li:line', 'h3:line', 'li:line', 'div:part', 'div:part', 'section:part', 'section:part']);
+  assert.deepEqual(marked.slice(6, 8).map((n) => n.getAttribute('class').split(' ')[0]), ['report-extras', 'report-actions']);
+  assert.deepEqual(kinds.map(([, , at]) => at), ['0ms', '240ms', '500ms', '760ms', '1020ms', '1280ms', '1540ms', '1780ms', '2020ms', '2260ms']);
+  assert.equal(totalMs, 2260 + REVEAL_TIMING.settleMs);
+  assert.equal(card.getAttribute('data-reveal'), 'run');
+  assert.equal(marked.some((n) => n.closest('[hidden]')), false);   // the notes are hidden here (none to say), and take no beat
+  finishReveal(card);
+  assert.equal(card.getAttribute('data-reveal'), 'done');   // everything shows as it is
+  assert.deepEqual(revealCard(el('article', {})), { count: 0, totalMs: 0 });   // nothing to show in turn: left as it is
 });

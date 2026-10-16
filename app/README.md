@@ -129,9 +129,13 @@ Open `http://localhost:<LOCAL_PORT>`. If the server has a token, enter it in Set
 - **A shared origin.** Every Pages site of the GitHub account shares the origin `https://krishankb-de.github.io`, and with it the allow-list entry and the stored token. This is the account's only Pages site; keep third-party scripts off any other.
 - **Republishing.** After a change to `app/static`, commit it, then run `bash scripts/pages_publish.sh` from a checkout of the branch with a clean `app/static`. It adds one commit to `gh-pages` and never force-pushes. GitHub caches pages for about 10 minutes.
 
-- **Start a turn.** Attach an X-ray by click, drag and drop, or paste. On a private server you can instead pick a test-split study. The stages stream in order: preprocess → encode → retrieve → generate → label → score.
-- **What a card shows.** The report, the similar X-rays and matching reports, and the labels. Click an image to open the full-screen viewer, with side by side, zoom, pan, brightness and contrast.
-- **The drawer** holds the settings: model, beam, token budget, the number of similar X-rays and reports, "Stop when the report starts repeating", and the access token.
+- **The welcome page.** The page opens on Dr. Green's welcome page when its address names no chat. **Start reading** opens a new chat; **Continue your last case** goes back to the newest chat. A link to a chat (`#/s/<id>`, `#/new`) opens the chat directly. Dr. Green in the banner opens the welcome page again, and Escape closes it.
+- **Start a turn.** Attach an X-ray by click, drag and drop, or paste. On a private server you can instead pick a test-split study. The stages run in order: preprocess → encode → retrieve → generate → label → score.
+- **How a turn is shown** (Settings → Showing results; a setting of this browser, never sent to the server):
+  - *When complete, top to bottom* (the default). From Send, the card is the reading card: the X-ray and the stages as they run. It stays until the turn has ended and the pause has passed (3 s from Send unless changed; 0 to 5 s). Then the card is shown in order: the report line by line, then the findings, the similar X-rays, the matching reports, the images and how it was made. **Show all now** skips the rest. An error or a Stop is shown at once. A chat opened from the sidebar is shown whole.
+  - *Live, as the report is written.* The card is drawn from the first event, as before.
+- **What a card shows**, top to bottom: the report, the findings (CheXbert labels), the similar X-rays, the matching reports, the images of the turn, and how it was made (stages and model). Click an image to open the full-screen viewer, with side by side, zoom, pan, brightness and contrast.
+- **The drawer** holds the settings in groups: the model, decoding (beam, token budget), similar cases and findings, report text, showing results, and the connection (API server, access token). **Restore defaults** puts back the page's defaults; it leaves the model, the API server and the token as they are.
 - **The page's defaults are not the published protocol.**
   - "Stop when the report starts repeating" and the display repair are both on.
   - Turn the stop switch off in Settings to decode as published. Only then does a test study's card compare the live report with the published one.

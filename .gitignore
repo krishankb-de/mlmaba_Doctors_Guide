@@ -123,3 +123,7 @@ node_modules/
 /playwright/.cache/
 /playwright/.auth/
 /.github/workflows/playwright.yml
+
+# Source pictures for the UI (local only): app/static/img/ holds what the page uses. One of them is a watermarked stock preview that has no
+# licence, so the folder is never committed.
+/Pictures UI/

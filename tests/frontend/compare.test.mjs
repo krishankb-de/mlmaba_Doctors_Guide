@@ -385,6 +385,8 @@ test('a card that does not compare is the card it always was', () => {
   assert.deepEqual(qa(card, '.report button').map((b) => b.getAttribute('aria-label')), ['Copy report, turn 1', 'Show raw report, turn 1']);
   assert.equal(q(card, '.label-chips'), null);   // the tiny turn has no labeller: no chips, as before
   assert.deepEqual(card.children.map((c) => c.localName + (c.getAttribute('class') ? `.${c.getAttribute('class')}` : '')),
-                   ['ol.timeline', 'div.notes', 'p.test-notice', 'div.report', 'div.labels', 'footer.provenance']);   // its parts, in their order
+                   ['header.card-head', 'div.notes', 'p.test-notice', 'div.report', 'section.findings', 'section.process']);   // its parts, in their order
+  assert.deepEqual(q(card, 'section.findings').children.map((c) => c.getAttribute('class')), ['section-title', 'labels']);
+  assert.deepEqual(q(card, 'section.process').children.map((c) => c.getAttribute('class')), ['section-title', 'timeline', 'provenance']);
   assert.ok(serialize(card).includes('Copy report, turn 1'));
 });

@@ -1115,7 +1115,7 @@ def test_the_card_check_holds_the_report_card_to_what_it_holds_the_sections_to()
     the synthetic turn, and held at every viewport (375 and 1280 px among them, in both schemes, the drawer closed and open) to what the sections
     are: there, inside the card's width, and not wider inside than it is."""
     assert layout.REPORT_PARTS == [".report-summary", ".report-body", ".report-key", ".report-terms"]
-    assert layout.CARD_PARTS == layout.SECTIONS + [layout.NOTICE] + layout.REPORT_PARTS
+    assert layout.CARD_PARTS == layout.SECTIONS + [layout.NOTICE] + layout.REPORT_PARTS + [".card-head", "section.findings", "section.process"]
     assert layout.check_sections(_sections(375, layout.CARD_PARTS), 375, layout.CARD_PARTS) == []
     for part in layout.REPORT_PARTS:
         gone = _sections(1280, layout.CARD_PARTS)
@@ -1656,6 +1656,7 @@ class FakePage:
         self.busy_measured, self.busy_flows, self.keep_scroll = [], [], []
         self.viewers_opened, self.viewer_measured = [], 0
         self.compare_drawn, self.compare_measured = [], []   # P9-F: (width, height) of each compare card drawn, and (width, drawer) of each measure
+        self.welcome_measured, self.welcome_closed, self.reading_drawn = 0, 0, 0   # the Dr. Green redesign: checks n and o
 
     def open(self, url: str, width: int, height: int, scheme: str) -> None:
         self.width, self.height, self.drawer, self.stop = width, height, False, False
@@ -1673,6 +1674,8 @@ class FakePage:
     def wait_for(self, expression: str, timeout: float = 15.0, what: Optional[str] = None, interval: float = 0.04) -> bool:
         if expression == layout.STARTED_JS:   # the page starts; a page that never gets busy fails only what a click should do
             self.started += 1
+            return True
+        if expression in (layout.WELCOME_OPEN_JS, layout.WELCOME_CLOSED_JS):   # the welcome page the page opens on, and the chat it leaves
             return True
         if self.busy_fails:
             raise TimeoutError("waited {:g} s for {}".format(timeout, what or expression))
@@ -1715,6 +1718,14 @@ class FakePage:
         if function == layout.MEASURE_SECTIONS_JS:
             self.sections_measured += 1
             return _sections(self.width, argument["sections"])
+        if function == layout.MEASURE_WELCOME_JS:
+            self.welcome_measured += 1
+            return _welcome(self.width)
+        if function == layout.CLOSE_WELCOME_JS:
+            self.welcome_closed += 1
+        if function == layout.INJECT_READING_JS:
+            assert argument["events"] == layout.reading_events()
+            self.reading_drawn += 1
         if function == layout.MEASURE_PICKER_JS:
             self.picker_measured += 1
             return _picker(self.width, self.height)
@@ -1764,8 +1775,10 @@ def test_the_loop_runs_every_case_and_passes_on_a_page_in_order():
                 + len(layout.VIEWER_TOUCH_VIEWPORTS) * len(layout.SCHEMES) * len(layout.VIEWER_STATES)    # P6 fix 1: and on a landscape phone
                 + len(layout.COMPOSER_BUSY_CASES) * len(layout.SCHEMES)   # P6 fix 2: the composer busy, where it is narrowest
                 + len(layout.COMPOSER_STRESS_CASES) * len(layout.STRESS_STATES) * len(layout.SCHEMES)   # P9-G5b fix 1: and with more in it than its rows
-                + len(layout.COMPARE_VIEWPORTS) * len(layout.SCHEMES))   # P9-F: a compare card, drawer closed and open
-    assert cases == expected == 370
+                + len(layout.COMPARE_VIEWPORTS) * len(layout.SCHEMES)   # P9-F: a compare card, drawer closed and open
+                + viewports * len(layout.SCHEMES)    # check n: the welcome page each viewport's page opens on
+                + viewports * len(layout.SCHEMES))   # check o: the reading card, drawer closed and open
+    assert cases == expected == 458
     assert failures == []
     busy_loads = (len(layout.COMPOSER_BUSY_CASES) + len(layout.COMPOSER_STRESS_CASES) * len(layout.STRESS_STATES)) * len(layout.SCHEMES)
     assert page.opened == ((len(layout.WIDTHS) * len(layout.HEIGHTS) + len(layout.SHORT_VIEWPORTS)) * len(layout.SCHEMES)
@@ -1777,7 +1790,7 @@ def test_the_loop_runs_every_case_and_passes_on_a_page_in_order():
     assert page.compare_drawn == [vp for vp in layout.COMPARE_VIEWPORTS for _ in layout.SCHEMES]
     assert page.compare_measured == [(w, drawer) for w, _ in layout.COMPARE_VIEWPORTS for _ in layout.SCHEMES for drawer in (False, True)]
     assert page.sections_drawn == viewports * len(layout.SCHEMES)                  # the card drawn once per viewport and scheme,
-    assert page.sections_measured == viewports * len(layout.SCHEMES) * 2           # and measured with the drawer closed and open
+    assert page.sections_measured == viewports * len(layout.SCHEMES) * 2 * 2       # and measured with the drawer closed and open, and so is the reading card
     assert page.picker_measured == viewports * len(layout.SCHEMES)
     assert page.composer_measured == len(layout.COMPOSER_CASES) * len(layout.SCHEMES) * len(layout.COMPOSER_STATES) + busy_loads
     assert {(w, h, drawer, state) for w, h, drawer, state, _ in page.composer_set_up} == (
@@ -1802,14 +1815,14 @@ def test_the_loop_runs_every_case_and_passes_on_a_page_in_order():
 def test_the_loop_reports_a_stop_button_that_never_renders_in_the_cases_that_show_it():
     cases, failures = layout.run_checks(FakePage(stop_renders=False), "http://x/")
     assert failures and all("#stop is not rendered, but the case shows it" in f and "stop=shown" in f for f in failures)
-    assert cases == 370
+    assert cases == 458
 
 
 def test_the_loop_reports_a_page_that_never_gets_busy_as_a_failure_of_the_busy_cases_and_does_not_stop():   # P9-G5b fix 1 (iii)
     """The busy cases click, and a page that does not do what a click should (Send never held, the drawer never opening) times the wait out:
     that is a failure of that case, in words, and the sweep goes on with the rest."""
     cases, failures = layout.run_checks(FakePage(busy_fails=True), "http://x/")
-    assert cases == 370
+    assert cases == 458
     assert failures and all("the page did not get to the busy composer" in f and "waited 15 s for" in f for f in failures), failures
     named = {state for state in layout.BUSY_STATES if any("composer {}:".format(state) in f for f in failures)}
     assert named == set(layout.BUSY_STATES), named   # every busy state is named, and every failure is of one
@@ -1827,7 +1840,7 @@ def test_every_case_is_set_up_after_the_page_has_started():
 
 def test_the_loop_reports_a_save_button_that_never_renders_in_the_save_cases_only():
     cases, failures = layout.run_checks(FakePage(save_renders=False), "http://x/")
-    assert cases == 370 and len(failures) == len(layout.WIDTHS) * len(layout.HEIGHTS) + len(layout.SHORT_VIEWPORTS)   # once per viewport: both schemes fail alike
+    assert cases == 458 and len(failures) == len(layout.WIDTHS) * len(layout.HEIGHTS) + len(layout.SHORT_VIEWPORTS)   # once per viewport: both schemes fail alike
     assert all("light+dark" in f and "save" in f and "#drawer-save is not rendered" in f for f in failures), failures
 
 
@@ -1835,3 +1848,57 @@ def test_the_loop_reports_a_deleted_floor_only_in_the_tall_cases():
     cases, failures = layout.run_checks(FakePage(floor=False), "http://x/")
     assert len(failures) == len(layout.TALL_WIDTHS)   # a failure seen in both colour schemes is reported once
     assert all("light+dark tall composer: the report area is 40 px tall, under the 120 px floor" in f for f in failures), failures
+
+
+# ---- the Dr. Green redesign: the welcome page (check n) and the reading card (check o) ----------------------------------------------------
+
+def _welcome(width: int = 1280) -> Dict[str, Any]:
+    """What MEASURE_WELCOME_JS reports for a welcome page in order: nothing overflows, Start reading is 48 px tall and hit, the words and the
+    bubble lie inside the width, the bubble above the words, and the page behind is inert."""
+    words = {sel: [24.0, 300.0 + 60 * i, min(width - 24.0, 500.0), 340.0 + 60 * i] for i, sel in enumerate(layout.WELCOME_WORDS)}
+    words.update({sel: [24.0, 10.0, 200.0, 40.0] for sel in layout.WELCOME_HEAD})
+    return {"doc": [width, width], "welcome": [width, width], "start": [24.0, 600.0, 180.0, 648.0], "startHit": True, "words": words,
+            "speech": [max(0.0, width - 260.0), 80.0, width - 24.0, 130.0], "inert": [True, True, True]}
+
+
+def test_the_welcome_check_passes_a_page_in_order_and_names_what_is_wrong():
+    assert layout.check_welcome(_welcome(375), 375) == [] and layout.check_welcome(_welcome(1280), 1280) == []
+    covered = _welcome(375)
+    covered["speech"] = [100.0, 290.0, 351.0, 345.0]   # over the greeting
+    assert layout.check_welcome(covered, 375) == ["welcome page: the speech bubble covers #welcome-title"]
+    small = _welcome()
+    small["start"] = [24.0, 600.0, 180.0, 636.0]
+    assert layout.check_welcome(small, 1280) == ["welcome page: Start reading is 36 px tall, under 44 px"]
+    hidden = dict(_welcome(), startHit=False, inert=[True, False, True])
+    assert layout.check_welcome(hidden, 1280) == ["welcome page: Start reading is covered", "welcome page: the page behind it is not inert"]
+    wide = _welcome(320)
+    wide["welcome"] = [340, 320]
+    wide["speech"] = [100.0, 80.0, 330.0, 130.0]
+    assert layout.check_welcome(wide, 320) == ["welcome page: #welcome overflows horizontally: scrollWidth 340 > clientWidth 320",
+                                               "welcome page: the speech bubble leaves the viewport's width: left 100, right 330"]
+    gone = _welcome()
+    gone["words"][".welcome-lead"] = None
+    assert layout.check_welcome(gone, 1280) == ["welcome page: .welcome-lead is not there"]
+
+
+def test_the_reading_card_is_check_i_turn_while_it_runs_and_is_held_to_what_the_sections_are():
+    events = layout.reading_events()
+    assert events == layout.section_events()[:len(events) - 1] + [events[-1]]   # check i's turn up to its generate stage
+    assert events[-1]["event"] == "stage_start" and events[-1]["data"]["stage"] == "generate"
+    assert not any(e["event"] in ("content_block_delta", "message_stop") for e in events)   # it runs: no report yet
+    assert layout.READING_PARTS == [".card-head", ".lightbox", ".reading-steps"]
+    assert layout.check_sections(_sections(375, layout.READING_PARTS), 375, layout.READING_PARTS) == []
+    squeezed = _sections(801, layout.READING_PARTS)
+    squeezed["sections"][".reading-steps"].update(sw=38, cw=0)   # the list given no width, as an open drawer once left it
+    assert layout.check_sections(squeezed, 801, layout.READING_PARTS) == [".reading-steps overflows inside: scrollWidth 38 > clientWidth 0"]
+
+
+def test_every_page_the_loop_opens_is_closed_from_its_welcome_page_and_the_first_of_each_viewport_is_measured():
+    page = FakePage()
+    layout.run_checks(page, "http://x/")
+    viewports = len(layout.WIDTHS) * len(layout.HEIGHTS) + len(layout.SHORT_VIEWPORTS)
+    assert page.welcome_closed == page.opened   # every page: the cases run on the chat it leaves
+    assert page.welcome_measured == viewports * len(layout.SCHEMES)
+    assert page.reading_drawn == viewports * len(layout.SCHEMES)
+    assert "#welcome-continue:not([hidden])" in layout.CLOSE_WELCOME_JS and "#welcome-start" in layout.CLOSE_WELCOME_JS
+    assert layout.STARTED_JS in layout.WELCOME_CLOSED_JS   # and the chat it leaves has started

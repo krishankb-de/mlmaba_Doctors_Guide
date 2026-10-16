@@ -78,14 +78,14 @@ from PIL import Image  # noqa: E402
 
 from app.imaging import TOO_SMALL_MSG  # noqa: E402
 from app.labels import CHEXBERT_14  # noqa: E402
-from scripts.chat_ui_browser_check import CARD_JS, Failure, Overrun, expect, run_check, warm_up  # noqa: E402
+from scripts.chat_ui_browser_check import CARD_JS, LIVE_DISPLAY_JS, Failure, Overrun, expect, run_check, warm_up  # noqa: E402
 from scripts.chat_ui_cdp import (App, Browser, exit_on_sigterm, find_chrome, tiny_only_problem, url_needs_no_evidence,  # noqa: E402
                                  url_problem)
 
 EVIDENCE_DIR = os.path.join(REPO_ROOT, "docs", "chat_ui", "evidence", "p6f")
 STEP_DELAY_S = 0.02            # between two decoding steps of the tiny engine
 DESKTOP = (1280, 900)
-TALL = (1280, 2300)            # tall enough for a whole card above the composer: the images row, the similar X-rays, the matching reports
+TALL = (1280, 2900)            # tall enough for a whole card above the composer: the findings, the similar X-rays, the matching reports, the images row
 MAX_SHOT_BYTES = 400 * 1024    # the limit of the committed pictures (tests/e2e/conftest.py MAX_SHOT_BYTES)
 
 # What the page says, as the page says it (the tests read the page's sources for every one of them).
@@ -108,7 +108,7 @@ USER_THUMB = "user:thumb"   # the thumbnail in the user's own message (P6-G): no
 
 EVIDENCE_FILES = ["attach_preview_1280x900_light.png", "attach_refused_1280x900_light.png", "reopened_images_1280x900_light.png",
                   "similar_xrays_1280x900_light.png", "matches_1280x900_light.png", "own_rank_1280x900_light.png",
-                  "card_1280x2300_light.png", "card_1280x2300_dark.png", "viewer_side_by_side_1280x900_light.png",
+                  "card_1280x2900_light.png", "card_1280x2900_dark.png", "viewer_side_by_side_1280x900_light.png",
                   "viewer_adjusted_1280x900_light.png", "viewer_side_by_side_1280x900_dark.png",
                   "checklist.json"]   # what a full run writes, and the only files it replaces
 
@@ -513,6 +513,13 @@ class Context:
         b.wait_for("location.search === '?run=%d' && document.readyState === 'complete' && !!document.querySelector('#exports')" % self.serial,
                    what="the page to load")
         b.wait_for("document.querySelector('#mode-badge').textContent !== '' && location.hash !== ''", what="the app to start")
+        if hash_ == "":   # no address: the page opens on the welcome page, closed here as a user closes it (Continue, else Start reading)
+            # and the chat home opens behind it to its end (Send on again), so that Continue is offered wherever there is a chat to go back to
+            b.wait_for("!document.querySelector('#welcome').hidden && location.hash.startsWith('#/') && !document.querySelector('#send').disabled",
+                       what="the welcome page the page opens on, the chat behind it opened")
+            b.evaluate("(document.querySelector('#welcome-continue:not([hidden])') || document.querySelector('#welcome-start')).click()")
+            b.wait_for("document.querySelector('#welcome').hidden && !document.querySelector('.layout').hasAttribute('inert')",
+                       what="the welcome page to close on the chat")
         # The app has started once it knows its server's features: the badge and the hash come with the page, the models a request later, and until then
         # the test-split button is hidden (the check runs on a server that has the gallery: main refuses any other).
         b.wait_for("!document.querySelector('#pick-study').hidden", what="the app to know its server's features")
@@ -959,7 +966,7 @@ def check_matches(ctx: Context) -> Tuple[str, Dict[str, Any]]:
     # -- the whole card, light and dark, on a page tall enough for it
     b.set_viewport(TALL[0], TALL[1], "light")
     b.evaluate("document.querySelector('#conversation').scrollTop = 0")
-    ctx.shot("card", "card", "the whole card of the picked study: stages, report, labels, images, similar X-rays, matching reports with the own-rank badge, provenance", TALL)
+    ctx.shot("card", "card", "the whole card of the picked study: report, findings, similar X-rays, matching reports with the own-rank badge, images, how it was made", TALL)
     b.set_viewport(TALL[0], TALL[1], "dark")
     ctx.shot("card", "card", "the same card in the dark colour scheme", TALL, "dark")
     b.set_viewport(DESKTOP[0], DESKTOP[1], "light")
@@ -987,7 +994,7 @@ def check_viewer(ctx: Context) -> Tuple[str, Dict[str, Any]]:
     neighbours = (turn["stages"]["retrieve"].get("detail") or {}).get("image_neighbors") or []
     openers = b.evaluate("(%s)()" % OPENERS_JS)
     keys = [o["key"] for o in openers]
-    expected = ["image:thumb", "image:model_input"] + ["neighbor:{}".format(n["rank"]) for n in neighbours]
+    expected = ["neighbor:{}".format(n["rank"]) for n in neighbours] + ["image:thumb", "image:model_input"]   # the card's order: similar X-rays, then its images
     expect(keys == expected and len(neighbours) > 0, "the card's pictures that open the viewer are {}, not {}".format(keys, expected))
     bubble = b.evaluate("(%s)()" % BUBBLE_JS)
     expect(bubble is not None and bubble["thumbIsOpener"] is True, "the upload in the user's own message is not a control that opens the viewer: {}".format(bubble))
@@ -1289,6 +1296,7 @@ def run_all(browser: Browser, base: str, work: str, out_dir: Optional[str]) -> T
     browser.call("Runtime.enable")
     browser.call("Emulation.setFocusEmulationEnabled", enabled=True)   # the page behaves as the focused one, so key events move focus
     ctx = Context(browser, base, work, out_dir)
+    browser.call("Page.addScriptToEvaluateOnNewDocument", source=LIVE_DISPLAY_JS)   # each item watches a turn's card as it streams (reveal.js: live)
     if out_dir is not None:
         clear_evidence(out_dir)
     return [run_check(ctx, name, fn, claim=claim, keep=1500, failure_chars=1500)   # a failure says all of what it knows

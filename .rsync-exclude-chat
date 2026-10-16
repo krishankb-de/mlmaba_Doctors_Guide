@@ -20,6 +20,8 @@
 /.staging/
 /CLAUDE.local.md
 /graphify-out/
+# the source pictures of the UI (one is an unlicensed stock preview): app/static/img/ holds what the page uses
+/Pictures UI/
 # the local npm Playwright install and its output
 /node_modules/
 /package.json

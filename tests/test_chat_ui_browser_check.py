@@ -428,9 +428,19 @@ def test_the_ax_reader_reads_the_text_a_screen_reader_would_and_not_what_is_hidd
 
 # ---- the lists the script keeps about itself ---------------------------------------------------------------------------------------------
 
-def test_the_checks_are_the_ten_in_order():
+def test_the_checks_are_the_eleven_in_order():
     assert [name for name, _ in check.CHECKS] == ["stream", "reload", "sessions", "exports", "stop", "keyboard", "narrow", "a11y", "error",
-                                                  "settings"]   # P4-F added the tenth
+                                                  "settings", "reveal"]   # P4-F added the tenth; the Dr. Green redesign the eleventh
+
+
+def test_every_check_but_reveal_watches_a_live_turn_and_reveal_stores_the_page_default_first():
+    """reveal.js shows a turn read and then in order unless the page is told live: every check of a streaming card is given live before the page
+    loads (only when the storage says nothing), and the reveal check stores the page's own default, in order with a 3 s pause, first."""
+    source = SCRIPT.read_text()
+    assert "localStorage.getItem('cxrchat.display') === null" in check.LIVE_DISPLAY_JS and '"reveal":"live"' in check.LIVE_DISPLAY_JS
+    assert '"reveal":"ordered"' in check.ORDERED_DISPLAY_JS and '"hold_s":3' in check.ORDERED_DISPLAY_JS and check.REVEAL_HOLD_S == 3
+    assert 'browser.call("Page.addScriptToEvaluateOnNewDocument", source=LIVE_DISPLAY_JS)' in source
+    assert "localStorage.removeItem('cxrchat.display')" in source   # each check starts from the live default again
 
 
 def test_repeated_counts_the_sentences_that_repeat_an_earlier_one_by_the_repairs_key():

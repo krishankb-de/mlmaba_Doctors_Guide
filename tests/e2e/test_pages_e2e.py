@@ -98,6 +98,7 @@ def test_the_pages_copy_asks_nothing_until_its_api_server_is_set_and_then_runs_a
     page.on("request", lambda request: asked.append(request.url))
     page.goto(server.pages_url)
     page.wait_for_function("(() => { const n = document.querySelector('#notice'); return !!n && !n.hidden; })()")
+    ui.close_welcome(page)   # the page opens on the welcome page: Start reading, then the notice is in sight
     page.wait_for_timeout(1500)   # what the page asks at its start, it has asked by now
     assert _notice(page) == FIRST_RUN
     assert asked and all(url.startswith(server.pages_url) for url in asked), asked   # its own files, and nothing else

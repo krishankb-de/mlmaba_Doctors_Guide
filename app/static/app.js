@@ -29,9 +29,10 @@ import { attachComposer } from './composer.js';
 import { applyEvent, initialView } from './state.js';
 import { openViewer as showViewer } from './viewer.js';
 import {
-  TEST_MODEL, detailTable, el, focusKey, isTestModel, optionChips, ownXraySide, renderAssistantCard, renderUserTurn, restoreFocus, scheduleRender, settleClamps,
-  statusText,
+  TEST_MODEL, detailTable, el, focusKey, isTestModel, optionChips, ownXraySide, refreshReadingCard, renderAssistantCard, renderReadingCard, renderUserTurn,
+  restoreFocus, scheduleRender, settleClamps, statusText,
 } from './render.js';
+import { DEFAULT_DISPLAY, HOLD_CHOICES, finishReveal, loadDisplay, revealCard, revealPhase, sanitizeDisplay, saveDisplay } from './reveal.js';
 
 const { asked, authHeaders, retryAfterSeconds, REQUEST_TIMEOUT_MS } = realApi;
 
@@ -49,6 +50,9 @@ const REVOKE_MS = 1000;                // an export's object URL is revoked this
 const SESSION_ID = /^[A-Za-z0-9_-]{1,64}$/;   // what the server's new_id produces
 const CLIENT_ID = /^[\x21-\x7e]{1,128}$/;     // what the server accepts as X-Client-Id: visible ASCII
 const SHORT_VIEWPORT = '(max-height: 480px)'; // the page scrolls instead of #conversation (styles.css)
+const REDUCED_MOTION = '(prefers-reduced-motion: reduce)';   // a card is then shown whole, with no reveal
+const SHOW_ALL_TEXT = 'Show all now';        // the reveal's button, in the card's head
+const DEFAULTS_TEXT = 'Defaults restored. They apply from your next Send.';
 
 // ---- routes ---------------------------------------------------------------------------------------------------------------
 
@@ -233,6 +237,18 @@ export function retrievalNote(models, model = '') {
   return gallery ? RETRIEVAL_NOTES.tower : RETRIEVAL_NOTES.none;
 }
 
+// What the welcome page says Dr. Green does, from what this server runs (/v1/models features): a report always, the findings where it has a
+// labeller, the similar X-rays where it has a gallery. A server that does not say yet is not taken at its word: null, and the page keeps the
+// sentence it was served with, which promises only the report.
+export function welcomeText(models) {
+  if (!isObject(models)) return null;
+  const parts = ['draft a report'];
+  if (serverHas(models, 'labels')) parts.push('list the findings');
+  if (serverHas(models, 'retrieval')) parts.push('show similar X-rays from the training library');
+  const said = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts.at(-1)}` : parts[0];
+  return `Give me a frontal chest X-ray and I'll ${said}.`;
+}
+
 // The card of the model the settings choose: the named one, else the server's default. null while /v1/models is unknown.
 export function chosenCard(settings, models) {
   const wanted = typeof settings?.model === 'string' ? settings.model : '';
@@ -321,7 +337,7 @@ export function browserStorage(win) {
 const text = (v) => (typeof v === 'string' && v.trim() ? v.trim() : '');
 const clip = (s, n = 300) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 const isAbort = (err) => err?.name === 'AbortError';   // what fetch throws for a request whose signal was aborted
-const GENERIC_ERROR = 'Something went wrong — see the console';   // for what is a bug of the page's, not the server's or the network's
+const GENERIC_ERROR = 'Something went wrong. See the console.';   // for what is a bug of the page's, not the server's or the network's
 // What the browsers' fetch says when the network fails, each in its own words (Chrome, Firefox, Safari, node).
 const FETCH_FAILURE = /failed to fetch|fetch failed|load failed|networkerror|network error|network connection|internet connection|network request failed/i;
 
@@ -554,10 +570,14 @@ export function createApp(env) {
     conversation: $('conversation'), drawer: $('drawer'), composer: $('composer'), well: $('image-well'),
     preview: $('preview'), prompt: $('prompt'), chips: $('chips'), settings: $('settings'), send: $('send'),
     stop: $('stop'), file: $('file'), badge: $('mode-badge'), testBadge: $('test-badge'), health: $('health'),
+    brand: $('brand'), welcome: $('welcome'), welcomeWhat: $('welcome-what'), welcomeStart: $('welcome-start'), welcomeContinue: $('welcome-continue'),
   };
+  const now = () => (env.now ?? Date.now)();
 
   const state = {
     settings: loadSettings(storage),
+    display: loadDisplay(storage),   // how a turn is shown (reveal.js): the page's own, never sent
+    welcomeFrom: null,       // while the welcome page is up: 'start' (the page opened on it) or 'brand' (the banner's Dr. Green opened it)
     clientId: clientId(storage),
     models: null,            // the /v1/models payload
     session: { id: null, turns: [], ui: new Map(), blobUrls: new Set() },   // what the conversation shows
@@ -706,13 +726,17 @@ export function createApp(env) {
       if (this.short()) node?.scrollIntoView?.({ block: 'end' });
       else ui.conversation.scrollTop = ui.conversation.scrollHeight;
     },
+    toStart(node) {   // the head of a card that is about to be shown top to bottom
+      node?.scrollIntoView?.({ block: 'start' });
+    },
   };
 
   function makeTurn(session, n) {
     const turn = { n, id: null, session, view: initialView(null), userEl: null, card: null, text: '', image: null, file: null,
                    controller: null, poller: null, streaming: false, polling: false, stopping: false, left: false, settled: false,
-                   dirty: false, reloading: false, testRow: null, cancelled: false };   // testRow: the test study the turn ran (P6-D);
-                                                                                    // cancelled: its upload, before the accept (P6-A c)
+                   dirty: false, reloading: false, testRow: null, cancelled: false,   // testRow: the test study the turn ran (P6-D);
+                                                                                     // cancelled: its upload, before the accept (P6-A c)
+                   ordered: false, sentAt: 0, holdMs: 0, revealed: false, revealTimer: null };   // how it is shown (reveal.js): set at Send
     turn.draw = () => paint(turn);   // one function per card, so scheduleRender draws it at most once a frame
     return turn;
   }
@@ -720,9 +744,25 @@ export function createApp(env) {
   // Replaces the card with one built from the latest view, keeps focus on the same control and the scroll where the
   // reader had it, and says what changed. Called at most once per animation frame per card (scheduleRender), and straight
   // away when the turn ends.
+  // A turn shown in order (reveal.js) has the reading card until it has ended and its pause since Send is over: a pause that is still to run
+  // brings the card back here when it is. Then the whole card is drawn once and revealed top to bottom, scrolled to its head for a reader who
+  // was following the turn, since the report starts there.
   function paint(turn) {
     if (turn.left || !turn.dirty || !turn.card) return;
     turn.dirty = false;
+    const { phase, waitMs } = revealPhase({ ordered: turn.ordered, revealed: turn.revealed, status: turn.view.status, sentAt: turn.sentAt, now: now(),
+                                            holdMs: turn.holdMs });
+    if (phase === 'reading') {
+      drawReading(turn);
+      if (waitMs > 0 && turn.revealTimer === null) {
+        turn.revealTimer = later(() => {
+          turn.revealTimer = null;
+          turn.dirty = true;
+          paint(turn);
+        }, waitMs);
+      }
+      return;
+    }
     const old = turn.card;
     const near = scroller.near();
     const active = doc.activeElement;
@@ -733,7 +773,48 @@ export function createApp(env) {
     settleClamps(next);   // in the page now: which reports overflow their three lines can be measured (P6 fix 1)
     if (key) restoreFocus(next, key);
     announce(statusText(turn.view));
-    if (near) scroller.toEnd(next);
+    if (phase === 'reveal') {
+      turn.revealed = true;
+      startReveal(next);
+      if (near) scroller.toStart(next);
+    } else if (near) {
+      scroller.toEnd(next);
+    }
+  }
+
+  // The reading card of a turn, brought up to date where it stands (its picture and its scan line are not drawn again), or put in the place of
+  // the card it has.
+  function drawReading(turn) {
+    const near = scroller.near();
+    const cx = { ...cardCtx(turn.n), image: turn.image };
+    if (!refreshReadingCard(turn.card, turn.view, cx)) {
+      const next = renderReadingCard(turn.view, cx);
+      if (turn.card.parentNode) turn.card.replaceWith(next); else ui.conversation.append(next);
+      turn.card = next;
+    }
+    announce(statusText(turn.view));
+    if (near) scroller.toEnd(turn.card);
+  }
+
+  // The reveal of a card just drawn: its lines and parts in turn (styles.css), with Show all now in its head until the last is shown. A reader
+  // who asked for less motion gets the card whole, as it is.
+  function startReveal(card) {
+    if (win.matchMedia?.(REDUCED_MOTION)?.matches) return;
+    const { totalMs } = revealCard(card);
+    if (!totalMs) return;
+    const skip = el('button', { type: 'button', class: 'reveal-skip', onclick: () => endReveal(card, skip) }, SHOW_ALL_TEXT);
+    card.querySelector('.card-head')?.append(skip);
+    later(() => endReveal(card, skip), totalMs);
+  }
+
+  // Show all now, or the end of the reveal: everything shows, and the button goes. One that had the focus hands it to the report's Copy, so
+  // that the keyboard stays in the card.
+  function endReveal(card, skip) {
+    if (card.getAttribute('data-reveal') !== 'run') return;
+    finishReveal(card);
+    const held = doc.activeElement === skip;
+    skip.remove();
+    if (held) (card.querySelector('[data-action="copy"]') ?? card.querySelector('button'))?.focus();
   }
 
   // What the chips of a user turn need besides its options (render.js optionChips, P9-G5b): how its generate stage ended, and whether its model
@@ -954,6 +1035,11 @@ export function createApp(env) {
       }
       // A note the server will not run (no file, no command) uses no settings, so its turn shows no chips (P4-H).
       const ran = runsTheModel(note, file) || Number.isInteger(options.test_row);   // a picked study runs whatever the note says
+      // How it is shown is fixed at Send (reveal.js): a turn that runs the model is read and then shown in order, unless the setting is live;
+      // the pause is counted from now. A question the server answers with no model has nothing to read.
+      turn.ordered = ran && state.display.reveal === 'ordered';
+      turn.sentAt = now();
+      turn.holdMs = state.display.hold_s * 1000;
       turn.userEl = renderUserTurn({ text: note, image: turn.image, options: ran ? options : null, outcome: chipsOutcome(null, options.model) },
                                    userCtx(turn, options.model));
       session.turns.push(turn);
@@ -1023,7 +1109,7 @@ export function createApp(env) {
     startTicker(turn);
     attempt(() => spendComposer(turn));
     attempt(() => {   // a card that is made but not yet in the page is put there by its first paint
-      turn.card = renderAssistantCard(turn.view, cardCtx(turn.n));
+      turn.card = turn.ordered ? renderReadingCard(turn.view, { ...cardCtx(turn.n), image: turn.image }) : renderAssistantCard(turn.view, cardCtx(turn.n));
       ui.conversation.append(turn.card);
       settleClamps(turn.card);
       scroller.toEnd(turn.card);
@@ -1664,8 +1750,70 @@ export function createApp(env) {
     return true;
   }
 
+  // ---- the welcome page -------------------------------------------------------------------------------------------------------------
+  //
+  // Dr. Green's welcome (index.html #welcome) lies over the whole page. The page opens on it when its address names no chat (home), with the
+  // newest chat (or a new one) opened behind it as home always is; a link to a chat, or #/new, goes straight to the chat. Start reading opens a
+  // new chat; Continue goes back to the chat behind it, and is there only when one is open. The banner's Dr. Green opens it again, and Escape
+  // then closes it. While it is up, the page behind it is inert: nothing there takes the focus or a click.
+  const behindWelcome = () => [doc.querySelector('.banner'), doc.querySelector('.layout'), ui.composer].filter(Boolean);
+
+  function showWelcome(from) {
+    if (!ui.welcome) return;
+    state.viewer?.close({ restore: false });
+    closeDrawer({ restore: false });
+    closeSidebar({ restore: false });
+    closePicker({ restore: false });
+    state.welcomeFrom = from;
+    syncWelcome();
+    ui.welcome.hidden = false;
+    doc.body.classList.add('welcome-open');
+    for (const node of behindWelcome()) node.setAttribute('inert', '');
+    if (from === 'brand') ui.welcomeStart.focus();   // the button that opened it is behind it now
+  }
+
+  function hideWelcome() {
+    if (!ui.welcome || ui.welcome.hidden) return false;
+    ui.welcome.hidden = true;
+    doc.body.classList.remove('welcome-open');
+    for (const node of behindWelcome()) node.removeAttribute('inert');
+    state.welcomeFrom = null;
+    return true;
+  }
+
+  // What the page says Dr. Green does (this server's), and whether there is a chat to continue.
+  function syncWelcome() {
+    if (!ui.welcome) return;
+    const what = welcomeText(state.models);
+    if (what && ui.welcomeWhat.textContent !== what) ui.welcomeWhat.textContent = what;
+    ui.welcomeContinue.hidden = !state.session.id;
+    ui.welcomeContinue.textContent = state.welcomeFrom === 'brand' ? 'Back to your case' : 'Continue your last case';
+  }
+
+  function wireWelcome() {
+    if (!ui.welcome) return;
+    ui.brand?.addEventListener('click', () => showWelcome('brand'));
+    ui.welcomeStart.addEventListener('click', () => {
+      hideWelcome();
+      detach(navigate('#/new'));
+      ui.well.focus();   // where a new chat starts: the X-ray
+    });
+    ui.welcomeContinue.addEventListener('click', () => {
+      const from = state.welcomeFrom;
+      hideWelcome();
+      (from === 'brand' ? ui.brand : ui.well).focus();
+    });
+  }
+
   function onKeydown(event) {
     if (event.key !== 'Escape') return;
+    if (ui.welcome && !ui.welcome.hidden) {   // the page the user opened from the banner closes again; the page it opened on stays
+      if (state.welcomeFrom === 'brand' && hideWelcome()) {
+        ui.brand.focus();
+        event.preventDefault();
+      }
+      return;
+    }
     if (state.viewer) {   // the topmost layer (P6-E): Escape closes it and nothing under it, wherever the focus is
       state.viewer.close();
       event.preventDefault();
@@ -1916,27 +2064,49 @@ export function createApp(env) {
       detach(reloadAll());
     });
     fields.storageNote = el('p', { class: 'hint', hidden: true }, STORAGE_TEXT);
+    // How a turn is shown (reveal.js): the page's own, stored apart from the options and never sent. Each applies as it is chosen.
+    const shown = (key, ...options) => {
+      const select = el('select', { 'data-display': key }, ...options.map(([value, label]) => el('option', { value: String(value) }, label)));
+      select.addEventListener('change', () => updateDisplay({ [key]: key === 'hold_s' ? Number(select.value) : select.value }));
+      return select;
+    };
+    fields.reveal = shown('reveal', ['ordered', 'When complete, top to bottom'], ['live', 'Live, as the report is written']);
+    fields.hold = shown('hold_s', ...HOLD_CHOICES.map((s) => [s, s === 0 ? 'No pause' : `${s} second${s === 1 ? '' : 's'}`]));
+    fields.holdHint = el('p', { class: 'hint', id: 'hold-hint' },
+      'While the X-ray is read you see each step as it runs. The pause counts from Send, so a fast report is not shown the instant it lands.');
+    fields.hold.setAttribute('aria-describedby', 'hold-hint');
     fields.save = el('button', { type: 'submit', id: 'drawer-save' }, 'Save');
+    fields.defaults = el('button', { type: 'button', id: 'drawer-defaults', onclick: () => restoreDefaults() }, 'Restore defaults');
+    // The fields in groups, each a fieldset that says what it is about, in the order the drawer has always listed them.
+    const group = (legend, ...children) => el('fieldset', {}, el('legend', {}, legend), ...children);
     // novalidate: the browser's own bubbles for min and max would stop the submit before the page could say what its fields take.
     fields.form = el('form', { id: 'settings-form', novalidate: true },
-      el('label', {}, 'Model', fields.model),
-      fields.compareRow,
-      el('label', {}, 'Decode', fields.decode),
-      el('label', {}, rangeLabel('Beam size', 'beam_size'), fields.beam), fields.errors.beam_size,
-      el('label', {}, rangeLabel('Token budget', 'max_new_tokens'), fields.tokens), fields.errors.max_new_tokens,
-      el('label', { class: 'check' }, fields.cached, 'Cached decode'), fields.cachedNote,
-      fields.compileRow,
-      el('label', {}, rangeLabel('Similar images', 'k_images'), fields.kImages), fields.errors.k_images,
-      el('label', {}, rangeLabel('Matching reports', 'k_reports'), fields.kReports), fields.errors.k_reports, fields.retrievalNote,
-      el('label', { class: 'check' }, fields.label, 'CheXbert labels'), fields.labelsNote,
-      el('label', { class: 'check' }, fields.repair, 'Display repair'),
-      el('label', { class: 'check' }, fields.stop, 'Stop when the report starts repeating'), fields.stopHint,
-      el('label', {}, 'Mode', fields.mode),
-      el('label', {}, 'API server', fields.apiServer), fields.errors.api_server, fields.apiServerHint,
-      el('label', {}, 'Access token', fields.token),
-      el('p', { class: 'hint' }, 'Saved in this browser on this device, because you typed it here.'),
-      fields.storageNote,
-      el('div', { class: 'drawer-actions' }, fields.save));
+      group('Model to run',
+        el('label', {}, 'Model', fields.model),
+        fields.compareRow),
+      group('Decoding',
+        el('label', {}, 'Decode', fields.decode),
+        el('label', {}, rangeLabel('Beam size', 'beam_size'), fields.beam), fields.errors.beam_size,
+        el('label', {}, rangeLabel('Token budget', 'max_new_tokens'), fields.tokens), fields.errors.max_new_tokens,
+        el('label', { class: 'check' }, fields.cached, 'Cached decode'), fields.cachedNote,
+        fields.compileRow),
+      group('Similar cases and findings',
+        el('label', {}, rangeLabel('Similar images', 'k_images'), fields.kImages), fields.errors.k_images,
+        el('label', {}, rangeLabel('Matching reports', 'k_reports'), fields.kReports), fields.errors.k_reports, fields.retrievalNote,
+        el('label', { class: 'check' }, fields.label, 'CheXbert labels'), fields.labelsNote),
+      group('Report text',
+        el('label', { class: 'check' }, fields.repair, 'Display repair'),
+        el('label', { class: 'check' }, fields.stop, 'Stop when the report starts repeating'), fields.stopHint),
+      group('Showing results',
+        el('label', {}, 'Show results', fields.reveal),
+        el('label', {}, 'Pause before results', fields.hold), fields.holdHint),
+      group('Connection',
+        el('label', {}, 'Mode', fields.mode),
+        el('label', {}, 'API server', fields.apiServer), fields.errors.api_server, fields.apiServerHint,
+        el('label', {}, 'Access token', fields.token),
+        el('p', { class: 'hint' }, 'Saved in this browser on this device, because you typed it here.'),
+        fields.storageNote),
+      el('div', { class: 'drawer-actions' }, fields.defaults, fields.save));
     fields.form.addEventListener('submit', (event) => {
       event.preventDefault();   // the page never reloads
       saveDrawer();
@@ -2139,6 +2309,29 @@ export function createApp(env) {
     fields.stop.checked = s.stop_on_repeat;
     fields.stopHint.textContent = stopHint(card);   // what Off means for the chosen model (P9-G5b)
     fields.mode.value = text(state.models?.mode) || '—';
+    fields.reveal.value = state.display.reveal;
+    fields.hold.value = String(state.display.hold_s);
+    fields.hold.disabled = state.display.reveal === 'live';   // a live turn is drawn as it comes: there is nothing to pause
+  }
+
+  // A display setting chosen in the drawer (reveal.js): kept and stored at once, as a select of the options is; it applies from the next Send.
+  function updateDisplay(patch) {
+    state.display = sanitizeDisplay({ ...state.display, ...patch });
+    const ok = saveDisplay(storage, state.display);
+    if (!ok) fields.storageNote.hidden = false;   // the settings' own note says it: this lasts until the page closes
+    syncDrawer();
+    return ok;
+  }
+
+  // Restore defaults: every setting of a turn and of how it is shown back to the page's defaults, the model, the API server and the token
+  // left as they are (they say which server and model, not how to run them). A number being typed is let go. Like any change it applies from
+  // the next Send, and the page says so.
+  function restoreDefaults() {
+    for (const key of [...drafts]) if (NUMBER_KEYS.includes(key)) showDraft(key, false);
+    const { model: _model, token: _token, ...rest } = DEFAULT_SETTINGS;
+    update({ ...rest, compare: false });
+    updateDisplay(DEFAULT_DISPLAY);
+    announce(DEFAULTS_TEXT, true);
   }
 
   function renderChips() {
@@ -2320,7 +2513,11 @@ export function createApp(env) {
     ui.settings.addEventListener('click', () => { if (ui.drawer.hidden) openDrawer(); else closeDrawer(); });
     doc.body.addEventListener('keydown', onKeydown);
     ui.newChat.addEventListener('click', () => { closeSidebar(); detach(navigate('#/new')); });
-    win.addEventListener?.('hashchange', () => detach(handleRoute()));
+    win.addEventListener?.('hashchange', () => {
+      hideWelcome();   // an address that names a chat (Back, a link, a typed one) is that chat
+      detach(handleRoute());
+    });
+    wireWelcome();
     // A wider or narrower conversation (the window, the drawer, the sidebar) changes which reports overflow their three lines (P6 fix 1).
     const Observer = env.ResizeObserver ?? globalThis.ResizeObserver;
     if (typeof Observer === 'function') new Observer(settleSoon).observe(ui.conversation);
@@ -2341,12 +2538,16 @@ export function createApp(env) {
   async function start() {
     build();
     wire();
+    // The welcome page, before anything is asked of the server, so that it is the first thing seen: only where the page is given it (the
+    // browser's start, env.welcome) and only for an address that names no chat.
+    if (env.welcome === true && parseRoute(win.location?.hash).kind === 'home') showWelcome('start');
     if (noServer()) { showNotice(FIRST_RUN_TEXT); return; }   // the Pages copy's first run (P9-B): nothing is asked until a server is set
     const asOf = state.serverGen;
     detach(checkHealth());
     await Promise.all([refreshModels(), refreshSessions()]);
     if (asOf !== state.serverGen) return;   // another API server was set meanwhile, whose reload opens what it shows (P9-B fix 1)
     await handleRoute();
+    syncWelcome();   // what this server does, and the chat home opened behind the page: Continue goes back to it
   }
 
   return { start, send, stopTurn, handleRoute, navigate, refreshSessions, exportSession, openDrawer, closeDrawer, reloadAll, state, ui };
@@ -2354,8 +2555,9 @@ export function createApp(env) {
 
 // ---- start ----------------------------------------------------------------------------------------------------------------------------
 
+// welcome: the page opens on Dr. Green's welcome when its address names no chat (a test's page, built without it, opens straight on the chat).
 export function browserEnv() {
-  return { document, window: globalThis, storage: browserStorage(globalThis), api: realApi };
+  return { document, window: globalThis, storage: browserStorage(globalThis), api: realApi, welcome: true };
 }
 
 // Only a page that has the composer starts the app: a test importing this file gets the helpers and nothing else.

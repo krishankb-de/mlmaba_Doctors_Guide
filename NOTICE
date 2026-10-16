@@ -34,3 +34,12 @@ Third-party notices
 3. Data. No MIMIC-CXR or MIMIC-CXR-JPG data, and no model weights trained on them, are
    included. Both datasets need credentialed access on PhysioNet under their data use
    agreement.
+
+4. Fonts, served with the page from app/static/fonts/ (latin subsets as packaged by
+   Fontsource), each under the SIL Open Font License 1.1, whose full text is beside it:
+   Atkinson Hyperlegible Next (Copyright 2020-2024 The Atkinson Hyperlegible Next Project
+   Authors), OFL-atkinson-hyperlegible-next.txt; Literata (Copyright 2017 The Literata
+   Project Authors), OFL-literata.txt.
+
+5. The Dr. Green illustrations in app/static/img/ were generated with Google Gemini for
+   this project by its author, and resized and cropped for the page.

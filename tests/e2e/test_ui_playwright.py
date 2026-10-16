@@ -25,8 +25,8 @@ from tests.e2e.conftest import COMPARE_MODELS, DESKTOP, FAULT_TOKENS, REPO_ROOT,
 
 pytestmark = [pytest.mark.e2e, pytest.mark.slow]
 
-BANNER = "Research prototype — not for clinical use."
-EMPTY_STATE = "Attach a chest X-ray below to generate a report."
+BANNER = "Research prototype; not for clinical use."
+EMPTY_STATE = "Attach a chest X-ray below and I'll read it."
 REPEAT_NOTE = "Stopped when the model began repeating itself."
 STOPPED_NOTE = "Turn stopped"
 SAVED = "Settings saved. They apply from your next Send."
@@ -124,9 +124,10 @@ def assistants(ui: Any, session_id: str) -> List[Dict[str, Any]]:
 
 
 def tab_from_the_top(page: Any) -> List[Dict[str, Any]]:
-    """Click the banner's text, as a user does to start over from the top (blur() would leave Chrome's sequential-navigation starting
-    point where the focus was), then press Tab once per control FOCUSABLE_JS lists; -> what had the focus after each press."""
-    page.click(".banner .disclaimer")
+    """Click the banner at its very start, before Dr. Green (its first control), as a user does to start over from the top (blur() would
+    leave Chrome's sequential-navigation starting point where the focus was), then press Tab once per control FOCUSABLE_JS lists; -> what had
+    the focus after each press."""
+    page.click(".banner", position={"x": 4, "y": 4})
     seen = []
     for _ in page.evaluate(FOCUSABLE_JS):
         page.keyboard.press("Tab")
@@ -145,9 +146,18 @@ def tab_to(page: Any, name: str, limit: int = 60) -> int:
 
 # ---- 1 -----------------------------------------------------------------------------------------------------------------------------
 
-def test_first_load_shows_the_banner_the_empty_chat_and_the_server_strip(ui):
-    page = ui.open()
+def test_first_load_shows_the_welcome_page_then_the_banner_the_empty_chat_and_the_server_strip(ui):
+    page = ui.open(keep_welcome=True)
+    page.wait_for_function("!document.querySelector('#welcome').hidden && !document.querySelector('#send').disabled")
+    assert page.inner_text("#welcome-title") == "Hi there."   # Dr. Green's welcome first, the chat behind it inert
+    assert page.inner_text(".speech") == "Hi, I'm Dr. Green."
+    assert page.inner_text("#welcome .disclaimer") == BANNER
+    assert page.evaluate("['.banner', '.layout', '#composer'].every((s) => document.querySelector(s).hasAttribute('inert'))")
+    assert page.is_hidden("#welcome-continue")   # no chat yet: nothing to continue
+    page.click("#welcome-start")
+    page.wait_for_function("document.querySelector('#welcome').hidden")
     assert page.evaluate("location.hash") == "#/new"   # no chat yet: home is an empty one
+    assert page.evaluate("document.activeElement === document.querySelector('#image-well')")
     assert page.inner_text(".banner .disclaimer") == BANNER
     assert page.evaluate("document.querySelector('#conversation').children.length") == 0
     assert page.evaluate("getComputedStyle(document.querySelector('#conversation'), '::before').content") == '"{}"'.format(EMPTY_STATE)
@@ -612,7 +622,7 @@ def test_errors_are_refused_visibly_and_leave_the_composer_usable(ui, images):
 def test_keyboard_only(ui, images):
     page = ui.open()
     expected = page.evaluate(FOCUSABLE_JS)
-    assert expected == ["new-session", "image-well", "prompt", "settings", "send"]
+    assert expected == ["brand", "new-session", "image-well", "prompt", "settings", "send"]   # Dr. Green first: the banner's way back to the welcome page
     seen = tab_from_the_top(page)                  # Tab visits every control in document order, each with its focus ring
     assert [f["name"] for f in seen] == expected and all(f["ring"] for f in seen), seen
 
@@ -643,7 +653,7 @@ def test_keyboard_only(ui, images):
     assert card["status"] == "aborted" and ui.composer()["focus"] == "prompt"
 
     expected = page.evaluate(FOCUSABLE_JS)         # with a chat and a card: the sidebar, the card's controls, the composer
-    assert expected[:5] == ["new-session", "Export JSON", "Export Markdown", expected[3], "Delete chat: xray_a.png"]
+    assert expected[:6] == ["brand", "new-session", "Export JSON", "Export Markdown", expected[4], "Delete chat: xray_a.png"]
     assert expected[-4:] == ["image-well", "prompt", "settings", "send"] and "Show raw report, turn 1" in expected
     seen = tab_from_the_top(page)
     assert [f["name"] for f in seen] == expected and all(f["ring"] for f in seen), seen

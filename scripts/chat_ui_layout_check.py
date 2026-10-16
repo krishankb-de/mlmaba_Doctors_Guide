@@ -58,6 +58,14 @@ page); six chips and a 140-character unbroken word are injected, and Stop is sho
      columns inside its width, each not wider inside than it is and with every part a column has (COMPARE_PARTS: its model's name, the summary,
      the sentences, a note, the terms, the label chips, Copy and Show raw) inside its own width, and the two stand side by side when the card is
      at least 900 px wide (1280 px, the drawer closed) and are stacked below that (the drawer open, 375 px)
+  n  (the Dr. Green redesign, every viewport in every scheme, on the page each case opens) the welcome page the page opens on: neither the
+     page nor the welcome page overflows horizontally; Start reading, scrolled into view, is at least 44 px tall and its centre hits it; the
+     greeting, the lines under it, the note, and the head's name and disclaimer lie inside the viewport's width, and so does the speech bubble,
+     which covers none of those words; the page behind it is inert. Then it is closed as a user closes it (Continue where it is offered, else
+     Start reading), and every case above runs on the chat it leaves
+  o  (one more case for every viewport in every scheme) the reading card that stands for a turn while it is read, drawn by render.js from check
+     i's turn while it runs, with a generated picture: its head, its lightbox and its list of stages lie inside the card's width and do not
+     overflow it, the picture has loaded inside the card, and nothing overflows the page, with the drawer closed and open
 
 On the short viewports, where the page scrolls instead (667x375, 320x256), c and d give way to: the report keeps its
 natural height (no scroller of its own, at least 120 px), the composer is not capped, the banner stays at the top of
@@ -108,7 +116,11 @@ NOTICE = "p.test-notice"   # P9-G5b: the tiny engine's notice above the report (
 # P6-H: the report card a person can read (render.js renderReport): the plain summary above the sentences, the list of sentences, the first of its notes
 # (the one for a [removed]) and the Terms under them. The synthetic turn's report has every one of them (CARD_REPORT).
 REPORT_PARTS = [".report-summary", ".report-body", ".report-key", ".report-terms"]
-CARD_PARTS = SECTIONS + [NOTICE] + REPORT_PARTS   # what check i measures in the card
+CARD_PARTS = SECTIONS + [NOTICE] + REPORT_PARTS + [".card-head", "section.findings", "section.process"]   # what check i measures in the card
+READING_PARTS = [".card-head", ".lightbox", ".reading-steps"]   # check o: the reading card's parts
+WELCOME_WORDS = ["#welcome-title", ".welcome-lead", "#welcome-what", ".welcome-note"]   # check n: what the speech bubble must leave clear
+WELCOME_HEAD = [".welcome-head .brand", ".welcome-head .disclaimer"]
+MIN_TAP_PX = 44   # check n: the welcome page's Start reading, a tap target (R-03)
 # P6 fix 1: the clamp's proof. Three lines of a matching report hold about 130 characters at 375 px and about 280 on a wide page.
 MID_REPORT = ("Findings: The heart is normal in size. The lungs are clear, with no focal consolidation, pleural effusion or pneumothorax. "
               "Impression: No acute cardiopulmonary process.")   # 168 characters: over three lines at phone width, two lines on a wide page
@@ -721,10 +733,107 @@ def _save_settings(browser: Browser) -> None:
 STARTED_JS = "location.hash.startsWith('#/') && !document.querySelector('#send').disabled"
 
 
-def open_case(browser: Browser, url: str, width: int, height: int, scheme: str) -> None:
-    """browser.open, and then the page's own start-up to its end, so that a case is set up on a page that will not change it."""
+WELCOME_OPEN_JS = "document.body.classList.contains('welcome-open') && !document.querySelector('#welcome').hidden"
+WELCOME_CLOSED_JS = ("!document.body.classList.contains('welcome-open') && document.querySelector('#welcome').hidden"
+                     " && !document.querySelector('.layout').hasAttribute('inert') && " + STARTED_JS)
+# Closes the welcome page as a user does: Continue where it is offered (the chat home opened behind it, which every case before the redesign
+# measured), else Start reading (a new chat, which is home with no chat yet). The focus each gives is taken back, as on a page just opened.
+CLOSE_WELCOME_JS = """() => {
+  const go = document.querySelector('#welcome-continue:not([hidden])') ?? document.querySelector('#welcome-start');
+  go.click();
+  document.activeElement?.blur?.();
+  return true;
+}"""
+
+
+def open_case(browser: Browser, url: str, width: int, height: int, scheme: str, welcome: Optional[List[str]] = None) -> None:
+    """browser.open, and then the page's own start-up to its end, so that a case is set up on a page that will not change it. The page is
+    opened without an address, so it opens on the welcome page: with a list, check n's failures there are added to it; then it is closed."""
     browser.open(url, width, height, scheme)
     browser.wait_for(STARTED_JS, 30, "the page to start: its route in the address, Send on")
+    browser.wait_for(WELCOME_OPEN_JS, 15, "the welcome page: the page opens on it when its address names no chat")
+    if welcome is not None:
+        welcome.extend(check_welcome(browser.run(MEASURE_WELCOME_JS, {"words": WELCOME_WORDS + WELCOME_HEAD}), width))
+    browser.run(CLOSE_WELCOME_JS, None)
+    browser.wait_for(WELCOME_CLOSED_JS, 15, "the welcome page to close on the chat")
+    browser.evaluate("window.scrollTo(0, 0)")
+
+
+MEASURE_WELCOME_JS = """(args) => {
+  const q = (s) => document.querySelector(s);
+  const box = (el) => { const r = el.getBoundingClientRect(); return [r.left, r.top, r.right, r.bottom]; };
+  const welcome = q('#welcome');
+  const start = q('#welcome-start');
+  start.scrollIntoView({ block: 'center' });
+  const s = box(start);
+  const hit = document.elementFromPoint((s[0] + s[2]) / 2, (s[1] + s[3]) / 2);
+  welcome.scrollTop = 0;
+  const words = {};
+  for (const sel of args.words) words[sel] = q(sel) ? box(q(sel)) : null;
+  return { doc: [document.documentElement.scrollWidth, document.documentElement.clientWidth], welcome: [welcome.scrollWidth, welcome.clientWidth],
+           start: s, startHit: !!hit && (hit === start || start.contains(hit)), words, speech: box(q('.speech')),
+           inert: ['.banner', '.layout', '#composer'].map((sel) => q(sel).hasAttribute('inert')) };
+}"""
+
+
+def check_welcome(m: Dict[str, Any], width: int) -> List[str]:
+    """The failures in one measurement of the welcome page (check n)."""
+    failures = []
+    for name, (sw, cw) in (("documentElement", m["doc"]), ("#welcome", m["welcome"])):
+        if sw > cw:
+            failures.append("welcome page: {} overflows horizontally: scrollWidth {} > clientWidth {}".format(name, sw, cw))
+    left, top, right, bottom = m["start"]
+    if not m["startHit"]:
+        failures.append("welcome page: Start reading is covered")
+    if bottom - top < MIN_TAP_PX:
+        failures.append("welcome page: Start reading is {:.0f} px tall, under {} px".format(bottom - top, MIN_TAP_PX))
+    if left < -0.5 or right > width + 0.5:
+        failures.append("welcome page: Start reading leaves the viewport's width")
+    speech = m["speech"]
+    for name, b in [("the speech bubble", speech)] + [(sel, m["words"].get(sel)) for sel in WELCOME_WORDS + WELCOME_HEAD]:
+        if b is None:
+            failures.append("welcome page: {} is not there".format(name))
+        elif b[0] < -0.5 or b[2] > width + 0.5:
+            failures.append("welcome page: {} leaves the viewport's width: left {:.0f}, right {:.0f}".format(name, b[0], b[2]))
+    for sel in WELCOME_WORDS:
+        b = m["words"].get(sel)
+        if b and speech[0] < b[2] - 0.5 and b[0] < speech[2] - 0.5 and speech[1] < b[3] - 0.5 and b[1] < speech[3] - 0.5:
+            failures.append("welcome page: the speech bubble covers {}".format(sel))
+    if not all(m["inert"]):
+        failures.append("welcome page: the page behind it is not inert")
+    return failures
+
+
+# Check o: the reading card of check i's turn while it runs (its generate stage started), with a generated picture for its lightbox.
+INJECT_READING_JS = """async (args) => {
+  const render = await import('/static/render.js');
+  const state = await import('/static/state.js');
+  const canvas = document.createElement('canvas');
+  canvas.width = 120;
+  canvas.height = 140;
+  const g = canvas.getContext('2d');
+  g.fillStyle = '#333333';
+  g.fillRect(0, 0, 120, 140);
+  g.fillStyle = '#bbbbbb';
+  g.fillRect(20, 20, 30, 100);
+  g.fillRect(70, 20, 30, 100);
+  const png = canvas.toDataURL('image/png');
+  const card = render.renderReadingCard(state.replay(args.events), { image: { url: png }, turn: 1 });
+  document.querySelector('#conversation').replaceChildren(card);
+  await Promise.all([...card.querySelectorAll('img')].map((img) => img.decode().catch(() => null)));
+  return true;
+}"""
+
+
+def reading_events() -> List[Dict[str, Any]]:
+    """Check i's turn up to its generate stage: running, the stages before it done."""
+    out = []
+    for event in section_events():
+        if event["event"] == "content_block_delta":
+            out.append({"event": "stage_start", "data": {"stage": "generate", "index": 3, "seq": event["data"]["seq"]}})
+            break
+        out.append(event)
+    return out
 
 def enter_busy(browser: Browser, state: str, drawer: bool) -> Optional[str]:
     """The page in the busy composer of one case, by what a user does (P9-G5b fix 1): the image attached as in the idle cases, then, for
@@ -996,7 +1105,11 @@ def run_checks(browser: Browser, url: str) -> Tuple[int, List[str]]:
     for width, height, scroll in viewports:
         for scheme in SCHEMES:
             serial += 1
-            open_case(browser, "{}?case={}".format(url, serial), width, height, scheme)
+            cases += 1   # the welcome page the page opens on (check n), measured before the chat's cases
+            welcome = []   # type: List[str]
+            open_case(browser, "{}?case={}".format(url, serial), width, height, scheme, welcome=welcome)
+            for failure in welcome:
+                seen.setdefault(("{}x{}".format(width, height), "welcome", failure), []).append(scheme)
             browser.key("Tab", "Tab", 9)   # keyboard modality, so :focus-visible matches when the toggle is focused
             browser.run(INJECT_JS, {"chips": CHIPS, "word": LONG_WORD, "text": REPORT_TEXT})
             for drawer in ("closed", "open"):
@@ -1022,6 +1135,12 @@ def run_checks(browser: Browser, url: str) -> Tuple[int, List[str]]:
                 browser.evaluate("document.querySelector('#drawer').hidden = {}".format("false" if drawer == "open" else "true"))
                 for failure in check_sections(browser.run(MEASURE_SECTIONS_JS, {"sections": CARD_PARTS}), width, CARD_PARTS, drawer == "open"):
                     seen.setdefault(("{}x{}".format(width, height), "drawer={} card sections".format(drawer), failure), []).append(scheme)
+            cases += 1   # the reading card (check o), with the drawer closed and then open
+            browser.run(INJECT_READING_JS, {"events": reading_events()})
+            for drawer in ("closed", "open"):
+                browser.evaluate("document.querySelector('#drawer').hidden = {}".format("false" if drawer == "open" else "true"))
+                for failure in check_sections(browser.run(MEASURE_SECTIONS_JS, {"sections": READING_PARTS}), width, READING_PARTS, drawer == "open"):
+                    seen.setdefault(("{}x{}".format(width, height), "drawer={} reading card".format(drawer), failure), []).append(scheme)
             cases += 1   # the test-split picker open, with the drawer closed (P6 fix 1)
             browser.evaluate("document.querySelector('#drawer').hidden = true")
             browser.run(INJECT_PICKER_JS, {"studies": PICKER_STUDIES})

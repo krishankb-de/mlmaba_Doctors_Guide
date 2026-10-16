@@ -294,6 +294,51 @@ LOG_JS = """async (id) => {
 }"""
 
 # Run by Chrome before the page's own scripts on every load (Context.stop_off): the stored settings, with the stop switch off.
+# How a turn is shown (reveal.js, cxrchat.display): every check but reveal watches a turn as it streams, so the page is given "live" before it
+# loads, unless the storage already says something (the reveal check stores the page's own default, in order with a 3 s pause, first).
+LIVE_DISPLAY_JS = """try { if (localStorage.getItem('cxrchat.display') === null) localStorage.setItem('cxrchat.display', '{"reveal":"live","hold_s":3}'); }
+catch (e) { /* storage blocked: the page runs with its defaults */ }"""
+ORDERED_DISPLAY_JS = "localStorage.setItem('cxrchat.display', '{\"reveal\":\"ordered\",\"hold_s\":3}')"
+REVEAL_HOLD_S = 3
+# The welcome page as the page shows it, and the page behind it.
+WELCOME_STATE_JS = """() => {
+  const q = (s) => document.querySelector(s);
+  return { shown: !q('#welcome').hidden && document.body.classList.contains('welcome-open'), title: q('#welcome-title').textContent.trim(),
+           speech: q('.speech').textContent.trim(), start: q('#welcome-start').textContent.trim(),
+           inert: ['.banner', '.layout', '#composer'].map((s) => q(s).hasAttribute('inert')) };
+}"""
+# From Send on, every state of the newest assistant card the page draws: a frame each time it changes, with when, after Send.
+REVEAL_RECORD_JS = """() => {
+  window.__reveal = { sentAt: performance.now(), frames: [] };
+  const conv = document.querySelector('#conversation');
+  const look = () => {
+    const cards = conv.querySelectorAll('article.card');
+    const c = cards[cards.length - 1];
+    if (!c) return;
+    const f = { phase: c.getAttribute('data-phase'), status: c.getAttribute('data-status'), reveal: c.getAttribute('data-reveal'),
+                report: !!c.querySelector('.report'), lightbox: !!c.querySelector('.lightbox img[src]'),
+                steps: [...c.querySelectorAll('.reading-steps > li')].map((li) => li.getAttribute('data-state')), skip: !!c.querySelector('.reveal-skip') };
+    const frames = window.__reveal.frames;
+    const last = frames[frames.length - 1];
+    const same = last && JSON.stringify(Object.assign({}, last, { t: 0 })) === JSON.stringify(Object.assign({}, f, { t: 0 }));
+    if (!same) frames.push(Object.assign(f, { t: Math.round(performance.now() - window.__reveal.sentAt) }));
+  };
+  new MutationObserver(look).observe(conv, { subtree: true, childList: true, attributes: true });
+  look();
+  return true;
+}"""
+# The beats of the newest card's reveal in document order: each unit's delay (--reveal-at), whether they never go back, and where the report's last
+# line falls against the first part under the report.
+REVEAL_ORDER_JS = """() => {
+  const c = [...document.querySelectorAll('#conversation article.card')].pop();
+  const units = [...c.querySelectorAll('.reveal-line, .reveal-part')];
+  const at = (n) => parseFloat(n.style.getPropertyValue('--reveal-at')) || 0;
+  const delays = units.map(at);
+  const lines = [...c.querySelectorAll('.report .reveal-line')].map(at);
+  const after = [...c.children].filter((n) => n.localName === 'section' && n.classList.contains('reveal-part')).map(at);
+  return { units: units.length, lines: lines.length, monotonic: delays.every((d, i) => i === 0 || d >= delays[i - 1]),
+           lastLine: lines.length ? Math.max(...lines) : -1, firstPartAfter: after.length ? Math.min(...after) : Infinity };
+}"""
 STOP_OFF_JS = """try { var s = JSON.parse(localStorage.getItem('cxrchat.settings') || 'null') || {}; s.stop_on_repeat = false;
   localStorage.setItem('cxrchat.settings', JSON.stringify(s)); } catch (e) { /* storage blocked: the page runs with its defaults */ }"""
 
@@ -381,8 +426,10 @@ class Context:
         forget_settings(self.browser)
 
     # -- the page
-    def open(self, hash_: str = "", viewport: Tuple[int, int] = DESKTOP, scheme: str = "light", base: Optional[str] = None) -> None:
-        """A fresh load of the app, at this viewport and colour scheme. The query is unique, so that a stale page cannot pass."""
+    def open(self, hash_: str = "", viewport: Tuple[int, int] = DESKTOP, scheme: str = "light", base: Optional[str] = None,
+             keep_welcome: bool = False) -> None:
+        """A fresh load of the app, at this viewport and colour scheme. The query is unique, so that a stale page cannot pass. With no address
+        the page opens on the welcome page: unless it is kept, it is closed as a user closes it (Continue where it is offered, else Start reading)."""
         b = self.browser
         self.serial += 1
         b.set_viewport(viewport[0], viewport[1], scheme)
@@ -390,6 +437,13 @@ class Context:
         b.wait_for("location.search === '?run=%d' && document.readyState === 'complete' && !!document.querySelector('#exports')"
                    % self.serial, what="the page to load")
         b.wait_for("document.querySelector('#mode-badge').textContent !== '' && location.hash !== ''", what="the app to start")
+        if hash_ == "" and not keep_welcome:
+            # and the chat home opens behind it to its end (Send on again), so that Continue is offered wherever there is a chat to go back to
+            b.wait_for("!document.querySelector('#welcome').hidden && location.hash.startsWith('#/') && !document.querySelector('#send').disabled",
+                       what="the welcome page the page opens on, the chat behind it opened")
+            b.evaluate("(document.querySelector('#welcome-continue:not([hidden])') || document.querySelector('#welcome-start')).click()")
+            b.wait_for("document.querySelector('#welcome').hidden && !document.querySelector('.layout').hasAttribute('inert')",
+                       what="the welcome page to close on the chat")
 
     def card(self) -> Optional[Dict[str, Any]]:
         return self.browser.evaluate("(%s)()" % CARD_JS)
@@ -1461,7 +1515,7 @@ def finished_card(b: Browser, cards: int, timeout: float = 60.0) -> Dict[str, An
 
 def forget_settings(b: Browser) -> None:
     try:
-        b.evaluate("localStorage.removeItem('cxrchat.settings')")
+        b.evaluate("localStorage.removeItem('cxrchat.settings'); localStorage.removeItem('cxrchat.display')")   # the next load stores live again
     except RuntimeError:   # no page of the app is open (yet): nothing of it is stored
         pass
 
@@ -1749,9 +1803,79 @@ def settings_walk(ctx: Context) -> Tuple[str, Dict[str, Any]]:
              "clean_display_at_200_tokens": clean})
 
 
+# ---- the Dr. Green redesign: the welcome page and a turn read, then shown in order (reveal.js) ---------------------------------------------
+
+def check_reveal(ctx: Context) -> Tuple[str, Dict[str, Any]]:
+    """The page opened with no address opens on the welcome page, the chat behind it inert; Start reading, a click on its centre, opens a new
+    chat with the focus on the image well. With Show results in order (the page's own default, which every other check sets to live), a turn is
+    the reading card from Send (its X-ray on the lightbox, the stages as they run, no report) until it has ended and the 3 s pause since Send is
+    over; then the whole card is shown, top to bottom (every line of the report before the parts under it), and its reveal ends by itself, Show
+    all now gone. A second turn's Show all now, pressed from the keyboard, ends its reveal at once and hands the focus to Copy."""
+    b = ctx.browser
+    ctx.open("#/new")   # a page of the app, so that its storage can be written: the next load reads it
+    b.evaluate(ORDERED_DISPLAY_JS)
+    ctx.open("", keep_welcome=True)
+    welcome = b.evaluate("(%s)()" % WELCOME_STATE_JS)
+    expect(welcome["shown"], "the page opened with no address did not open on the welcome page: {}".format(welcome))
+    expect(welcome["inert"] == [True, True, True], "the page behind the welcome page is not inert: {}".format(welcome["inert"]))
+    expect(welcome["title"] == "Hi there." and welcome["speech"] == "Hi, I'm Dr. Green." and welcome["start"] == "Start reading",
+           "the welcome page says {}".format(welcome))
+    expect(b.evaluate("document.querySelector('#welcome-start').getBoundingClientRect().bottom <= innerHeight"),
+           "Start reading is below the fold of the welcome page at {}x{}".format(*DESKTOP))
+    b.click("#welcome-start")
+    # the address changes at once and the chat a task later (its hashchange): the new chat is the empty one, whatever home had opened behind
+    b.wait_for("location.hash === '#/new' && document.querySelector('#welcome').hidden && !document.querySelector('.layout').hasAttribute('inert')"
+               " && document.querySelectorAll('#conversation > *').length === 0", what="Start reading to open a new chat")
+    expect(b.evaluate("document.activeElement === document.querySelector('#image-well')"), "Start reading did not put the focus on the image well")
+    ctx.attach("a")
+    b.run(REVEAL_RECORD_JS, None)
+    ctx.send()
+    deadline = time.time() + 40   # the pictures of these states are the redesign's own (the checklist keeps to its ten); the frames say them here
+    while True:
+        last = b.evaluate("window.__reveal.frames[window.__reveal.frames.length - 1] || null")
+        if last and last["reveal"] == "done":
+            break
+        if time.time() > deadline:
+            raise Failure("the card was not shown and its reveal over within 40 s: last state {}".format(last))
+        time.sleep(0.04)
+    frames = b.evaluate("window.__reveal.frames")
+    shown_at = next((i for i, f in enumerate(frames) if f["phase"] is None and f["status"] is not None), None)
+    expect(shown_at is not None and shown_at > 0, "the card was never the reading card before it was shown: {}".format(frames[:4]))
+    reading = frames[:shown_at]
+    expect(all(f["phase"] == "reading" and not f["report"] for f in reading), "a reading card showed a report, or was not the reading card")
+    expect(any(f["lightbox"] for f in reading), "the reading card never showed the X-ray on its lightbox")
+    expect(any(f["status"] == "running" and "running" in f["steps"] for f in reading), "the reading card never showed a stage running")
+    held = [f for f in reading if f["status"] == "done"]
+    first = frames[shown_at]
+    pause_ms = REVEAL_HOLD_S * 1000
+    expect(first["t"] >= pause_ms - 60, "the card was shown {} ms after Send, before the {} ms pause".format(first["t"], pause_ms))
+    expect(first["status"] == "done" and first["reveal"] == "run" and first["skip"],
+           "the card was shown as {}, not done, in its reveal, with Show all now".format(first))
+    end = next(f for f in frames[shown_at:] if f["reveal"] == "done")
+    expect(not end["skip"], "Show all now outlived the reveal")
+    order = b.evaluate("(%s)()" % REVEAL_ORDER_JS)
+    expect(order["lines"] and order["monotonic"], "the reveal's beats do not follow the card down: {}".format(order))
+    expect(order["lastLine"] < order["firstPartAfter"], "a part under the report came up before its last line: {}".format(order))
+    # a second turn: Show all now, from the keyboard
+    ctx.attach("b")
+    ctx.send()
+    b.wait_for("(() => { const c = [...document.querySelectorAll('#conversation article.card')].pop(); return !!c && c.getAttribute('data-reveal') === 'run'; })()",
+               10, "the second turn's reveal")
+    b.evaluate("[...document.querySelectorAll('#conversation article.card')].pop().querySelector('.reveal-skip').focus()")
+    b.key("Enter", "Enter", 13, "\r")
+    skipped = b.evaluate("(() => { const c = [...document.querySelectorAll('#conversation article.card')].pop(); "
+                         "return { reveal: c.getAttribute('data-reveal'), skip: !!c.querySelector('.reveal-skip'), "
+                         "copy: document.activeElement === c.querySelector('[data-action=\"copy\"]') }; })()")
+    expect(skipped == {"reveal": "done", "skip": False, "copy": True}, "Show all now pressed with Enter left {}".format(skipped))
+    data = {"welcome": welcome, "frames": len(frames), "reading_frames": len(reading), "held_after_done": len(held), "shown_ms": first["t"],
+            "reveal_over_ms": end["t"], "pause_ms": pause_ms, "beats": order, "show_all_now": skipped}
+    return ("the page opened on the welcome page, the chat behind it inert, and Start reading opened a new chat; the turn was the reading card "
+            "({} states, {} of them done and held) and was shown {} ms after Send (pause {} ms), top to bottom, its reveal over at {} ms; "
+            "Show all now ended a second reveal at once, the focus on Copy").format(len(reading), len(held), first["t"], pause_ms, end["t"]), data
+
 CHECKS = [("stream", check_stream), ("reload", check_reload), ("sessions", check_sessions), ("exports", check_exports),
           ("stop", check_stop), ("keyboard", check_keyboard), ("narrow", check_narrow), ("a11y", check_a11y), ("error", check_error),
-          ("settings", check_settings)]
+          ("settings", check_settings), ("reveal", check_reveal)]
 
 
 def select_checks(only: Optional[str]) -> List[Tuple[str, Callable[["Context"], Tuple[str, Dict[str, Any]]]]]:
@@ -1832,6 +1956,7 @@ def run_all(browser: Browser, app: Optional[App], base: str, work: str, out_dir:
     browser.call("Runtime.enable")
     browser.call("Emulation.setFocusEmulationEnabled", enabled=True)   # the page behaves as the focused one, so key events move focus
     ctx = Context(browser, app, base, work, out_dir)
+    browser.call("Page.addScriptToEvaluateOnNewDocument", source=LIVE_DISPLAY_JS)   # every check watches a live turn but reveal (it says so first)
     if out_dir is not None:   # a picture of an earlier run must not pass for this run's
         for name in EVIDENCE_FILES:
             if os.path.exists(os.path.join(out_dir, name)):

@@ -36,7 +36,8 @@ def files_of(root: Path) -> Dict[str, bytes]:
 
 
 def page_sources() -> List[str]:
-    return sorted(p.name for p in STATIC.iterdir() if p.is_file() and not p.name.startswith("."))
+    """The page's files, relative to app/static: its code at the top, its pictures and fonts in their folders (img/, fonts/)."""
+    return sorted(p.relative_to(STATIC).as_posix() for p in STATIC.rglob("*") if p.is_file() and not p.name.startswith("."))
 
 
 # ---- the build, on this checkout's page --------------------------------------------------------------------------------------
@@ -192,9 +193,11 @@ def test_the_build_checks_its_own_copy_and_says_how_many_of_each_kind_never_whic
 
 
 @pytest.mark.parametrize("files, error", [
-    ({"notes.txt": "a note\n"}, "ERROR pages_build: 1 file of another kind refused: a page is made of .html, .js and .css, and nothing else is published"),
+    ({"notes.txt": "a note\n"}, "ERROR pages_build: 1 file of another kind refused: a page is made of .html, .js and .css, img/*.png and fonts/*.woff2 and *.txt, and nothing else is published"),
+    ({"img/scan.jpg": "not really a picture\n", "fonts/face.ttf": "not a woff2\n"},
+     "ERROR pages_build: 2 files of another kind refused: a page is made of .html, .js and .css, img/*.png and fonts/*.woff2 and *.txt, and nothing else is published"),   # the folders take their own kinds only
     ({"scan.png": "not really a picture\n", "deep/notes.txt": "a note\n"},
-     "ERROR pages_build: 2 files of another kind refused: a page is made of .html, .js and .css, and nothing else is published"),
+     "ERROR pages_build: 2 files of another kind refused: a page is made of .html, .js and .css, img/*.png and fonts/*.woff2 and *.txt, and nothing else is published"),
     ({"index.html": INDEX.replace("<head>\n", "<head>\n  " + PAGES_TAG + "\n")},
      "ERROR pages_build: the page's index.html carries the Pages tag itself: the page the API serves must not"),
     ({"index.html": INDEX.replace('="/static/', '="static/')},

@@ -16,6 +16,7 @@ import * as appModule from '../../app/static/app.js';   // P6-C, P6-D: a missing
 import { applyEvent, initialView } from '../../app/static/state.js';
 import { el, renderAssistantCard } from '../../app/static/render.js';
 import { authHeaders, transportFailure } from '../../app/static/api.js';
+import { DISPLAY_KEY } from '../../app/static/reveal.js';
 
 installDom();   // after the import above: with no #composer on the page, importing app.js started nothing
 
@@ -475,8 +476,9 @@ function buildPage() {
   document.body.replaceChildren(
     el('header', { class: 'banner' },
       el('button', { id: 'sidebar-toggle', type: 'button', 'aria-controls': 'sidebar', 'aria-expanded': 'false', 'aria-label': 'Sessions' }, '☰'),
+      el('button', { id: 'brand', class: 'brand', type: 'button', 'aria-label': 'Dr. Green, welcome page' }, el('span', { class: 'avatar', 'aria-hidden': 'true' }), 'Dr. Green'),
       el('span', { id: 'test-badge', hidden: true }, 'test model'),
-      el('p', { class: 'disclaimer' }, 'Research prototype — not for clinical use.'),
+      el('p', { class: 'disclaimer' }, 'Research prototype; not for clinical use.'),
       el('span', { id: 'mode-badge' }), el('span', { id: 'health', 'aria-live': 'polite' })),
     el('div', { class: 'layout' },
       el('nav', { id: 'sidebar', 'aria-label': 'Sessions' }, el('button', { id: 'new-session', type: 'button' }, 'New chat'), el('ol', { id: 'session-list' })),
@@ -491,13 +493,23 @@ function buildPage() {
       el('button', { id: 'send', type: 'submit' }, 'Send'),
       el('button', { id: 'stop', type: 'button', hidden: true }, 'Stop'),
       el('input', { id: 'file', type: 'file', hidden: true })),
-    el('div', { id: 'viewer', hidden: true }));
+    el('div', { id: 'viewer', hidden: true }),
+    el('section', { id: 'welcome', hidden: true, 'aria-labelledby': 'welcome-title' },
+      el('div', { class: 'welcome-head' }, el('span', { class: 'brand' }, 'Dr. Green'), el('p', { class: 'disclaimer' }, 'Research prototype; not for clinical use.')),
+      el('div', { class: 'welcome-stage' },
+        el('div', { class: 'welcome-copy' },
+          el('h1', { id: 'welcome-title', tabindex: '-1' }, 'Hi there.'),
+          el('p', { class: 'welcome-lead' }, "I'm Dr. Green, your virtual radiologist for chest X-rays."),
+          el('p', { id: 'welcome-what' }, "Give me a frontal chest X-ray and I'll draft a report."),
+          el('div', { class: 'welcome-actions' },
+            el('button', { id: 'welcome-start', type: 'button' }, 'Start reading'),
+            el('button', { id: 'welcome-continue', type: 'button', hidden: true }, 'Continue your last case'))))));
 }
 
 function fakeWindow(hash = '') {
   const listeners = new Map();
   const win = {
-    short: false, replaced: [], copied: [], scrollY: 0, innerHeight: 800,
+    short: false, reduced: false, replaced: [], copied: [], scrollY: 0, innerHeight: 800,   // reduced: the reader asked for less motion
     location: {
       current: hash,
       get hash() { return this.current; },
@@ -506,7 +518,7 @@ function fakeWindow(hash = '') {
     history: { replaceState(_state, _title, url) { win.replaced.push(url); win.location.current = url; } },
     addEventListener(type, fn) { if (!listeners.has(type)) listeners.set(type, []); listeners.get(type).push(fn); },
     fire(type) { for (const fn of listeners.get(type) ?? []) fn({ type }); },
-    matchMedia: (query) => ({ matches: win.short && /max-height/.test(query) }),
+    matchMedia: (query) => ({ matches: (win.short && /max-height/.test(query)) || (win.reduced && /prefers-reduced-motion: reduce/.test(query)) }),
     navigator: { clipboard: { writeText: async (value) => { win.copied.push(value); } } },
   };
   return win;
@@ -700,8 +712,11 @@ function atOrigins(origins, inner) {
 
 // origins: the API servers the page may reach (P9-B), when its API is not on its own origin. pages: the page is the GitHub Pages copy, whose
 // index.html carries <meta name="cxr-pages" content="1"> (scripts/pages_build.py).
-function harness({ hash = '', sessions = [], models = MODELS, storage = memoryStorage(), routes = {}, confirmAnswer = true, urls, noConfirm = false,
-                   origins = [], pages = false } = {}) {
+// A page's storage starts with the display setting live (reveal.js): the card drawn from the first event, as every test here before the ordered
+// reveal expects. The ordered reveal, the default of a page with nothing stored, has tests of its own (liveStorage() leaves it out).
+const liveStorage = (initial = {}) => memoryStorage({ [DISPLAY_KEY]: JSON.stringify({ reveal: 'live' }), ...initial });
+function harness({ hash = '', sessions = [], models = MODELS, storage = liveStorage(), routes = {}, confirmAnswer = true, urls, noConfirm = false,
+                   origins = [], pages = false, welcome = false } = {}) {
   installDom();   // a new document each time: the body of the last test still holds that app's listeners
   buildPage();
   if (pages) document.body.append(el('meta', { name: 'cxr-pages', content: '1' }));
@@ -724,6 +739,7 @@ function harness({ hash = '', sessions = [], models = MODELS, storage = memorySt
     setInterval: timers.setInterval, clearInterval: timers.clearInterval,
     ...(noConfirm ? {} : { confirm: (message) => { confirms.push(message); return h.answer; } }),
     ...(urls ? { URL: urls } : {}),
+    ...(welcome ? { welcome: true } : {}),   // the browser's start opens on Dr. Green's welcome page (browserEnv)
   });
   return h;
 }
@@ -1137,7 +1153,7 @@ test('a TypeError out of the stream or the poll that api.js did not mark as the 
   h.api.polls[0].channel.fail(broken);
   await flush();
   assert.deepEqual(logged.map((args) => args[0]), [bug, broken]);
-  assert.equal(q($('notice'), 'p').textContent, 'Something went wrong — see the console');   // and the console has it
+  assert.equal(q($('notice'), 'p').textContent, 'Something went wrong. See the console.');   // and the console has it
   await turn;                                               // the send itself is over: the poll it ended on failed
   buttonOf($('notice'), 'Retry').click();                   // Retry follows the turn again
   await flush();
@@ -2727,7 +2743,7 @@ test('the banner has the retention sentence in an element of its own after the s
   assert.equal($('retention').hidden, false);
   assert.equal($('retention').getAttribute('class'), 'note');   // the muted note style the page already has: no new rule
   assert.equal($('health').textContent, 'private · 0 of 4 turns in flight');   // the strip says what it said
-  assert.deepEqual(Array.from(banner.children).map((n) => n.id || n.getAttribute('class')), ['sidebar-toggle', 'test-badge', 'disclaimer', 'mode-badge', 'health', 'retention']);
+  assert.deepEqual(Array.from(banner.children).map((n) => n.id || n.getAttribute('class')), ['sidebar-toggle', 'brand', 'test-badge', 'disclaimer', 'mode-badge', 'health', 'retention']);
 
   payload = { ...payload, retention_days: 7 };
   h.timers.advance(10000);
@@ -2752,7 +2768,7 @@ test('the banner has a "test model" badge after the toggle while the server\'s d
   assert.equal($('test-badge').hidden, false);
   assert.equal($('test-badge').textContent, 'test model');
   const banner = Array.from($('health').parentNode.children).map((n) => n.id || n.getAttribute('class'));
-  assert.deepEqual(banner.slice(0, 4), ['sidebar-toggle', 'test-badge', 'disclaimer', 'mode-badge']);   // a small badge, first after the toggle
+  assert.deepEqual(banner.slice(0, 5), ['sidebar-toggle', 'brand', 'test-badge', 'disclaimer', 'mode-badge']);   // a small badge, first after the toggle and Dr. Green
   for (const models of [MODELS, MODELS_EOS, MODELS_EOS_DEFAULT, { ...MODELS, default_model: 'tiny2' }, { ...MODELS, default_model: 'Tiny' }]) {
     const real = harness({ models });
     await real.app.start();
@@ -3261,7 +3277,7 @@ const captureErrors = (t) => {
   t.after(() => { console.error = real; });
   return logged;
 };
-const GENERIC = 'Something went wrong — see the console';
+const GENERIC = 'Something went wrong. See the console.';
 
 // I1: the watchdog starts when the server has the turn, not when Send is pressed ------------------------------------------------------------
 
@@ -4851,8 +4867,8 @@ test('a server with no retrieval gallery and no labeller: those controls are dis
   // What is sent is what the user chose: the server skips the stages, and says so in the turn.
   const sent = optionsFromSettings(loadSettings(h.storage), NO_STAGES);
   assert.deepEqual([sent.k_images, sent.k_reports, sent.label], [4, 3, true]);
-  // The notes' places: after the field they explain (and the field's own, hidden, error line).
-  const form = $('settings-form').children;
+  // The notes' places: after the field they explain (and the field's own, hidden, error line), in the group of the drawer they are in.
+  const form = labelled(MATCHING).parentNode.children;
   assert.deepEqual(form.slice(form.indexOf(labelled(MATCHING)), form.indexOf(labelled(MATCHING)) + 3), [labelled(MATCHING), $('k_reports-error'), retrieval]);
   assert.equal(form[form.indexOf(labelled('CheXbert labels')) + 1], labels);
 });
@@ -5337,7 +5353,7 @@ test('the drawer has the stop switch, on, with its hint; its chip reads "full bu
   assert.deepEqual([stop.getAttribute('type'), stop.getAttribute('data-setting'), stop.checked], ['checkbox', 'stop_on_repeat', true]);
   assert.equal($('stop-hint').textContent, 'Off: the published protocol, which always decodes the whole token budget.');
   assert.equal(stop.getAttribute('aria-describedby'), 'stop-hint');   // the words that say what off means are read with the switch
-  const form = $('settings-form').children;
+  const form = labelled('Stop when the report starts repeating').parentNode.children;   // its group of the drawer
   assert.equal(form[form.indexOf(labelled('Stop when the report starts repeating')) + 1], $('stop-hint'));   // the hint is right under the switch
   assert.deepEqual(chipsText(), ['beam 3', '100 tok', 'cached', 'k 4/3']);   // on is what the page does: nothing to say
   stop.checked = false;
@@ -5616,8 +5632,9 @@ test('a value that is not a whole number inside the range is not applied: the fi
     assert.equal($(`${key}-error`).hidden, false, label);
   }
   assert.deepEqual([saved(h).beam_size, saved(h).k_images, saved(h).k_reports], [3, 4, 3]);
-  assert.equal($('max_new_tokens-error').parentNode, $('settings-form'));   // under its own field, in the form
-  const form = $('settings-form').children;
+  assert.equal($('max_new_tokens-error').closest('form'), $('settings-form'));   // under its own field, in the form
+  assert.equal($('max_new_tokens-error').parentNode.localName, 'fieldset');        // in the field's own group
+  const form = $('max_new_tokens-error').parentNode.children;
   assert.equal(form[form.indexOf(labelled(BUDGET)) + 1], $('max_new_tokens-error'));
 });
 
@@ -6417,7 +6434,7 @@ const OTHER_API = 'http://127.0.0.1:8010';
 const CLIENT = 'client-p9b';              // one client id for every run, so that the requests of two runs compare byte for byte
 const FIRST_RUN = 'Set the API server in Settings, for example http://localhost:8000 (your tunnel).';
 const SERVER_REFUSED = 'Enter an origin and nothing after it: https://host[:port], or http://localhost[:port] (also 127.0.0.1 or [::1]) for this computer.';
-const settledWith = (settings = {}) => memoryStorage({ [CLIENT_KEY]: CLIENT, [SETTINGS_KEY]: JSON.stringify(settings) });
+const settledWith = (settings = {}) => liveStorage({ [CLIENT_KEY]: CLIENT, [SETTINGS_KEY]: JSON.stringify(settings) });
 const serverField = () => control('API server');
 const said = () => q($('notice'), 'p').textContent;
 
@@ -7294,7 +7311,7 @@ test('the Settings checkbox "Compare with <partner>" is there only when /v1/mode
   const box = q(row, 'input');
   assert.deepEqual([row.hidden, ownText(row), box.getAttribute('type'), box.getAttribute('data-setting'), box.checked],
                    [false, `Compare with ${C_13D}`, 'checkbox', 'compare', false]);
-  const form = $('settings-form').children;
+  const form = labelled('Model').parentNode.children;   // the Model group of the drawer
   assert.equal(form[form.indexOf(labelled('Model')) + 1], row);   // right after the model it is about
   assert.deepEqual(chipsText(), ['beam 3', '100 tok', 'cached']);
   box.focus();
@@ -7385,4 +7402,226 @@ test('another API server answers for compare itself: the switch stays stored, an
   assert.equal(Object.hasOwn(optionsFromSettings(loadSettings(h.storage), MODELS), 'compare'), false);
   await switchTo(API);         // back: the stored switch is offered and on again
   assert.deepEqual([compareRow().hidden, q(compareRow(), 'input').checked, chipsText().includes('compare')], [false, true, true]);
+});
+
+// ---- the Dr. Green redesign: a turn read and then shown in order, the welcome page, Showing results (reveal.js) -------------------------
+
+const ordered = (display = {}) => memoryStorage(Object.keys(display).length ? { [DISPLAY_KEY]: JSON.stringify(display) } : {});   // nothing stored: the default
+const stepsOf = (card) => qa(card, '.reading-steps > li').map((li) => [li.getAttribute('data-stage'), li.getAttribute('data-state')]);
+
+test('a turn is read, then shown in order: the reading card while it runs, held for the pause after it ends, then the card top to bottom', async () => {
+  const h = await ready({ options: { storage: ordered() } });   // nothing stored: the page's default, in order with a 3 s pause
+  const events = fullTurn();
+  const turn = h.app.send();
+  await flush();
+  const run = h.api.streams[0];
+  run.accept('m_a');
+  await flush();
+  let card = cardOf();
+  assert.deepEqual([card.getAttribute('data-phase'), q(card, '.card-what').textContent], ['reading', 'Reading your X-ray']);
+  const lightbox = q(card, '.lightbox');
+  assert.match(q(lightbox, 'img').getAttribute('src'), /^blob:/);   // the X-ray as it was attached
+  for (const e of events.slice(0, 9)) run.channel.push(e);   // up to the report so far
+  await flush();
+  nextFrame();
+  card = cardOf();
+  assert.equal(card.getAttribute('data-phase'), 'reading');
+  assert.equal(q(card, '.report'), null);   // the report being written is not shown: it is shown whole, in order
+  assert.equal(q(card, '.lightbox'), lightbox);   // brought up to date where it stands
+  assert.deepEqual(stepsOf(card).slice(0, 3), [['preprocess', 'done'], ['encode', 'done'], ['generate', 'running']]);   // retrieve ended skipped: off the list
+  assert.equal($('status').textContent, 'generate running');
+  for (const e of events.slice(9)) run.channel.push(e);   // to message_stop, done, in the same instant
+  run.channel.end();
+  await turn;
+  card = cardOf();
+  assert.deepEqual([card.getAttribute('data-phase'), card.getAttribute('data-status'), q(card, '.card-what').textContent], ['reading', 'done', 'Report ready']);
+  assert.deepEqual([$('send').disabled, $('stop').hidden], [false, true]);   // the pause holds the card, not the page
+  h.timers.advance(2999);
+  assert.equal(cardOf().getAttribute('data-phase'), 'reading');   // the pause runs 3 s from Send
+  h.timers.advance(1);
+  card = cardOf();
+  assert.equal(card.hasAttribute('data-phase'), false);
+  assert.deepEqual([card.getAttribute('data-reveal'), card.getAttribute('data-status')], ['run', 'done']);
+  assert.deepEqual(qa(card, '.report-section li').map((li) => li.getAttribute('class')), ['reveal-line']);
+  assert.ok(buttonOf(q(card, '.card-head'), 'Show all now'));
+  h.timers.advance(10000);
+  assert.equal(card.getAttribute('data-reveal'), 'done');   // over by itself
+  assert.equal(buttonOf(card, 'Show all now'), undefined);
+});
+
+test('Show all now ends the reveal at once and hands its focus to Copy; with no pause a turn is shown as it ends; less motion shows it whole', async () => {
+  const h = await ready({ options: { storage: ordered({ reveal: 'ordered', hold_s: 0 }) } });
+  const turn = h.app.send();
+  await flush();
+  const run = h.api.streams[0];
+  run.accept('m_a');
+  await flush();
+  for (const e of fullTurn()) run.channel.push(e);
+  run.channel.end();
+  await turn;
+  const card = cardOf();
+  assert.equal(card.getAttribute('data-reveal'), 'run');   // no pause: shown in order as it ends
+  const skip = buttonOf(q(card, '.card-head'), 'Show all now');
+  skip.focus();
+  skip.click();
+  assert.equal(card.getAttribute('data-reveal'), 'done');
+  assert.equal(q(card, '.reveal-skip'), null);
+  assert.equal(document.activeElement, buttonOf(card, 'Copy'));   // the keyboard stays in the card
+  h.timers.advance(10000);   // the reveal's own end comes to nothing now
+  assert.equal(card.getAttribute('data-reveal'), 'done');
+
+  const still = await ready({ options: { storage: ordered({ hold_s: 0 }) } });
+  still.win.reduced = true;   // the reader asked for less motion
+  const second = still.app.send();
+  await flush();
+  still.api.streams[0].accept('m_a');
+  await flush();
+  for (const e of fullTurn()) still.api.streams[0].channel.push(e);
+  still.api.streams[0].channel.end();
+  await second;
+  assert.deepEqual([cardOf().hasAttribute('data-reveal'), q(cardOf(), '.reveal-skip')], [false, null]);   // the card whole, as it is
+});
+
+test('a turn that is stopped is shown at once, never held for the pause; a live setting draws the card from the first event', async () => {
+  const h = await ready({ options: { storage: ordered() } });
+  const turn = h.app.send();
+  await flush();
+  const run = h.api.streams[0];
+  run.accept('m_a');
+  await flush();
+  resetEvents();
+  run.channel.push(startEv(), stageStartEv('preprocess', 0), stopEv('aborted'));
+  run.channel.end();
+  await turn;
+  const card = cardOf();
+  assert.deepEqual([card.hasAttribute('data-phase'), card.hasAttribute('data-reveal'), card.getAttribute('data-status')], [false, false, 'aborted']);
+  assert.equal(q(card, '.note.stopped').textContent, 'Turn stopped');
+
+  const live = await ready({ options: { storage: ordered({ reveal: 'live' }) } });
+  live.app.send();
+  await flush();
+  live.api.streams[0].accept('m_a');
+  await flush();
+  assert.deepEqual([cardOf().hasAttribute('data-phase'), q(cardOf(), '.reading-steps')], [false, null]);   // the card as it always was
+  assert.ok(q(cardOf(), 'ol.timeline'));
+});
+
+test('Showing results in the drawer: kept apart under cxrchat.display and never sent; the pause is off while results are live; Restore defaults', async () => {
+  const h = await ready({ options: { storage: ordered() } });
+  $('settings').click();
+  const reveal = control('Show results');
+  const hold = control('Pause before results');
+  assert.equal(labelled('Show results').parentNode.querySelector('legend').textContent, 'Showing results');
+  assert.deepEqual([reveal.value, hold.value, hold.disabled], ['ordered', '3', false]);
+  assert.deepEqual(texts(qa(reveal, 'option')), ['When complete, top to bottom', 'Live, as the report is written']);
+  assert.deepEqual(texts(qa(hold, 'option')), ['No pause', '1 second', '2 seconds', '3 seconds', '4 seconds', '5 seconds']);
+  assert.equal(hold.getAttribute('aria-describedby'), 'hold-hint');
+  hold.value = '1';
+  change(hold);
+  assert.deepEqual(JSON.parse(h.storage.data.get(DISPLAY_KEY)), { reveal: 'ordered', hold_s: 1 });
+  reveal.value = 'live';
+  change(reveal);
+  assert.deepEqual(JSON.parse(h.storage.data.get(DISPLAY_KEY)), { reveal: 'live', hold_s: 1 });
+  assert.equal(hold.disabled, true);   // a live turn is drawn as it comes: there is nothing to pause
+  assert.equal(h.storage.data.has(SETTINGS_KEY), false);   // not a setting of the turn
+  const sent = optionsFromSettings(loadSettings(h.storage), MODELS);
+  assert.equal(['reveal', 'hold_s'].some((k) => k in sent), false);   // and never sent: the server's Options would refuse it
+
+  typeInto(control(BEAM), '6');
+  control('Display repair').checked = false;
+  change(control('Display repair'));
+  assert.deepEqual([saved(h).beam_size, saved(h).display_repair], [6, false]);
+  buttonOf($('drawer'), 'Restore defaults').click();
+  assert.deepEqual([saved(h).beam_size, saved(h).display_repair, saved(h).stop_on_repeat], [3, true, true]);
+  assert.deepEqual([control(BEAM).value, control('Display repair').checked, reveal.value, hold.value, hold.disabled], ['3', true, 'ordered', '3', false]);
+  assert.deepEqual(JSON.parse(h.storage.data.get(DISPLAY_KEY)), { reveal: 'ordered', hold_s: 3 });
+  assert.equal($('status').textContent, 'Defaults restored. They apply from your next Send.');
+  assert.equal(q($('drawer'), '.drawer-actions').children.at(-1), $('drawer-save'));   // Save still ends the form
+});
+
+test('the page opens on Dr. Green\'s welcome page when its address names no chat: the page behind is inert; Start reading opens a new chat', async () => {
+  const models = { ...MODELS, features: { retrieval: true, labels: true } };
+  const h = harness({ welcome: true, models, sessions: [sess('s_a', 'A')], routes: doneSession('s_a', 'A', 'm_a') });
+  const started = h.app.start();
+  assert.equal($('welcome').hidden, false);   // first, before anything is asked of the server
+  await started;
+  await flush();
+  assert.equal(document.body.classList.contains('welcome-open'), true);
+  for (const node of [q(document.body, '.banner'), q(document.body, '.layout'), $('composer')]) assert.equal(node.hasAttribute('inert'), true);
+  assert.equal($('welcome').hasAttribute('inert'), false);
+  assert.deepEqual(h.win.replaced, ['#/s/s_a']);   // home opened the newest chat behind it, as home always has
+  assert.equal($('welcome-what').textContent,
+               "Give me a frontal chest X-ray and I'll draft a report, list the findings and show similar X-rays from the training library.");
+  assert.deepEqual([$('welcome-continue').hidden, $('welcome-continue').textContent], [false, 'Continue your last case']);
+  press($('welcome-start'), 'Escape');
+  assert.equal($('welcome').hidden, false);   // the page it opened on is not closed by Escape: it is the start
+  $('welcome-start').click();
+  await flush();
+  assert.equal($('welcome').hidden, true);
+  assert.equal(document.body.classList.contains('welcome-open'), false);
+  for (const node of [q(document.body, '.banner'), q(document.body, '.layout'), $('composer')]) assert.equal(node.hasAttribute('inert'), false);
+  assert.equal(h.win.location.hash, '#/new');
+  assert.equal($('conversation').children.length, 0);   // a new chat
+  assert.equal(document.activeElement, $('image-well'));   // where it starts: the X-ray
+});
+
+test('Continue goes back to the chat behind the welcome page; a server that runs no labeller and no gallery promises only the report', async () => {
+  const h = harness({ welcome: true, models: NO_STAGES, sessions: [sess('s_a', 'A')], routes: doneSession('s_a', 'A', 'm_a') });
+  await h.app.start();
+  await flush();
+  assert.equal($('welcome-what').textContent, "Give me a frontal chest X-ray and I'll draft a report.");
+  $('welcome-continue').click();
+  assert.equal($('welcome').hidden, true);
+  assert.equal(h.win.location.hash, '#/s/s_a');
+  assert.equal(cardOf().getAttribute('data-message-id'), 'm_a');
+  assert.equal(document.activeElement, $('image-well'));
+  const fresh = harness({ welcome: true });   // no chat yet: nothing to continue
+  await fresh.app.start();
+  await flush();
+  assert.equal($('welcome').hidden, false);
+  assert.equal($('welcome-continue').hidden, true);
+});
+
+test('a link to a chat, or #/new, opens the chat and not the welcome page; a page started without it never shows it; welcomeText', async () => {
+  for (const hash of ['#/new', '#/s/s_a']) {
+    const h = harness({ welcome: true, hash, sessions: [sess('s_a', 'A')], routes: doneSession('s_a', 'A', 'm_a') });
+    await h.app.start();
+    await flush();
+    assert.deepEqual([$('welcome').hidden, document.body.classList.contains('welcome-open')], [true, false], hash);
+  }
+  const plain = harness({ sessions: [sess('s_a', 'A')], routes: doneSession('s_a', 'A', 'm_a') });
+  await plain.app.start();
+  await flush();
+  assert.equal($('welcome').hidden, true);
+  const { welcomeText } = appModule;
+  assert.equal(welcomeText(null), null);   // the server has not said: the page keeps the sentence it was served with
+  assert.equal(welcomeText({ ...MODELS, features: { retrieval: false, labels: true } }), "Give me a frontal chest X-ray and I'll draft a report and list the findings.");
+  assert.equal(welcomeText({ ...MODELS, features: { retrieval: true, labels: false } }),
+               "Give me a frontal chest X-ray and I'll draft a report and show similar X-rays from the training library.");
+});
+
+test('the banner\'s Dr. Green opens the welcome page again over what was open; Back to your case and Escape close it, back to Dr. Green', async () => {
+  const h = harness({ sessions: [sess('s_a', 'A')], routes: doneSession('s_a', 'A', 'm_a') });
+  await h.app.start();
+  await flush();
+  $('settings').click();
+  assert.equal($('drawer').hidden, false);
+  $('brand').click();
+  assert.equal($('welcome').hidden, false);
+  assert.equal($('drawer').hidden, true);   // what was open behind it closes
+  assert.equal(document.activeElement, $('welcome-start'));   // the button that opened it is behind the page now
+  assert.deepEqual([$('welcome-continue').hidden, $('welcome-continue').textContent], [false, 'Back to your case']);
+  $('welcome-continue').click();
+  assert.equal($('welcome').hidden, true);
+  assert.equal(document.activeElement, $('brand'));
+  assert.equal(h.win.location.hash, '#/s/s_a');   // the same chat, untouched
+  $('brand').click();
+  const escape = press($('welcome-start'), 'Escape');
+  assert.equal($('welcome').hidden, true);
+  assert.equal(escape.defaultPrevented, true);
+  assert.equal(document.activeElement, $('brand'));
+  $('brand').click();
+  h.win.location.hash = '#/new';   // an address that names a chat (Back, a link) is that chat
+  await flush();
+  assert.equal($('welcome').hidden, true);
 });

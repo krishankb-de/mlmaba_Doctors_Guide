@@ -3,15 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CXR Report Chat</title>
+  <title>Dr. Green: chest X-ray reports</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/static/styles.css">
   <script type="module" src="/static/app.js"></script>
 </head>
 <body>
   <header class="banner"><button id="sidebar-toggle" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Sessions">☰</button>
+    <button id="brand" class="brand" type="button" aria-label="Dr. Green, welcome page"><span class="avatar" aria-hidden="true"></span>Dr. Green</button>
     <span id="test-badge" hidden>test model</span>
-    <p class="disclaimer">Research prototype — not for clinical use.</p>
+    <p class="disclaimer">Research prototype; not for clinical use.</p>
     <span id="mode-badge"></span> <span id="health" aria-live="polite"></span></header>
   <div class="layout">
     <nav id="sidebar" aria-label="Sessions">
@@ -33,5 +34,27 @@
     <input id="file" type="file" accept="image/png,image/jpeg,image/webp" hidden>
   </form>
   <div id="viewer" hidden role="dialog" aria-modal="true" aria-label="Image viewer"></div>
+  <section id="welcome" hidden aria-labelledby="welcome-title">
+    <div class="welcome-head">
+      <span class="brand"><span class="avatar" aria-hidden="true"></span>Dr. Green</span>
+      <p class="disclaimer">Research prototype; not for clinical use.</p>
+    </div>
+    <div class="welcome-stage">
+      <figure class="welcome-figure" aria-hidden="true">
+        <div class="welcome-art"></div>
+        <p class="speech">Hi, I'm Dr. Green.</p>
+      </figure>
+      <div class="welcome-copy">
+        <h1 id="welcome-title" tabindex="-1">Hi there.</h1>
+        <p class="welcome-lead">I'm Dr. Green, your virtual radiologist for chest X-rays.</p>
+        <p id="welcome-what">Give me a frontal chest X-ray and I'll draft a report.</p>
+        <div class="welcome-actions">
+          <button id="welcome-start" type="button">Start reading</button>
+          <button id="welcome-continue" type="button" hidden>Continue your last case</button>
+        </div>
+        <p class="welcome-note">Every report is a draft for a radiologist to review.</p>
+      </div>
+    </div>
+  </section>
 </body>
 </html>

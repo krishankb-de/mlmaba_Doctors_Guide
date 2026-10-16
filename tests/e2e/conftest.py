@@ -259,6 +259,10 @@ def images(tmp_path_factory) -> Dict[str, str]:
 
 # ---- the server -------------------------------------------------------------------------------------------------------------------
 
+# reveal.js: a turn is shown live, drawn as it streams, unless the storage already says otherwise (a test may store the page's own default first).
+LIVE_DISPLAY_JS = """try { if (localStorage.getItem('cxrchat.display') === null) localStorage.setItem('cxrchat.display', '{"reveal":"live","hold_s":3}'); }
+catch (e) { /* storage blocked: the page runs with its defaults */ }"""
+
 class TinyServer:
     """The tiny app in a process group of its own on a free loopback port: started, killed and started again on the same port and
     home, and stopped (SIGTERM, then SIGKILL for what is left)."""
@@ -382,9 +386,11 @@ class UI:
 
     # -- contexts, pages and the watch
     def new_context(self, viewport: Tuple[int, int] = DESKTOP, scheme: str = "light", **options: Any) -> Any:
-        """A browser context of its own (storage, downloads); options go to Playwright (has_touch=True, is_mobile=True for a phone)."""
+        """A browser context of its own (storage, downloads); options go to Playwright (has_touch=True, is_mobile=True for a phone). Its pages
+        show a turn live, as it streams (reveal.js; the ordered reveal, the page's own default, is the browser check's reveal check)."""
         context = self.browser.new_context(viewport={"width": viewport[0], "height": viewport[1]}, color_scheme=scheme,
                                            accept_downloads=True, **options)
+        context.add_init_script(LIVE_DISPLAY_JS)
         self.contexts.append(context)
         return context
 
@@ -477,11 +483,24 @@ class UI:
         return found.group(1)
 
     # -- doing
-    def open(self, page: Any = None, hash_: str = "") -> Any:
+    def open(self, page: Any = None, hash_: str = "", keep_welcome: bool = False) -> Any:
+        """The page at this address. With none it opens on the welcome page, which is closed as a user closes it (Continue where there is a
+        chat to go back to, else Start reading) unless it is kept."""
         page = page or self.page
         page.goto(self.server.url + hash_)
+        if hash_ == "" and not keep_welcome:
+            self.close_welcome(page)
         self.wait_loaded(page)
         return page
+
+    def close_welcome(self, page: Any = None) -> None:
+        page = page or self.page
+        # and the chat behind it has opened, or the page has said why it cannot (no token, no API server: the notice it shows under the page)
+        page.wait_for_function("!document.querySelector('#welcome').hidden && ((location.hash.startsWith('#/')"
+                               " && !document.querySelector('#send').disabled) || !document.querySelector('#notice').hidden)", timeout=30000)
+        page.evaluate("(document.querySelector('#welcome-continue:not([hidden])') || document.querySelector('#welcome-start')).click()")
+        page.wait_for_function("document.querySelector('#welcome').hidden && !document.querySelector('.layout').hasAttribute('inert')",
+                               timeout=30000)
 
     def reload(self, page: Any = None) -> None:
         page = page or self.page
