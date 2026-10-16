@@ -64,5 +64,3 @@ venv/bin/python scripts/chat_ui_features_check.py --no-evidence
 ## Licence
 
 All rights reserved; see `LICENSE`. Third-party notices are in `NOTICE`.
-
-Derived from [krishankb-de/hybrid_model_mamba_xlstm](https://github.com/krishankb-de/hybrid_model_mamba_xlstm), branch `chat_ui`, commit c00699b.
