@@ -307,14 +307,16 @@ WELCOME_STATE_JS = """() => {
            speech: q('.speech').textContent.trim(), start: q('#welcome-start').textContent.trim(),
            inert: ['.banner', '.layout', '#composer'].map((s) => q(s).hasAttribute('inert')) };
 }"""
-# From Send on, every state of the newest assistant card the page draws: a frame each time it changes, with when, after Send.
+# From Send on, every state of the card the next turn adds (not one already on the page): a frame each time it changes, with when, after Send.
 REVEAL_RECORD_JS = """() => {
-  window.__reveal = { sentAt: performance.now(), frames: [] };
   const conv = document.querySelector('#conversation');
+  const before = conv.querySelectorAll('article.card').length;
+  window.__reveal = { sentAt: performance.now(), frames: [] };
+  if (window.__revealObserver) window.__revealObserver.disconnect();
   const look = () => {
     const cards = conv.querySelectorAll('article.card');
+    if (cards.length <= before) return;
     const c = cards[cards.length - 1];
-    if (!c) return;
     const f = { phase: c.getAttribute('data-phase'), status: c.getAttribute('data-status'), reveal: c.getAttribute('data-reveal'),
                 report: !!c.querySelector('.report'), lightbox: !!c.querySelector('.lightbox img[src]'),
                 steps: [...c.querySelectorAll('.reading-steps > li')].map((li) => li.getAttribute('data-state')), skip: !!c.querySelector('.reveal-skip') };
@@ -323,7 +325,8 @@ REVEAL_RECORD_JS = """() => {
     const same = last && JSON.stringify(Object.assign({}, last, { t: 0 })) === JSON.stringify(Object.assign({}, f, { t: 0 }));
     if (!same) frames.push(Object.assign(f, { t: Math.round(performance.now() - window.__reveal.sentAt) }));
   };
-  new MutationObserver(look).observe(conv, { subtree: true, childList: true, attributes: true });
+  window.__revealObserver = new MutationObserver(look);
+  window.__revealObserver.observe(conv, { subtree: true, childList: true, attributes: true });
   look();
   return true;
 }"""
@@ -1810,11 +1813,19 @@ def check_reveal(ctx: Context) -> Tuple[str, Dict[str, Any]]:
     chat with the focus on the image well. With Show results in order (the page's own default, which every other check sets to live), a turn is
     the reading card from Send (its X-ray on the lightbox, the stages as they run, no report) until it has ended and the 5 s pause since Send is
     over; then the whole card is shown, top to bottom (every line of the report before the parts under it), and its reveal ends by itself, Show
-    all now gone. A second turn's Show all now, pressed from the keyboard, ends its reveal at once and hands the focus to Copy."""
+    all now gone. A second turn's Show all now, pressed from the keyboard, ends its reveal at once and hands the focus to Copy. A third turn, for
+    a reader who asked for less motion, is held for the same pause and then shown whole: no reveal and no Show all now. The motion setting is
+    the check's own for each turn (Emulation.setEmulatedMedia): a runner's own (GitHub's macOS image asks for less) must not decide which it tests."""
     b = ctx.browser
+
+    def motion(value: str) -> None:   # prefers-reduced-motion as the check needs it, the colour scheme as ctx.open set it
+        b.call("Emulation.setEmulatedMedia", features=[{"name": "prefers-color-scheme", "value": "light"},
+                                                       {"name": "prefers-reduced-motion", "value": value}])
+
     ctx.open("#/new")   # a page of the app, so that its storage can be written: the next load reads it
     b.evaluate(ORDERED_DISPLAY_JS)
     ctx.open("", keep_welcome=True)
+    motion("no-preference")
     welcome = b.evaluate("(%s)()" % WELCOME_STATE_JS)
     expect(welcome["shown"], "the page opened with no address did not open on the welcome page: {}".format(welcome))
     expect(welcome["inert"] == [True, True, True], "the page behind the welcome page is not inert: {}".format(welcome["inert"]))
@@ -1867,11 +1878,28 @@ def check_reveal(ctx: Context) -> Tuple[str, Dict[str, Any]]:
                          "return { reveal: c.getAttribute('data-reveal'), skip: !!c.querySelector('.reveal-skip'), "
                          "copy: document.activeElement === c.querySelector('[data-action=\"copy\"]') }; })()")
     expect(skipped == {"reveal": "done", "skip": False, "copy": True}, "Show all now pressed with Enter left {}".format(skipped))
+    # a third turn, for a reader who asked for less motion: the same pause, then the card whole
+    motion("reduce")
+    ctx.attach("c")
+    b.run(REVEAL_RECORD_JS, None)
+    ctx.send()
+    b.wait_for("window.__reveal.frames.some((f) => f.phase === null && f.status === 'done')", 40, "the third turn's card to be shown")
+    time.sleep(1.0)   # what a reveal would have begun by now
+    still = b.evaluate("window.__reveal.frames")
+    shown = next(f for f in still if f["phase"] is None and f["status"] == "done")
+    whole = b.evaluate("(() => { const c = [...document.querySelectorAll('#conversation article.card')].pop(); return { reveal: c.getAttribute('data-reveal'), "
+                       "skip: !!c.querySelector('.reveal-skip'), marked: c.querySelectorAll('.reveal-line, .reveal-part').length, report: !!c.querySelector('.report') }; })()")
+    expect(shown["t"] >= pause_ms - 60, "with less motion the card was shown {} ms after Send, before the {} ms pause".format(shown["t"], pause_ms))
+    expect(not any(f["reveal"] for f in still) and whole == {"reveal": None, "skip": False, "marked": 0, "report": True},
+           "with less motion the card was not shown whole: {}".format(whole))
+    motion("")   # the page's own setting again for whatever runs next
     data = {"welcome": welcome, "frames": len(frames), "reading_frames": len(reading), "held_after_done": len(held), "shown_ms": first["t"],
-            "reveal_over_ms": end["t"], "pause_ms": pause_ms, "beats": order, "show_all_now": skipped}
+            "reveal_over_ms": end["t"], "pause_ms": pause_ms, "beats": order, "show_all_now": skipped,
+            "less_motion": {"shown_ms": shown["t"], **whole}}
     return ("the page opened on the welcome page, the chat behind it inert, and Start reading opened a new chat; the turn was the reading card "
             "({} states, {} of them done and held) and was shown {} ms after Send (pause {} ms), top to bottom, its reveal over at {} ms; "
-            "Show all now ended a second reveal at once, the focus on Copy").format(len(reading), len(held), first["t"], pause_ms, end["t"]), data
+            "Show all now ended a second reveal at once, the focus on Copy; with less motion a third was shown whole at {} ms").format(
+                len(reading), len(held), first["t"], pause_ms, end["t"], shown["t"]), data
 
 CHECKS = [("stream", check_stream), ("reload", check_reload), ("sessions", check_sessions), ("exports", check_exports),
           ("stop", check_stop), ("keyboard", check_keyboard), ("narrow", check_narrow), ("a11y", check_a11y), ("error", check_error),
