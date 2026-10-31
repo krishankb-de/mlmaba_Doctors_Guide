@@ -1,3 +1,12 @@
+/* Hallmark · shape: app screen · genre: modern-minimal (inferred) · theme: brand · redesign: full
+ * paper: oklch(95.8% 0.007 234) · accent: oklch(45.9% 0.080 169) · surface: absolute (the film) · display: Atkinson Hyperlegible Next · body: Atkinson Hyperlegible Next
+ * nav: kept (banner, sessions sidebar, settings drawer) · signature: the reading card: the film on its lightbox while it is read, then the report as the card's document, its films in the mount · states: loading, empty, error, full
+ * axes: light/grotesk-sans/chromatic-green · posture: restrained · contrast: pass · v2.0.0 */
+/* Hallmark · pre-emit critique: P4 H5 E4 S4 R4 V3 · weakest: V, a redesign of one app keeps its shell; the change is in the card's hierarchy and the framed welcome */
+/* Hallmark · waive 80 · one drawn figure, Dr. Green's portrait on the welcome page only, the owner's own art in app/static/img · the persona is the brand the owner chose; the working screens carry none */
+/* Hallmark · waive 7b · --film is #000000 under every X-ray, the viewer and the thumbnails · radiographs are read against black; a tint would shift how the film reads */
+/* Hallmark · waive 24b · two nudges, .card 18px 20px and the busy composer's 6px inset · both are held by the compare-card query and the 320 px layout check */
+
 /* CXR report chat: the page shell (CHAT_UI_PLAN.md P4-A), in the Dr. Green reading-room look.
  *
  * Layout: the body is one grid, the banner over sidebar | conversation | drawer, with the composer under the
@@ -12,23 +21,19 @@
  * Hooks the scripts use: the hidden attribute (drawer, preview, stop, viewer, welcome), body.sidebar-open (the off-canvas
  * sidebar; a click on its scrim lands on the body), body.welcome-open, #image-well.dragging, ol.timeline li[data-state] and
  * li.open, .provisional, .card[data-phase="reading"] and .card[data-reveal] (the reading card and the ordered reveal, reveal.js),
- * and the .card and .chip helpers (render.js). app.js builds the rows of #session-list, #exports,
+ * and the .card, .chip and .meta-parts helpers (render.js). app.js builds the rows of #session-list, #exports,
  * #session-more, #notice, #rerun-hint (under the image well), #saved (under the chips), the contents of #drawer (a form that ends in Save)
  * and #health[data-state="down"], styled below. composer.js builds #preview's thumbnail, line and Remove (P6-A); viewer.js builds the
  * contents of #viewer (.viewer-*), and sets body.viewer-open, the inert attribute of the page behind it and --viewer-top (P6-E).
  *
  * Look (the reasons, one line each):
- *   colour   a cool backlit "lightbox" ground by day and a dim reading-room slate by night; one accent, scrub green (the colour of surgical
- *            scrubs, and Dr. Green's name), kept for Send, focus, the running stage, positive findings and similarity bars; X-rays on black.
- *   type     Atkinson Hyperlegible Next for the page: drawn so that letters that look alike (l, 1, I; 0, O) do not, which matters in
- *            numbers and drug-like terms. Literata for the report: a text face drawn for long reading on screens, so the report reads as
- *            the document and the rest as its frame. Both are served from /static/fonts/ (no request leaves the page's origin).
- *   shape    sheets 6 px, controls 8 px, the avatar a circle; no pills. Shadow only where something lies over the page (the drawer and the
- *            sidebar on a phone, the viewer), so elevation means "over".
- *   motif    film-mount corners: four small L marks around the image well, the reading lightbox and every picture of a card, as films
- *            are clipped onto a viewbox.
- *   motion   one moment per screen: the greeting bubble on the welcome page, the scan line while an X-ray is read, and the report written
- *            top to bottom when it is shown. None of it for a reader who asked for less.
+ *   colour   a cool lightbox ground by day, a reading-room slate by night; one accent, scrub green, for the primary action, links, focus, the running stage and a present finding; X-rays on black.
+ *   type     Atkinson Hyperlegible Next for the page, its look-alike letters (l, 1, I; 0, O) drawn apart; Literata for the report, the document of the card.
+ *   scale    type on one 1.125 ratio from 16 px (--text-*), space on eight steps from 2 to 64 px (--space-*); weights 400, 600 and 700.
+ *   ground   the banner, the sidebar and the conversation share the plain ground; only the sheets a reader works on (cards, composer, drawer) are lifted.
+ *   shape    sheets 6 px, controls 8 px, films 2 px, the avatar a circle; no pills. Shadow only where something lies over the page.
+ *   motif    film-mount corners: L marks round the image well, the reading lightbox, each picture of a card and Dr. Green on the welcome page.
+ *   motion   the phone's sidebar slides in and out, and one moment per screen (the greeting, the scan line, the report written in order); colours change at once; none of it for a reader who asked for less.
  */
 
 @font-face {
@@ -59,14 +64,46 @@
   --warn: #8a5300;
   --bad: #b42318;
   --on-accent: #ffffff;   /* text on an accent fill */
-  --soft: #e1e9ee;        /* hover and selected fill */
+  --soft: #e1e9ee;        /* hover and selected fill, the quiet chips and the summary's well */
   --control: #74858f;     /* border of a form control: 3:1 against --bg and --card */
+  --selection: #cfe5db;   /* selected text: a wash of scrub green under the ink */
   --shadow: 0 1px 2px rgba(24, 36, 45, 0.08), 0 10px 28px rgba(24, 36, 45, 0.14);
   --scrim: rgba(24, 36, 45, 0.45);
-  --wash: rgba(237, 242, 245, 0.9);        /* over the illustration behind the conversation: there, not in the way */
-  --wash-empty: rgba(237, 242, 245, 0.55); /* an empty chat: Dr. Green shows through */
   --film: #000000;        /* an X-ray is read on black, in both themes */
   --scan: rgba(108, 195, 160, 0.38);       /* the scan line over the lightbox */
+  /* The viewer is the film's black in both themes, so it keeps the slate's palette, which reads on black; a picture that failed says so in it too. */
+  --viewer-bg: var(--film);
+  --viewer-fg: #e4ecf1;
+  --viewer-muted: #9db0bd;
+  --viewer-line: #2c3b46;
+  --viewer-control: #6f8492;
+  --viewer-raised: #1a252e;
+  --viewer-accent: #6cc3a0;   /* scrub green on black: 10:1 against it */
+
+  --space-3xs: 2px;
+  --space-2xs: 4px;
+  --space-xs: 8px;
+  --space-sm: 12px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 40px;
+  --space-2xl: 64px;
+
+  --text-xs: 0.79rem;
+  --text-sm: 0.889rem;
+  --text-md: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.266rem;
+  --text-2xl: 1.424rem;
+  --text-3xl: 1.602rem;
+  --text-display-s: 2.027rem;
+  --text-display: 2.566rem;
+  --text-display-l: 2.887rem;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-micro: 120ms;
+  --dur-short: 220ms;
+  --dur-long: 420ms;
 
   --sidebar-w: 260px;
   --drawer-w: 320px;
@@ -76,6 +113,7 @@
   --gutter: 24px;
   --radius: 6px;          /* a sheet */
   --radius-control: 8px;  /* a control */
+  --radius-film: 2px;     /* a film, and the small marks beside text */
   --font: "Atkinson Hyperlegible Next", "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
   --serif: "Literata", "Iowan Old Style", "Sitka Text", Cambria, Georgia, serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
@@ -95,10 +133,9 @@
     --on-accent: #0f1a16;
     --soft: #22303a;
     --control: #6f8492;
+    --selection: #234a3c;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.45), 0 10px 28px rgba(0, 0, 0, 0.4);
     --scrim: rgba(0, 0, 0, 0.6);
-    --wash: rgba(18, 27, 34, 0.9);
-    --wash-empty: rgba(18, 27, 34, 0.62);
   }
 }
 
@@ -108,7 +145,14 @@
 
 [hidden] { display: none !important; }   /* an author display rule below would otherwise defeat the attribute */
 
-html { -webkit-text-size-adjust: 100%; }
+/* The page itself never scrolls (each pane does): html and body clip what runs past them, clip and not hidden, so that neither is a
+   scroller the banner would stick to. The root's clip is the viewport's, which also keeps the page still under what lies outside the
+   panes' flow (the visually hidden parts of a card). A short viewport scrolls the page down, and still never sideways (below). */
+html {
+  -webkit-text-size-adjust: 100%;
+  overflow: clip;
+  scrollbar-color: var(--control) transparent;
+}
 
 body {
   display: grid;
@@ -121,32 +165,38 @@ body {
   height: 100vh;
   height: 100dvh;
   margin: 0;
-  overflow: hidden;
+  overflow: clip;
   background: var(--bg);
   color: var(--fg);
-  font: 16px/1.55 var(--font);
+  font: var(--text-md)/1.55 var(--font);
+  font-variant-emoji: text;   /* the ⚠ before a sentence about an earlier X-ray is a glyph in the text's colour, not an emoji picture */
 }
+
+/* The welcome page and the viewer hold the page behind them still. The root's overflow is the viewport's, and it is the root's own here:
+   a body's would only reach the viewport under a root that clips nothing. Only a short viewport scrolls the page at all. */
+html:has(> body.welcome-open), html:has(> body.viewer-open) { overflow: hidden; }
 
 .layout { display: contents; }
 
 a { color: var(--accent); text-underline-offset: 2px; }
-h1, h2, h3, h4 { margin: 0 0 8px; line-height: 1.25; }
-h1 { font-size: 1.5625rem; }
-h2 { font-size: 1.25rem; }
-h3, h4 { font-size: 1rem; }
-p { margin: 0 0 8px; }
+h1, h2, h3, h4 { margin: 0 0 var(--space-xs); line-height: 1.25; text-wrap: balance; }
+h1 { font-size: var(--text-3xl); }
+h2 { font-size: var(--text-xl); }
+h3, h4 { font-size: var(--text-md); }
+p { margin: 0 0 var(--space-xs); }
 pre, code { font-family: var(--mono); font-size: 0.875em; }
 pre { margin: 0; white-space: pre-wrap; }
 img { max-width: 100%; height: auto; }
 
-table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
-th, td { padding: 4px 8px; border-top: 1px solid var(--border); text-align: left; vertical-align: top; }
+table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
+th, td { padding: var(--space-2xs) var(--space-xs); border-top: 1px solid var(--border); text-align: left; vertical-align: top; }
 th { color: var(--muted); font-weight: 600; overflow-wrap: normal; }   /* a key keeps its width; the value wraps */
 
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 ::placeholder { color: var(--muted); opacity: 1; }
+::selection { background: var(--selection); color: var(--fg); }
 
-.visually-hidden {   /* out of sight and in the accessibility tree: a chip's spoken state, the page's status line */
+.visually-hidden {   /* out of sight and in the accessibility tree: a chip's spoken state, the page's status line, a separator between meta parts */
   position: absolute;
   width: 1px;
   height: 1px;
@@ -159,30 +209,34 @@ th { color: var(--muted); font-weight: 600; overflow-wrap: normal; }   /* a key 
   border: 0;
 }
 
+/* A button is outlined and a field is filled: the two kinds of control read apart at a glance. The primary of a screen (Send, Save, Start
+   reading) is the one filled button. */
 button {
   min-height: 40px;
-  padding: 8px 14px;
+  padding: var(--space-xs) var(--space-sm);
   border: 1px solid var(--control);
   border-radius: var(--radius-control);
-  background: var(--card);
+  background: transparent;
   color: inherit;
   font: inherit;
   font-weight: 600;
   cursor: pointer;
 }
 button:hover:not(:disabled) { background: var(--soft); }
+button:active:not(:disabled) { background: var(--border); color: var(--fg); }   /* pressed: one step further from the ground than hover, in the page's ink: a muted label is under 4.5:1 on it */
 button:disabled { opacity: 0.55; cursor: not-allowed; }
-#conversation button { min-height: 32px; padding: 4px 10px; font-size: 0.875rem; }   /* Copy, Show raw: compact in a card */
+#conversation button { min-height: 32px; padding: var(--space-2xs) var(--space-sm); font-size: var(--text-sm); }   /* Copy, Show raw: compact in a card */
 
 textarea, select, input:not([type]), input[type="text"], input[type="number"], input[type="password"],
 input[type="url"], input[type="search"] {
   max-width: 100%;
-  padding: 8px 12px;
+  padding: var(--space-xs) var(--space-sm);
   border: 1px solid var(--control);
   border-radius: var(--radius-control);
   background: var(--card);
   color: inherit;
   font: inherit;
+  caret-color: var(--accent);
 }
 input[type="checkbox"], input[type="radio"] { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
 
@@ -197,11 +251,14 @@ input[type="checkbox"], input[type="radio"] { width: 18px; height: 18px; margin:
   background: var(--soft) url("img/dr-green-face.png") center / cover no-repeat;
 }
 
-/* The film-mount corners (the motif): four L marks in --mount drawn as eight thin gradients at the corners of the box. */
-.mount, #image-well, .lightbox, #conversation .picture-button {
+/* The film-mount corners (the motif): four L marks in --mount drawn as eight thin gradients at the corners of the box. The image well's are
+   drawn on a layer of its own over it, so that its words stand on the slot's plain fill and never on the marks. */
+#image-well, .lightbox, #conversation .picture-button, .welcome-figure {
   --mount: var(--control);
   --mount-len: 12px;
   --mount-w: 2px;
+}
+#image-well::before, .lightbox, #conversation .picture-button, .welcome-figure {
   background-image:
     linear-gradient(var(--mount), var(--mount)), linear-gradient(var(--mount), var(--mount)),
     linear-gradient(var(--mount), var(--mount)), linear-gradient(var(--mount), var(--mount)),
@@ -214,8 +271,24 @@ input[type="checkbox"], input[type="radio"] { width: 18px; height: 18px; margin:
   background-repeat: no-repeat;
 }
 
+/* Meta strings (a card's provenance, the score's caption, a study in the picker): each part a box of its own that flows as text does and wraps
+   between parts, so that a selection copies as one line; the separator between them is said to a screen reader and a copy only (render.js,
+   app.js), and keeps its spaces for the copy. On a card each fact is a cell with a hairline before it (the general-sibling selector: a hidden
+   separator sits between two parts); in the picker the studies are parted by space alone. */
+.meta-parts { display: block; margin: 0; }
+.meta-part { display: inline-block; max-width: 100%; overflow-wrap: anywhere; vertical-align: baseline; }
+.meta-parts > .visually-hidden { white-space: pre; }
+.provenance .meta-parts > .meta-part ~ .meta-part, .score-source.meta-parts > .meta-part ~ .meta-part,
+#conversation .provenance .meta-parts > .meta-part ~ button {   /* the link-like button below has an id's weight: this rule matches it */
+  margin-left: var(--space-xs);
+  padding-left: var(--space-xs);
+  border-left: 1px solid var(--border);
+}
+button.study.meta-parts > .meta-part:not(:last-child) { margin-right: var(--space-sm); }
+
 /* ---- banner -------------------------------------------------------------------------------------------------- */
 
+/* Quiet chrome on the ground colour: the brand, the disclaimer in the warning's colour, and the server's state at the right, small. */
 .banner {
   grid-area: banner;
   position: sticky;
@@ -224,52 +297,55 @@ input[type="checkbox"], input[type="radio"] { width: 18px; height: 18px; margin:
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px 14px;
+  gap: var(--space-2xs) var(--space-md);
   min-height: 48px;
-  padding: 4px var(--gutter);
+  padding: var(--space-2xs) var(--gutter);
   border-bottom: 1px solid var(--border);
-  background: var(--card);
-  font-size: 0.8125rem;
-  font-weight: 500;
+  background: var(--bg);
+  font-size: var(--text-xs);
+  line-height: 1.4;
 }
 .disclaimer { margin: 0; color: var(--warn); font-weight: 600; }   /* the one thing every screen says: in the warning's colour */
+.banner .note { font-size: inherit; }   /* #retention, how long a chat is kept: a note of the banner's own size */
 
 .brand {   /* Dr. Green: the face and the name; in the banner a button that opens the welcome page again */
   display: inline-flex;
   flex: none;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-xs);
   min-height: 40px;
-  padding: 2px 10px 2px 2px;
+  padding: var(--space-3xs) var(--space-xs) var(--space-3xs) var(--space-3xs);
   border: 0;
   border-radius: var(--radius-control);
   background: none;
   color: var(--fg);
-  font-size: 1rem;
+  font-size: var(--text-md);
   font-weight: 700;
   letter-spacing: -0.005em;
+  line-height: 1.25;
   white-space: nowrap;
 }
 
-#mode-badge {
-  padding: 1px 8px;
-  border: 1px solid var(--control);
+#mode-badge {   /* the server's mode, beside the disclaimer: what the page is talking to; its state is the other end of the row (#health) */
+  padding: 0 var(--space-xs);
+  border: 1px solid var(--border);
   border-radius: var(--radius);
-  font-size: 0.75rem;
+  color: var(--muted);
+  font-size: var(--text-xs);
   font-weight: 600;
 }
 /* "test model": the server's default is the tiny engine, whose text is no report (app.js, render.js TEST_NOTICE; P9-G5b). It follows the brand,
    in the toggle's row: at 320 px the disclaimer takes a row of its own with the badge or without it, and the toggle, the brand and the badge share
    the first, so the badge costs no row there. A real engine has no badge. */
 #test-badge {
-  padding: 1px 8px;
+  padding: 0 var(--space-xs);
   border: 1px solid var(--warn);
   border-radius: var(--radius);
   color: var(--warn);
-  font-size: 0.75rem;
-  font-weight: 700;
+  font-size: var(--text-xs);
+  font-weight: 600;
 }
-#health { margin-left: auto; color: var(--muted); font-weight: 400; }
+#health { margin-left: auto; color: var(--muted); font-weight: 400; }   /* the server's state, at the right: it says the mode again, so the badge is not beside it */
 #health[data-state="down"] { color: var(--warn); font-weight: 600; }   /* "server restarting…" */
 #mode-badge:empty, #health:empty { display: none; }
 
@@ -282,130 +358,136 @@ input[type="checkbox"], input[type="radio"] { width: 18px; height: 18px; margin:
   grid-area: sidebar;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-sm);
   min-height: 0;
-  padding: 14px 12px;
+  padding: var(--space-md) var(--space-xs);
   overflow-y: auto;
   overflow-wrap: anywhere;
   border-right: 1px solid var(--border);
-  background: var(--card);
+  background: var(--bg);
 }
-#new-session { width: 100%; border-color: var(--accent); color: var(--accent); }
-#session-list { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
-#session-list a { display: block; padding: 8px 10px; border-radius: var(--radius-control); color: inherit; text-decoration: none; }
+#new-session { width: 100%; border-color: var(--accent); color: var(--accent); }   /* the sidebar's one primary action */
+#exports { display: flex; flex-wrap: wrap; gap: var(--space-2xs); }   /* a quiet row of compact buttons: a file of this chat, as JSON or Markdown */
+#exports button {   /* both on one row of the sidebar where they fit, each growing into what the row leaves; else the second wraps */
+  flex: 1 1 auto;
+  min-height: 40px;
+  padding: var(--space-2xs) var(--space-xs);
+  border-color: var(--control);
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+#exports button:hover:not(:disabled), #exports button:active:not(:disabled) { color: var(--fg); }   /* the id's colour above beats the generic pressed ink */
+#session-list { display: flex; flex-direction: column; gap: var(--space-3xs); margin: 0; padding: 0; list-style: none; }
+#session-list a { display: block; padding: var(--space-xs) var(--space-sm); border-radius: var(--radius-control); color: inherit; text-decoration: none; }
 #session-list a:hover, #session-list [aria-current], #session-list .active { background: var(--soft); }
+#session-list a:active { background: var(--border); }
 #session-list [aria-current], #session-list .active { font-weight: 700; }
-#session-list li { display: flex; align-items: center; gap: 4px; }   /* the link, and a delete button beside it */
+#session-list li { display: flex; align-items: center; gap: var(--space-2xs); }   /* the link, and a delete button beside it */
 #session-list li > a { flex: 1 1 auto; min-width: 0; }
 .session-title, .session-meta { display: block; }
-.session-meta { color: var(--muted); font-size: 0.75rem; font-weight: 400; }
-.session-delete { flex: none; min-height: 32px; padding: 0 10px; border-color: transparent; background: none; color: var(--muted); }
-#exports { display: flex; flex-wrap: wrap; gap: 8px; }
-#exports button { flex: 1 1 auto; font-size: 0.875rem; }
+.session-title { font-size: var(--text-sm); }
+.session-meta { color: var(--muted); font-size: var(--text-xs); font-weight: 400; }
+.session-delete { flex: none; min-height: 32px; padding: 0 var(--space-xs); border-color: transparent; background: none; color: var(--muted); }
 #session-more { width: 100%; }
 
 /* ---- conversation: a centred column of turns ------------------------------------------------------------------ */
 
-/* Behind the conversation and the composer, one picture: the welcome page's illustration under a wash of the ground colour, there and light
-   enough that nothing reads over it. It is the body's own first grid item, laid over both rows, so that it does not stop at the composer; every
-   text of a turn lies on an opaque sheet or bubble. An empty chat lets Dr. Green show through. */
-body::before {
-  content: "";
-  grid-area: 2 / 2 / 4 / 3;
-  background:
-    linear-gradient(var(--wash), var(--wash)),
-    url("img/dr-green-wide.png") right bottom / cover no-repeat,
-    var(--bg);
-}
-body:has(#conversation:empty)::before {
-  background:
-    linear-gradient(var(--wash-empty), var(--wash-empty)),
-    url("img/dr-green-wide.png") 80% 20% / cover no-repeat,
-    var(--bg);
-}
-
+/* The conversation lies on the plain ground, as a film is read in a neutral room: every text of a turn is on its own sheet or bubble. */
 #conversation {
   grid-area: conversation;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-md);
   min-width: 0;
   min-height: 0;
-  padding: 24px var(--gutter) 16px;
+  padding: var(--space-lg) var(--gutter) var(--space-md);
   overflow-y: auto;
   overflow-wrap: anywhere;   /* a long word or URL wraps instead of widening the page */
-  scroll-padding-top: 16px;  /* a card shown top to bottom is scrolled to its head with room above it */
+  scroll-padding-top: var(--space-md);  /* a card shown top to bottom is scrolled to its head with room above it */
 }
 #conversation > * { flex: none; width: 100%; max-width: var(--column-w); margin-inline: auto; }
 
-#conversation:empty { align-items: flex-start; justify-content: center; }
-#conversation:empty::before {   /* Dr. Green's line, on a sheet of its own so that it reads over the picture */
+/* An empty chat: Dr. Green's line, one quiet statement in the middle of the pane with his face before it. The face is drawn after the line
+   (::after) and the row runs from the right, so it stands on the line's left; neither is a control, so no focus order is involved. */
+#conversation:empty { flex-direction: row-reverse; align-items: center; justify-content: center; gap: var(--space-sm); }
+#conversation:empty::before {
   content: "Attach a chest X-ray below and I'll read it.";
-  max-width: 22ch;
-  margin-left: max(0px, calc(50% - var(--column-w) / 2));
-  padding: 14px 18px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--card);
+  max-width: 24ch;
   color: var(--fg);
-  font-size: 1.25rem;
+  font-size: var(--text-xl);
   font-weight: 600;
   line-height: 1.35;
+  text-wrap: balance;
+}
+#conversation:empty::after {
+  content: "";
+  flex: none;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--soft) url("img/dr-green-face.png") center / cover no-repeat;
 }
 
+/* The card: the sheet a reader works on. Its padding is pinned: the compare card's query (858 px) counts 20 px of it a side. */
 .card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);   /* a part that is hidden takes no gap */
   padding: 18px 20px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--card);
+  color: var(--fg);
 }
 
+/* Chips by role. The base is the hairline of a setting (the turn's options); a present finding is filled; an absent finding, a report's own
+   findings, a neighbour's difference and a group's size are flat on the soft fill; an uncertain one is dashed. */
 .chip {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 1px 8px;
-  border: 1px solid var(--control);
+  gap: var(--space-2xs);
+  padding: var(--space-2xs) var(--space-xs);
+  border: 1px solid var(--border);
   border-radius: var(--radius);
-  font-size: 0.75rem;
-  line-height: 1.6;
+  font-size: var(--text-xs);
+  line-height: 1.35;
 }
 
 .provisional { color: var(--muted); font-style: italic; }   /* the best beam so far: earlier text can still change */
 
-.timeline { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; font-size: 0.8125rem; }
+/* How this was made: the stages as a row of flat items, a glyph and a label each, the state said by the glyph and the colour. */
+.timeline { display: flex; flex-wrap: wrap; gap: var(--space-2xs) var(--space-md); margin: 0; padding: 0; list-style: none; font-size: var(--text-sm); }
 .timeline > li {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 2px 6px;
-  padding: 2px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--card);
+  gap: var(--space-3xs) var(--space-xs);
+  min-height: 32px;
   color: var(--muted);
 }
 /* The state glyphs are shapes: the state is also said in words (render.js), so each has empty alt text and is left out of the accessible
    name. Of each pair of declarations the first is for engines that do not know alt text. */
 .timeline > li::before { content: "○"; content: "○" / ""; }
 #conversation .timeline > li > button {   /* the control of a stage that has a detail: it reads as the label, inside the item */
-  min-height: 24px;
-  padding: 0 2px;
+  min-height: 32px;
+  padding: 0 var(--space-3xs);
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--radius-film);
   background: none;
   color: inherit;
   font: inherit;
   text-align: left;
 }
 #conversation .timeline > li > button:hover:not(:disabled) { background: none; text-decoration: underline; text-underline-offset: 2px; }
-.timeline > li[data-state="running"] { border-color: var(--accent); color: var(--accent); }
+#conversation .timeline > li > button:active:not(:disabled) { background: var(--soft); }
+.timeline > li[data-state="running"] { color: var(--accent); }
 .timeline > li[data-state="running"]::before { content: "●"; content: "●" / ""; }
 .timeline > li[data-state="done"] { color: var(--fg); }
 .timeline > li[data-state="done"]::before { content: "✓"; content: "✓" / ""; color: var(--ok); }
-.timeline > li[data-state="skipped"] { border-style: dashed; font-style: italic; }
+.timeline > li[data-state="skipped"] { font-style: italic; }
 .timeline > li[data-state="skipped"]::before { content: "–"; content: "–" / ""; }
-.timeline > li[data-state="error"] { border-color: var(--bad); color: var(--bad); }
+.timeline > li[data-state="error"] { color: var(--bad); }
 .timeline > li[data-state="error"]::before { content: "✕"; content: "✕" / ""; }
 .timeline > li > table { display: none; flex: 1 1 100%; }
 .timeline > li.open { flex: 1 1 100%; }
@@ -413,98 +495,99 @@ body:has(#conversation:empty)::before {
 
 /* ---- cards: the parts render.js builds ---------------------------------------------------------------------------- */
 
-.card { display: flex; flex-direction: column; gap: 16px; }   /* a part that is hidden takes no gap */
-
 /* The head of a card: Dr. Green, what the card is, and (while a report is shown top to bottom) Show all now. */
-.card-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin: 0; }
+.card-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2xs) var(--space-sm); margin: 0; }
 .card-who { font-weight: 700; }
-.card-what { color: var(--muted); font-size: 0.875rem; }
+.card-what { color: var(--muted); font-size: var(--text-sm); }
 #conversation .reveal-skip { margin-left: auto; }
 
 .turn.user { display: flex; justify-content: flex-end; }
-.turn.user > .bubble {
+.turn.user > .bubble {   /* the user's turn: their film and what they asked, in a soft well that gives the card the lead */
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 8px;
+  gap: var(--space-xs);
   max-width: min(100%, 36rem);
-  padding: 10px 14px;
+  padding: var(--space-sm);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--soft);
 }
 .user-text { margin: 0; white-space: pre-wrap; }   /* the user's own line breaks */
-.options { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; padding: 0; list-style: none; color: var(--muted); }
-.thumb { display: block; width: 96px; height: 96px; object-fit: cover; border: 1px solid var(--border); border-radius: var(--radius); background: var(--film); }
+.options { display: flex; flex-wrap: wrap; gap: var(--space-2xs); margin: 0; padding: 0; list-style: none; color: var(--muted); }
+.thumb { display: block; width: 160px; height: 160px; object-fit: contain; border: 1px solid var(--border); border-radius: var(--radius-film); background: var(--film); }   /* the whole film on its black, as a card's pictures are; 120 px on a phone (below) */
 .thumb:not([src]) { background: var(--card); color: transparent; }   /* still loading: the box, not its alt text */
-.thumb[data-failed] { color: var(--muted); font-size: 0.75rem; overflow: hidden; }   /* failed: the alt text says what belongs here */
-#conversation .thumb-button { min-height: 0; padding: 0; border: 0; border-radius: var(--radius); background: none; line-height: 0; }
+.thumb[data-failed] { color: var(--viewer-fg); font-size: var(--text-xs); overflow: hidden; }   /* failed: the alt text says what belongs here, light on the black */
+#conversation .thumb-button { min-height: 0; padding: 0; border: 0; border-radius: var(--radius-film); background: none; line-height: 0; }
+#conversation .thumb-button:active:not(:disabled) { filter: brightness(0.9); }
 
-.notes { display: flex; flex-direction: column; gap: 4px; }
-.note { margin: 0; color: var(--muted); font-size: 0.8125rem; }
+.notes { display: flex; flex-direction: column; gap: var(--space-2xs); }
+.note { margin: 0; color: var(--muted); font-size: var(--text-sm); }
 .note.error { color: var(--bad); }
 .note.truncated { color: var(--warn); }
 .test-notice {   /* above the report of every card of the tiny engine: the text below it is no report (render.js renderTestNotice, P9-G5b) */
   margin: 0;
-  padding: 8px 12px;
+  padding: var(--space-xs) var(--space-sm);
   border: 1px solid var(--warn);
   border-radius: var(--radius);
   background: var(--soft);
   background: color-mix(in srgb, var(--warn) 9%, var(--card));
-  font-size: 0.875rem;
+  font-size: var(--text-sm);
   font-weight: 600;
 }
 
-/* The report: the document of the card, in the text face. */
-.report-body { font-family: var(--serif); font-size: 1.0625rem; line-height: 1.7; }
-.report-section + .report-section { margin-top: 14px; }
-.report-section h3 { margin: 0 0 4px; font-family: var(--font); font-size: 0.9375rem; font-weight: 700; }
+/* The report: the document of the card, in the text face, one step up from the page and held to a reading measure. */
+.report-body { max-width: 65ch; font-family: var(--serif); font-size: var(--text-lg); line-height: 1.65; text-wrap: pretty; }   /* pretty: no lone word on a last line */
+.report-section + .report-section { margin-top: var(--space-md); }
+.report-section h3 { margin: 0 0 var(--space-2xs); font-family: var(--font); font-size: var(--text-sm); font-weight: 700; line-height: 1.35; }
 .report-section p { margin: 0; }
-.report-raw { padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
-.report .note { margin-top: 8px; }
-.report-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.report-raw { padding: var(--space-sm); border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
+.report .note { margin-top: var(--space-xs); }
+.report-actions { display: flex; flex-wrap: wrap; gap: var(--space-xs); margin-top: var(--space-md); }
 .report-actions button[aria-pressed="true"] { border-color: var(--accent); background: var(--soft); }
+.report-actions button[aria-pressed="true"]:active:not(:disabled) { background: var(--border); }   /* a toggled-on button shows the press as well: its own fill is the hover's */
 
 /* the report card a person can read (render.js, P6-H): a plain summary on top, the sentences one to a line, the notes and the terms under them */
-.report-summary { margin-bottom: 14px; }
-.summary-box { padding: 12px 14px; border-radius: var(--radius); background: var(--soft); }
-.summary-box h3 { margin: 0 0 2px; color: var(--muted); font-size: 0.8125rem; font-weight: 700; }
+.report-summary { margin-bottom: var(--space-md); }
+.summary-box { padding: var(--space-sm) var(--space-md); border-radius: var(--radius); background: var(--soft); }   /* a well, not a sheet */
+.summary-box h3 { margin: 0 0 var(--space-3xs); color: var(--muted); font-size: var(--text-sm); font-weight: 700; }
 .summary-box p { margin: 0; }
-.summary-note { margin: 4px 0 0; color: var(--muted); font-size: 0.75rem; }
+.summary-note { margin: var(--space-2xs) 0 0; color: var(--muted); font-size: var(--text-xs); }
 .report-list { margin: 0; padding: 0; list-style: none; }
-.report-list li + li { margin-top: 2px; }
+.report-list li { text-wrap: pretty; }
+.report-list li + li { margin-top: var(--space-3xs); }
 .report-list li.earlier { color: var(--muted); }   /* a sentence about an earlier X-ray: the model never saw one, so it reads quieter */
-.flag { margin-right: 0.35em; font-size: 0.875em; }
-.removed { padding: 0 4px; border: 1px solid var(--border); border-radius: 4px; color: var(--muted); font-family: var(--font); font-size: 0.8125em; white-space: nowrap; }
+.flag { margin-right: var(--space-2xs); font-size: 0.875em; }
+.removed { padding: 0 var(--space-2xs); border: 1px solid var(--border); border-radius: var(--radius-film); color: var(--muted); font-family: var(--font); font-size: 0.8125em; white-space: nowrap; }
 .term { text-decoration: underline dotted; text-underline-offset: 3px; cursor: help; }   /* a word the Terms below explain; its title says it too */
-.term sup { display: inline-block; margin-left: 1px; color: var(--muted); font-size: 0.7em; line-height: 0; }   /* inline-block: the underline stops short of the number */
-.report-extras { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
-.report-key { margin: 0; color: var(--muted); font-size: 0.8125rem; }
-.report-terms h3 { margin: 0 0 2px; color: var(--muted); font-size: 0.8125rem; font-weight: 700; }
-.term-list { margin: 0; padding-left: 1.5rem; color: var(--muted); font-size: 0.8125rem; }
+.term sup { display: inline-block; margin-left: var(--space-3xs); color: var(--muted); font-size: 0.7em; line-height: 0; }   /* inline-block: the underline stops short of the number */
+.report-extras { display: flex; flex-direction: column; gap: var(--space-xs); margin-top: var(--space-sm); }
+.report-key { margin: 0; color: var(--muted); font-size: var(--text-sm); }
+.report-terms h3 { margin: 0 0 var(--space-3xs); color: var(--muted); font-size: var(--text-sm); font-weight: 700; }
+.term-list { margin: 0; padding-left: var(--space-lg); color: var(--muted); font-size: var(--text-sm); }
 
-.labels { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px 16px; }
-.label-chips { display: flex; flex: 1 1 18rem; flex-wrap: wrap; gap: 4px; margin: 0; padding: 0; list-style: none; }
-.chip.positive { border-color: var(--accent); background: var(--accent); color: var(--on-accent); font-weight: 700; }   /* filled */
-.chip.negative { color: var(--muted); }                                                                                /* outlined */
-.chip.unknown { border-style: dashed; color: var(--muted); }
+.labels { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--space-xs) var(--space-md); }
+.label-chips { display: flex; flex: 1 1 18rem; flex-wrap: wrap; gap: var(--space-2xs); margin: 0; padding: 0; list-style: none; }
+.chip.positive { border-color: var(--accent); background: var(--accent); color: var(--on-accent); font-weight: 700; }   /* a present finding: filled */
+.chip.negative, .chip.finding, .chip.diff, .chip.group-size { border-color: transparent; background: var(--soft); color: var(--muted); }   /* flat */
+.chip.unknown { border-style: dashed; border-color: var(--control); color: var(--muted); }   /* uncertain: dashed */
 .chip .mark { font-weight: 700; }   /* a check or a cross: the agreement is a shape, not only a colour */
 @media (forced-colors: active) { .chip.positive { border-width: 3px; } }   /* the system palette drops the fill: keep the difference */
-.score-block { display: flex; flex-direction: column; gap: 2px; }
-.score { display: flex; flex-wrap: wrap; gap: 2px 12px; margin: 0; font-size: 0.8125rem; }
-.score > div { display: flex; gap: 4px; }
+.score-block { display: flex; flex-direction: column; gap: var(--space-3xs); }
+.score { display: flex; flex-wrap: wrap; gap: var(--space-3xs) var(--space-sm); margin: 0; font-size: var(--text-sm); }
+.score > div { display: flex; gap: var(--space-2xs); }
 .score dt { color: var(--muted); }
 .score dd { margin: 0; font-variant-numeric: tabular-nums; font-weight: 700; }
-.score-source { margin: 0; color: var(--muted); font-size: 0.75rem; }
+.score-source { margin: 0; color: var(--muted); font-size: var(--text-xs); }
 
-.provenance { color: var(--muted); font-size: 0.75rem; }
+.provenance { color: var(--muted); font-size: var(--text-xs); }
 .provenance p { margin: 0; }
-.provenance .drift { margin-top: 2px; font-style: italic; }
+.provenance .drift { margin-top: var(--space-3xs); font-style: italic; }
 #conversation .provenance button, #conversation .more {   /* a button that reads as a link */
-  min-height: 24px;
-  padding: 0 2px;
+  min-height: 32px;
+  padding: 0 var(--space-3xs);
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--radius-film);
   background: none;
   color: var(--accent);
   font-size: inherit;
@@ -512,55 +595,61 @@ body:has(#conversation:empty)::before {
   text-decoration: underline;
   text-underline-offset: 2px;
 }
+#conversation .provenance button:active:not(:disabled), #conversation .more:active:not(:disabled) { background: var(--soft); }
 
-.timeline table.nested { margin: 2px 0; }
-.timeline .values { margin: 0; padding-left: 1.25rem; }
+.timeline table.nested { margin: var(--space-3xs) 0; }
+.timeline .values { margin: 0; padding-left: var(--space-lg); }
 
 /* ---- the card's sections under the report (P6-B..D): findings, the similar X-rays, the matching reports, its images, how it was made ---- */
 
-/* A section of the card after the report starts with a rule and a sentence-case title: the eye finds the parts down the sheet. */
-.card > section { padding-top: 14px; border-top: 1px solid var(--border); }
-.section-title { margin: 0 0 8px; color: var(--fg); font-size: 0.9375rem; font-weight: 700; }
-.process { display: flex; flex-direction: column; gap: 8px; }
-.process .section-title { color: var(--muted); font-size: 0.8125rem; }
-.images .image-row { display: grid; grid-template-columns: repeat(2, minmax(0, 160px)); gap: 12px; }   /* side by side, phones too */
+/* A section of the card after the report starts with a rule and a small sentence-case title: the eye finds the parts down the sheet, and
+   none of them outweighs the report above. */
+.card > section { padding-top: var(--space-md); border-top: 1px solid var(--border); }
+.section-title { margin: 0 0 var(--space-xs); color: var(--fg); font-size: var(--text-sm); font-weight: 700; line-height: 1.35; text-wrap: balance; }
+.process { display: flex; flex-direction: column; gap: var(--space-2xs); }
+.process .section-title { margin-bottom: 0; color: var(--muted); }
+/* side by side, phones too (a track is the picture plus its 4 px mount each side): the upload up to 240 px, larger than each similar
+   X-ray, and what the model saw at its own 224 px, so it is never drawn larger than its pixels */
+.images .image-row { display: grid; grid-template-columns: minmax(0, 248px) minmax(0, 232px); gap: var(--space-sm); }
 .image-tile { min-width: 0; margin: 0; }
-.image-tile figcaption { margin-top: 4px; color: var(--muted); font-size: 0.75rem; overflow-wrap: anywhere; }
+.image-tile figcaption { margin-top: var(--space-2xs); color: var(--muted); font-size: var(--text-xs); overflow-wrap: anywhere; }
 .picture {   /* an X-ray, whole, on the black it is read against: an aspect that the resize changed is plain to see */
   display: block;
   width: 100%;
   aspect-ratio: 1 / 1;
   object-fit: contain;
-  border-radius: 2px;
+  border-radius: var(--radius-film);
   background: var(--film);
 }
 .picture:not([src]) { color: transparent; }   /* still loading: the box, not its alt text */
-.picture[data-failed] { color: #e4ecf1; font-size: 0.75rem; overflow: hidden; }   /* failed: the alt text says what belongs here */
+.picture[data-failed] { color: var(--viewer-fg); font-size: var(--text-xs); overflow: hidden; }   /* failed: the alt text, light on the black */
 #conversation .picture-button {   /* each picture in its mount */
   display: block;
   width: 100%;
   min-height: 0;
-  padding: 4px;
+  padding: var(--space-2xs);
   border: 0;
-  border-radius: 2px;
+  border-radius: var(--radius-film);
   background-color: transparent;
   line-height: 0;
 }
 #conversation .picture-button:hover:not(:disabled) { --mount: var(--accent); background-color: transparent; }
-.section-note { margin: 0 0 8px; }   /* public mode: what the section leaves out, and why */
+#conversation .picture-button:active:not(:disabled) { --mount: var(--fg); background-color: transparent; }
+.section-note { margin: 0 0 var(--space-xs); }   /* public mode: what the section leaves out, and why */
 
-/* similar X-rays: a grid that takes as many columns as fit, never one narrower than a readable figure */
+/* similar X-rays: four to a row on a wide card, each picture 160 px (a track is the picture plus its 4 px mount each side): the stored
+   320 px film drawn one image pixel to one device pixel on a retina screen, and the whole grid still on one screen (features check) */
 .neighbors .neighbor-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
-  gap: 14px 12px;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 140px), 168px));   /* a card the drawer leaves narrower than one track: one, its width */
+  gap: var(--space-md) var(--space-sm);
   margin: 0;
   padding: 0;
   list-style: none;
 }
 .neighbor { min-width: 0; }
 .neighbor figure { margin: 0; }
-.neighbor figcaption { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; font-size: 0.75rem; overflow-wrap: anywhere; }
+.neighbor figcaption { display: flex; flex-direction: column; gap: var(--space-2xs); margin-top: var(--space-xs); font-size: var(--text-xs); overflow-wrap: anywhere; }
 .neighbor-score { font-variant-numeric: tabular-nums; font-weight: 700; }
 .neighbor-placeholder {   /* public mode: a neutral box where the picture would be; no gallery image is ever asked for */
   width: 100%;
@@ -569,34 +658,33 @@ body:has(#conversation:empty)::before {
   border-radius: var(--radius);
   background: var(--soft);
 }
-.sim-bar { display: block; height: 4px; overflow: hidden; border-radius: 2px; background: var(--soft); }   /* drawn, not said: the number is */
-.sim-fill { display: block; height: 100%; background: var(--accent); }
-.badge.identical { align-self: flex-start; padding: 0 6px; border: 1px solid var(--accent); border-radius: var(--radius); color: var(--accent); font-weight: 700; }
+.sim-bar { display: block; height: 4px; overflow: hidden; border-radius: var(--radius-film); background: var(--soft); }   /* drawn, not said: the number is */
+.sim-fill { display: block; height: 100%; background: var(--muted); }
+.badge.identical { align-self: flex-start; padding: 0 var(--space-xs); border: 1px solid var(--control); border-radius: var(--radius); color: var(--fg); font-weight: 700; }
 .agreement { margin: 0; }
 .agreement:not(.note) { font-weight: 700; }   /* "12/14 labels agree"; a muted note says why there is no count */
-.diff-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.diff-chips { display: flex; flex-wrap: wrap; gap: var(--space-2xs); margin: 0; padding: 0; list-style: none; }
 .chip.diff { max-width: 100%; }   /* a name that wraps onto two lines keeps a tidy box */
 
 /* matching reports and the published lines: a ranked list, each report clamped to three lines until Show all (P6-D) */
 .own-rank {   /* "Own report: rank 3 of 2,663 test reports · R@10 hit": its tooltip has the dedup-aware rank and the protocol */
   width: fit-content;
   max-width: 100%;
-  margin: 0 0 8px;
-  padding: 2px 10px;
-  border: 1px solid var(--accent);
+  margin: 0 0 var(--space-xs);
+  padding: var(--space-2xs) var(--space-sm);
   border-radius: var(--radius);
-  color: var(--accent);
-  font-size: 0.8125rem;
+  background: var(--soft);
+  color: var(--fg);
+  font-size: var(--text-sm);
   font-weight: 700;
   cursor: help;
 }
-.matches .match-list, .published .published-list { display: flex; flex-direction: column; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.matches .match-list, .published .published-list { display: flex; flex-direction: column; gap: var(--space-sm); margin: 0; padding: 0; list-style: none; }
 .match, .published-line { min-width: 0; }
-.match-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-bottom: 4px; font-size: 0.8125rem; }
+.match-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2xs) var(--space-sm); margin-bottom: var(--space-2xs); font-size: var(--text-sm); }
 .match-score { font-variant-numeric: tabular-nums; font-weight: 700; }
 .match-head .sim-bar { flex: 0 1 120px; }
-.chip.group-size { color: var(--muted); }
-.clamp-text { margin: 0; font-family: var(--serif); font-size: 0.9375rem; line-height: 1.6; overflow-wrap: anywhere; }
+.clamp-text { margin: 0; font-family: var(--serif); font-size: var(--text-md); line-height: 1.6; overflow-wrap: anywhere; text-wrap: pretty; }   /* another report: a step under the card's own */
 .clamp-text.clamped:not(.open) {   /* three lines, then an ellipsis: Show all opens the rest */
   display: -webkit-box;
   overflow: hidden;
@@ -604,22 +692,22 @@ body:has(#conversation:empty)::before {
   -webkit-line-clamp: 3;
   line-clamp: 3;
 }
-.clamp-actions { margin-top: 2px; }
+.clamp-actions { margin-top: var(--space-3xs); }
 #conversation .show-all {   /* a button that reads as a link, as "show more" in a stage's table */
-  min-height: 24px;
-  padding: 0 2px;
+  min-height: 32px;
+  padding: 0 var(--space-3xs);
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--radius-film);
   background: none;
   color: var(--accent);
-  font-size: 0.8125rem;
+  font-size: var(--text-sm);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
-.finding-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 0; padding: 0; list-style: none; }
-.chip.finding { color: var(--muted); }
-.published-head { margin: 0 0 2px; color: var(--muted); font-size: 0.8125rem; font-weight: 700; }
-.verdict { padding: 0 6px; border: 1px solid currentColor; border-radius: var(--radius); }
+#conversation .show-all:active:not(:disabled) { background: var(--soft); }
+.finding-chips { display: flex; flex-wrap: wrap; gap: var(--space-2xs); margin: var(--space-xs) 0 0; padding: 0; list-style: none; }
+.published-head { margin: 0 0 var(--space-3xs); color: var(--muted); font-size: var(--text-sm); font-weight: 700; }
+.verdict { padding: 0 var(--space-xs); border: 1px solid currentColor; border-radius: var(--radius); }
 .verdict.same { color: var(--ok); }
 .verdict.differs { color: var(--warn); }
 
@@ -627,25 +715,25 @@ body:has(#conversation:empty)::before {
 
 /* The X-ray on a lightbox, the scan line passing over it, and the stages as they really run beside it: a list that says what is done. */
 .card.reading { container: reading / inline-size; }   /* its own width decides how its picture and its list share it */
-.reading-body { display: grid; grid-template-columns: minmax(0, 168px) minmax(0, 1fr); gap: 18px; align-items: start; }
+.reading-body { display: grid; grid-template-columns: minmax(0, 168px) minmax(0, 1fr); gap: var(--space-lg); align-items: start; }
 .reading-body:not(:has(.lightbox)) { grid-template-columns: minmax(0, 1fr); }
 .lightbox {
   --mount: var(--accent);
   position: relative;
   aspect-ratio: 1 / 1;
-  padding: 5px;
+  padding: var(--space-2xs);
   overflow: hidden;
-  border-radius: 2px;
+  border-radius: var(--radius-film);
 }
-.lightbox img { display: block; width: 100%; height: 100%; object-fit: contain; border-radius: 2px; background: var(--film); }
+.lightbox img { display: block; width: 100%; height: 100%; object-fit: contain; border-radius: var(--radius-film); background: var(--film); }
 .lightbox::after {   /* the scan line, drawn over the picture: reduced motion leaves it out */
   content: "";
   position: absolute;
-  inset: 5px;
+  inset: var(--space-2xs);
   pointer-events: none;
 }
-.reading-steps { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; font-size: 0.9375rem; }
-.reading-steps > li { display: flex; align-items: baseline; gap: 10px; color: var(--muted); }
+.reading-steps { display: flex; flex-direction: column; gap: var(--space-xs); margin: 0; padding: 0; list-style: none; font-size: var(--text-md); }
+.reading-steps > li { display: flex; align-items: baseline; gap: var(--space-sm); color: var(--muted); }
 .reading-steps > li::before { content: "○"; content: "○" / ""; flex: none; width: 1em; text-align: center; }
 .reading-steps > li[data-state="running"] { color: var(--fg); font-weight: 700; }
 .reading-steps > li[data-state="running"]::before { content: "●"; content: "●" / ""; color: var(--accent); }
@@ -654,8 +742,8 @@ body:has(#conversation:empty)::before {
 .reading-steps > li[data-state="error"] { color: var(--bad); }
 .reading-steps > li[data-state="error"]::before { content: "✕"; content: "✕" / ""; }
 @container reading (max-width: 440px) {   /* a phone, or a column the sidebar and the drawer leave narrow */
-  .reading-body { grid-template-columns: minmax(0, 112px) minmax(0, 1fr); gap: 12px; }
-  .reading-steps { font-size: 0.875rem; }
+  .reading-body { grid-template-columns: minmax(0, 112px) minmax(0, 1fr); gap: var(--space-sm); }
+  .reading-steps { font-size: var(--text-sm); }
 }
 @container reading (max-width: 300px) {   /* too narrow for the two side by side: the picture over the list */
   .reading-body { grid-template-columns: minmax(0, 1fr); }
@@ -668,13 +756,13 @@ body:has(#conversation:empty)::before {
    on every card. The card is a size container: whatever makes it narrow (the window, the sidebar, the drawer), its own width decides. */
 #conversation > .card.compare-card { max-width: var(--compare-w); }
 .compare-card { container: compare-card / inline-size; }
-.compare-columns { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }   /* stacked */
+.compare-columns { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-sm); }   /* stacked */
 /* side by side from a card 900 px wide: the query measures its content box, 42 px narrower (20 px of padding and 1 px of border each side) */
 @container compare-card (min-width: 858px) {
   .compare-columns { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
-.compare-column { display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); }
-.compare-model { margin: 0; font-size: 0.875rem; font-weight: 700; overflow-wrap: anywhere; }
+.compare-column { display: flex; flex-direction: column; gap: var(--space-sm); min-width: 0; padding: var(--space-sm); border: 1px solid var(--border); border-radius: var(--radius); }
+.compare-model { margin: 0; font-size: var(--text-sm); font-weight: 700; overflow-wrap: anywhere; }
 .compare-waiting { margin: 0; }   /* column 1, until column 0 is done */
 
 /* ---- composer: the intake tray, pinned under the conversation column ------------------------------------------- */
@@ -686,13 +774,13 @@ body:has(#conversation:empty)::before {
   flex-wrap: wrap;
   justify-content: flex-end;   /* the buttons gather at the right; the rows above are full width */
   align-items: center;
-  gap: 8px;   /* a gap, not margins: a hidden Stop or an empty chips row leaves no space */
+  gap: var(--space-xs);   /* a gap, not margins: a hidden Stop or an empty chips row leaves no space */
   width: min(100% - 2 * var(--gutter), var(--column-w));
-  margin: 0 0 16px;
-  padding: 10px;
+  margin: 0 0 var(--space-md);
+  padding: var(--space-xs);
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius-control);
   background: var(--card);
   container: composer / inline-size;   /* its rows ask how wide it is (P6-A), whatever made it narrow */
 }
@@ -700,33 +788,36 @@ body:has(#conversation:empty)::before {
 #composer > button { flex: none; white-space: nowrap; }   /* never narrower than its label: the row wraps instead */
 
 #image-well {   /* a lit slot in its mount: where a film goes */
-  padding: 10px 12px;
+  position: relative;
+  padding: var(--space-sm);
   border: 0;
-  border-radius: 2px;
+  border-radius: var(--radius-film);
   background-color: var(--soft);
   color: var(--muted);
-  font-size: 0.875rem;
+  font-size: var(--text-sm);
   font-weight: 600;
   text-align: center;
   cursor: pointer;
   user-select: none;
 }
+#image-well::before { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; }   /* the mount, over the slot */
 #image-well:hover, #image-well.dragging {
   --mount: var(--accent);
   background-color: var(--soft);
   background-color: color-mix(in srgb, var(--accent) 10%, var(--card));
   color: var(--fg);
 }
+#image-well:active { background-color: color-mix(in srgb, var(--accent) 18%, var(--card)); }
 
-#preview { display: flex; align-items: center; gap: 8px; }   /* composer.js (P6-A): the thumbnail, the file's line, Remove */
-#preview img { flex: none; width: 56px; height: 56px; object-fit: cover; border: 1px solid var(--border); border-radius: var(--radius); background: var(--film); }
+#preview { display: flex; align-items: center; gap: var(--space-xs); }   /* composer.js (P6-A): the thumbnail, the file's line, Remove */
+#preview img { flex: none; width: 56px; height: 56px; object-fit: cover; border: 1px solid var(--border); border-radius: var(--radius-film); background: var(--film); }
 #preview > span {   /* the name, then what the file is: "2544×3056 px · 2.4 MB", each a line of its own */
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;
   min-width: 0;
   color: var(--muted);
-  font-size: 0.8125rem;
+  font-size: var(--text-sm);
 }
 #preview .preview-name { overflow: hidden; color: var(--fg); text-overflow: ellipsis; white-space: nowrap; }   /* a long name is cut short: the title has it whole */
 #preview .preview-size { overflow-wrap: anywhere; }   /* the pixel size and the MB wrap where the composer is narrowest, and stay readable */
@@ -740,20 +831,20 @@ body:has(#conversation:empty)::before {
   min-width: 0;
   margin: 0;
   color: var(--muted);
-  font-size: 0.8125rem;
+  font-size: var(--text-xs);
   overflow-wrap: anywhere;   /* a long file name wraps instead of widening the composer */
 }
 
-#chips { display: flex; flex-wrap: wrap; gap: 4px; color: var(--muted); font-size: 0.75rem; overflow-wrap: anywhere; }
+#chips { display: flex; flex-wrap: wrap; gap: var(--space-2xs); color: var(--muted); font-size: var(--text-xs); overflow-wrap: anywhere; }
 #chips:empty { display: none; }
-#chips > * { padding: 0 8px; border: 1px solid var(--border); border-radius: var(--radius); line-height: 1.6; }
+#chips > * { padding: 0 var(--space-xs); border: 1px solid var(--border); border-radius: var(--radius); line-height: 1.6; }   /* settings: hairline */
 
 #saved {   /* "Settings saved. They apply from your next Send.": a live region beside the chips, for the few seconds that app.js leaves it there */
   flex: 1 0 100%;
   min-width: 0;
   margin: 0;
   color: var(--ok);
-  font-size: 0.8125rem;
+  font-size: var(--text-xs);
   font-weight: 600;
   overflow-wrap: anywhere;
 }
@@ -775,68 +866,78 @@ body:has(#conversation:empty)::before {
   flex: 1 0 100%;
   display: flex;
   align-items: flex-start;
-  gap: 8px;
-  padding: 8px 12px;
+  gap: var(--space-xs);
+  padding: var(--space-xs) var(--space-sm);
   border: 1px solid var(--bad);
   border-radius: var(--radius);
   color: var(--bad);
-  font-size: 0.875rem;
+  font-size: var(--text-sm);
 }
 #notice p { flex: 1 1 auto; min-width: 0; margin: 0; }
-#notice button { flex: none; min-height: 32px; padding: 2px 10px; color: var(--fg); }
+#notice button { flex: none; min-height: 32px; padding: var(--space-3xs) var(--space-sm); color: var(--fg); }
 
 #picker {   /* the test-split picker's list (P6-D): a row of its own at the top of the composer, scrolling inside when it is long */
   flex: 1 0 100%;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-xs);
   min-width: 0;
-  padding: 8px 10px;
+  padding: var(--space-xs) var(--space-sm);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg);
 }
-.picker-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 0.875rem; font-weight: 700; }
-#picker-close { flex: none; min-height: 32px; padding: 0 10px; }
+.picker-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-xs); font-size: var(--text-sm); font-weight: 700; }
+#picker-close { flex: none; min-height: 32px; padding: 0 var(--space-sm); }
 #picker-search { width: 100%; }
-#picker-status { margin: 0; color: var(--muted); font-size: 0.8125rem; }
-#picker-list { display: flex; flex-direction: column; gap: 2px; max-height: 30vh; margin: 0; padding: 0; overflow-y: auto; list-style: none; }
-#picker-list .study { width: 100%; min-height: 36px; padding: 4px 10px; border-color: transparent; background: none; font-size: 0.875rem; font-weight: 500; text-align: left; }
+#picker-status { margin: 0; color: var(--muted); font-size: var(--text-sm); }
+#picker-list { display: flex; flex-direction: column; gap: var(--space-3xs); max-height: 30vh; margin: 0; padding: 0; overflow-y: auto; list-style: none; }
+#picker-list .study { width: 100%; min-height: 36px; padding: var(--space-2xs) var(--space-sm); border-color: transparent; background: none; font-size: var(--text-sm); font-weight: 400; text-align: left; }
 #picker-list .study:hover:not(:disabled) { background: var(--soft); }
+#picker-list .study:active:not(:disabled) { background: var(--border); }
 
 #stop { border-color: var(--bad); color: var(--bad); }
+#stop:active:not(:disabled) { color: var(--fg); }   /* the id's red beats the generic pressed ink, and red on the pressed fill is 4.4:1 by day */
 #send { border-color: var(--accent); background: var(--accent); color: var(--on-accent); font-weight: 700; }
 #send:hover:not(:disabled) { background: var(--accent); filter: brightness(1.1); }
+#send:active:not(:disabled) { background: var(--accent); filter: brightness(0.92); }
 
 /* A page 720 px tall or less, or a composer 260 px wide or less (P6-A: 801 to about 890 px with the sidebar and the drawer open): the image
    well and the re-run hint take one line each, cut short, so that Send stays in sight without the composer being scrolled. The hint's whole
    text is still what Send says it does (aria-describedby), and the well's whole text is its name. */
 @media (max-height: 720px) {
   #image-well, #rerun-hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #image-well { padding-block: 6px; }
+  #image-well { min-height: 36px; padding-block: var(--space-2xs); }   /* one line, still a 36 px target: layout check k holds Send in sight at these heights */
+}
+/* A composer 480 px wide or less with a film attached: the well and the re-run hint are one line cut short (whole in their name and description,
+   as above). Empty, the well's instruction may wrap, so that the file types it names stay readable on a phone. */
+@container composer (max-width: 480px) {
+  #composer:has(#rerun-hint:not([hidden])) #image-well,
+  #composer:has(#rerun-hint:not([hidden])) #rerun-hint,
+  #composer:has(#preview:not([hidden])) #image-well { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }
 @container composer (max-width: 260px) {
   #image-well, #rerun-hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #image-well { padding-block: 4px; }
-  #preview { gap: 6px; }   /* a smaller thumbnail and Remove leave the file's line the room its sizes need to stay readable (P6 fix 1) */
+  #image-well { padding-block: var(--space-2xs); }
+  #preview { gap: var(--space-2xs); }   /* a smaller thumbnail and Remove leave the file's line the room its sizes need to stay readable (P6 fix 1) */
   #preview img { width: 40px; height: 40px; }
   #preview > span { line-height: 1.3; }
-  #preview > button { min-width: 32px; min-height: 32px; padding: 0 8px; }   /* a 32 px target each way, whatever its label (P6 fix 2) */
-  #chips { gap: 3px; }
+  #preview > button { min-width: 32px; min-height: 32px; padding: 0 var(--space-xs); }   /* a 32 px target each way, whatever its label (P6 fix 2) */
+  #chips { gap: var(--space-3xs); }
   #chips > * { line-height: 1.4; }
   /* Settings and Send share a row, and a busy composer adds Stop ("Cancel upload") on a row of its own: the rows above give up some 25 px
      between them (P6 fix 2), so that Stop and Send stay in sight at 801 x 568 with the drawer open (layout check k, busy). */
-  #composer > button { padding-block: 7px; padding-inline: 8px; }
+  #composer > button { padding-block: var(--space-2xs); padding-inline: var(--space-xs); }
 }
-/* A busy composer on a phone (P9-G5b): Stop is shown, and Settings, Send and Stop share one row. Between 261 and 319 px (a 320 px phone: 251 to 266 px,
+/* A busy composer on a phone (P9-G5b): Stop is shown, and Settings, Send and Stop share one row. Between 261 and 319 px (a 320 px phone: 255 to 270 px,
    by whether the composer scrolls) the three do not fit at their usual padding, so Stop, whose label is the longest ("Cancel upload"), wrapped onto
    a row of its own, the composer's last, and at 320 x 568 it showed 9 px above the composer's fold (the re-review of P6 fix 2). With 6 px of padding
-   each side they fit with room to spare. Below 261 px (801 px with the drawer open) the rule above takes over, and Stop keeps the row it has always had.
-   Above 319 px the three fit as they are. Checked at 320 x 568 by layout check k (busy). That holds while the composer's rows fit the room that the
-   page leaves it at 320 x 568. One row more (the "Settings saved" row, a third row of chips) makes it scroll: its classic scrollbar
-   takes 15 px, the container is 251 px, and the three buttons, 260 px wide at that padding, no longer share a row. Stop is then on a row of its own,
-   and app.js scrolls the busy composer to its end (keepStopInView, P9-G5b fix 1), so that it is in sight there too; layout check k (busy-after-save,
-   busy-save, busy-8-chips) holds it to that. */
+   each side they fit with room to spare (6 px is off the spacing scale: layout check k at 320 x 568 holds it). Below 261 px (801 px with the
+   drawer open) the rule above takes over, and Stop keeps the row it has always had. Above 319 px the three fit as they are. Checked at 320 x 568 by
+   layout check k (busy). That holds while the composer's rows fit the room that the page leaves it at 320 x 568. One row more (the "Settings saved"
+   row, a third row of chips) makes it scroll: its classic scrollbar takes 15 px, the container is narrower, and the three buttons no longer share a
+   row. Stop is then on a row of its own, and app.js scrolls the busy composer to its end (keepStopInView, P9-G5b fix 1), so that it is in sight there
+   too; layout check k (busy-after-save, busy-save, busy-8-chips) holds it to that. */
 @container composer (min-width: 261px) and (max-width: 319px) {
   #composer:has(#stop:not([hidden])) > button { padding-inline: 6px; }
 }
@@ -854,45 +955,47 @@ body:has(#conversation:empty)::before {
   border-left: 1px solid var(--border);
   background: var(--card);
 }
-#drawer label { display: block; margin-top: 12px; font-weight: 600; }
+#drawer label { display: block; margin-top: var(--space-sm); font-weight: 600; }
 #drawer select, #drawer textarea, #drawer input:not([type="checkbox"]):not([type="radio"]) {
   display: block;
   width: 100%;
-  margin-top: 4px;
+  margin-top: var(--space-2xs);
   font-weight: 400;
 }
-.drawer-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.drawer-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-xs); }
 .drawer-head h2 { margin: 0; }
 #drawer-close { flex: none; min-width: 40px; padding: 0; }
 /* The settings in groups, each a fieldset whose legend says what it is about; a rule parts one group from the next. */
-#drawer fieldset { min-width: 0; margin: 18px 0 0; padding: 0; border: 0; }
-#drawer fieldset + fieldset { padding-top: 16px; border-top: 1px solid var(--border); }
+#drawer fieldset { min-width: 0; margin: var(--space-md) 0 0; padding: 0; border: 0; }
+#drawer fieldset + fieldset { padding-top: var(--space-md); border-top: 1px solid var(--border); }
 /* A floated legend is laid out as a heading of the group, under the rule, and not on it (where a browser draws a fieldset's legend). */
-#drawer legend { float: left; width: 100%; margin: 0; padding: 0; color: var(--accent); font-size: 1rem; font-weight: 700; }
+#drawer legend { float: left; width: 100%; margin: 0; padding: 0; color: var(--accent); font-size: var(--text-md); font-weight: 700; }
 #drawer legend + * { clear: both; }
-#drawer .check { display: flex; align-items: center; gap: 10px; }   /* a checkbox, then its words */
+#drawer .check { display: flex; align-items: center; gap: var(--space-xs); }   /* a checkbox, then its words */
 /* A setting that cannot be used (k_images on a server with no gallery, beam size under greedy, cached decode with no cache) must look it:
    dashed, muted and on the soft fill (still 4.5:1), not the field it is when it works. */
 #drawer input:disabled, #drawer select:disabled { border-style: dashed; background: var(--soft); color: var(--muted); cursor: not-allowed; opacity: 1; }   /* opacity: Chrome's own sheet dims a disabled select below 4.5:1 */
 #drawer .check:has(:disabled) { color: var(--muted); }
-#drawer .note, #drawer .hint { margin: 4px 0 0; color: var(--muted); font-size: 0.8125rem; font-weight: 400; }
-#drawer .field-error { margin: 4px 0 0; color: var(--bad); font-size: 0.8125rem; }   /* "Enter a whole number from 16 to 200.", under its field */
+#drawer .note, #drawer .hint { margin: var(--space-2xs) 0 0; color: var(--muted); font-size: var(--text-sm); font-weight: 400; }
+#drawer .field-error { margin: var(--space-2xs) 0 0; color: var(--bad); font-size: var(--text-sm); }   /* "Enter a whole number from 16 to 200.", under its field */
 #drawer input[aria-invalid="true"] { border-color: var(--bad); }
 .drawer-actions {   /* Save sticks to the bottom of the drawer, so it is in sight however far the fields above it have scrolled */
   position: sticky;
   bottom: calc(-1 * var(--drawer-pad));   /* a sticky box keeps to the content edge: out over the padding, it is flush with the drawer's bottom */
   display: flex;
-  gap: 8px;
-  margin: 16px calc(-1 * var(--drawer-pad)) 0;   /* and with both its sides */
-  padding: 12px var(--drawer-pad);
+  gap: var(--space-xs);
+  margin: 0px calc(-1 * var(--drawer-pad)) 0;   /* and with both its sides; the space above it is the scale's, next */
+  margin-top: var(--space-md);
+  padding: var(--space-sm) var(--drawer-pad);
   border-top: 1px solid var(--border);
   background: var(--card);
 }
 #drawer-save { flex: 1 1 auto; border-color: var(--accent); background: var(--accent); color: var(--on-accent); font-weight: 700; }
 #drawer-save:hover:not(:disabled) { background: var(--accent); filter: brightness(1.1); }
+#drawer-save:active:not(:disabled) { background: var(--accent); filter: brightness(0.92); }
 #drawer-defaults { flex: none; }
-#drawer h3 { margin: 20px 0 4px; }
-#drawer h4 { margin: 12px 0 4px; color: var(--muted); font-size: 0.875rem; }
+#drawer h3 { margin: var(--space-lg) 0 var(--space-2xs); }
+#drawer h4 { margin: var(--space-sm) 0 var(--space-2xs); color: var(--muted); font-size: var(--text-sm); }
 #models-section table { table-layout: fixed; }   /* a long checkpoint path wraps in its cell instead of widening the drawer */
 #models-section th { width: 42%; overflow-wrap: anywhere; }
 
@@ -906,22 +1009,26 @@ body:has(#conversation:empty)::before {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: #000000;   /* black in both themes: an X-ray is read against it */
-  color: #e4ecf1;
+  background: var(--viewer-bg);   /* black in both themes: an X-ray is read against it */
+  color: var(--viewer-fg);
 }
-body.viewer-open { overflow: hidden; }   /* where the page scrolls (a short viewport) it stays where it is under the viewer */
-#viewer :focus-visible { outline-color: #6cc3a0; }   /* scrub green on black, in both themes: 10:1 against it */
-.viewer-bar { display: flex; flex: none; align-items: flex-start; gap: 8px; padding: 6px 8px; border-bottom: 1px solid #2c3b46; }
-.viewer-tools { display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center; gap: 6px 12px; min-width: 0; }
-#viewer button { min-height: 36px; padding: 4px 10px; border-color: #6f8492; background: #1a252e; color: #e4ecf1; }
-#viewer button:hover:not(:disabled) { background: #2c3b46; }
-.viewer-check, .viewer-range { display: inline-flex; align-items: center; gap: 6px; font-size: 0.8125rem; white-space: nowrap; }
-.viewer-check input, .viewer-range input { margin: 0; accent-color: #6cc3a0; }
+/* Where the page scrolls (a short viewport) it stays where it is under the viewer: the root holds it (above). Of the pair, the first is for an
+   engine without clip, where the body's overflow still reaches the viewport; clip keeps the body from turning into a scroller that the banner
+   would stick to instead. */
+body.viewer-open { overflow: hidden; overflow: clip; }
+#viewer :focus-visible { outline-color: var(--viewer-accent); }
+.viewer-bar { display: flex; flex: none; align-items: flex-start; gap: var(--space-xs); padding: var(--space-xs); border-bottom: 1px solid var(--viewer-line); }
+.viewer-tools { display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center; gap: var(--space-xs) var(--space-sm); min-width: 0; }
+#viewer button { min-height: 36px; padding: var(--space-2xs) var(--space-sm); border-color: var(--viewer-control); background: var(--viewer-raised); color: var(--viewer-fg); }
+#viewer button:hover:not(:disabled) { background: var(--viewer-line); }
+#viewer button:active:not(:disabled) { border-color: var(--viewer-fg); background: var(--viewer-line); }
+.viewer-check, .viewer-range { display: inline-flex; align-items: center; gap: var(--space-xs); font-size: var(--text-sm); white-space: nowrap; }
+.viewer-check input, .viewer-range input { margin: 0; accent-color: var(--viewer-accent); }
 .viewer-range input { width: 112px; }
 .viewer-value { min-width: 3.25em; font-variant-numeric: tabular-nums; }   /* "300%" and "40%" take the same room */
-.viewer-panes { display: flex; flex: 1 1 auto; gap: 2px; min-height: 0; }
+.viewer-panes { display: flex; flex: 1 1 auto; gap: var(--space-3xs); min-height: 0; }
 .viewer-pane { display: flex; flex: 1 1 0; flex-direction: column; min-width: 0; min-height: 0; margin: 0; }
-.viewer-panes:not([data-linked]) .viewer-pane[data-active] .viewer-stage { box-shadow: inset 0 0 0 2px #6cc3a0; }   /* unlinked: where the buttons act */
+.viewer-panes:not([data-linked]) .viewer-pane[data-active] .viewer-stage { box-shadow: inset 0 0 0 2px var(--viewer-accent); }   /* unlinked: where the buttons act */
 .viewer-stage { position: relative; flex: 1 1 auto; min-height: 0; overflow: hidden; cursor: grab; touch-action: none; user-select: none; }
 .viewer-stage.dragging { cursor: grabbing; }
 .viewer-stage img {   /* at its natural size, drawn where viewer.js puts it (transform) and as bright as the sliders say (filter) */
@@ -932,13 +1039,13 @@ body.viewer-open { overflow: hidden; }   /* where the page scrolls (a short view
   height: auto;
   transform-origin: 0 0;
 }
-.viewer-state { position: absolute; inset: 0; display: grid; place-items: center; margin: 0; padding: 12px; color: #9db0bd; font-size: 0.875rem; text-align: center; }
+.viewer-state { position: absolute; inset: 0; display: grid; place-items: center; margin: 0; padding: var(--space-sm); color: var(--viewer-muted); font-size: var(--text-sm); text-align: center; }
 .viewer-footer {   /* "Similar X-ray #2 · 320×320 px (stored gallery size)": one line */
   flex: none;
-  padding: 4px 10px;
+  padding: var(--space-2xs) var(--space-sm);
   overflow: hidden;
-  color: #9db0bd;
-  font-size: 0.8125rem;
+  color: var(--viewer-muted);
+  font-size: var(--text-sm);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -949,10 +1056,11 @@ body.viewer-open { overflow: hidden; }   /* where the page scrolls (a short view
 
 /* ---- the welcome page: Dr. Green, over the whole page until Start reading or Continue (app.js) ------------------- */
 
-/* Its stage holds the picture and the words. Wide: the figure fills the stage's height at the picture's own aspect (1600 x 893), anchored on
-   the right; the words stand on the ground colour at the left, and a scrim of that colour fades out before Dr. Green, so they never stand on
-   the busy room. The bubble is placed in the figure's own percentages, beside his head whatever the window. Narrow or tall: the tall crop is a
-   band at the top with the bubble at its foot, the words under it. */
+/* Wide: one stage, capped and centred, the words on the left and Dr. Green on the right, framed as a film in its mount; the stage stands in
+   the middle of the room the head leaves it. The figure keeps the picture's own aspect (1600 x 893), so the bubble is placed in its own
+   percentages, beside his head whatever the window. The figure comes first in the page and is aria-hidden, a picture with no control in it: it
+   is placed on the right by its grid area and nothing that takes the focus moves. Narrow or tall: the tall crop is a framed band above the words,
+   the bubble at its foot. */
 #welcome {
   position: fixed;
   inset: 0;
@@ -963,103 +1071,101 @@ body.viewer-open { overflow: hidden; }   /* where the page scrolls (a short view
   background: var(--bg);
   color: var(--fg);
 }
-body.welcome-open { overflow: hidden; }
-.welcome-head {
+.welcome-head {   /* no height of its own: it grows with its rows (a min-height held its grid row short, and the disclaimer's second row ran over the rule) */
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px 16px;
-  min-height: 56px;
-  padding: 8px var(--gutter);
+  gap: var(--space-2xs) var(--space-md);
+  padding-block: var(--space-xs);
+  padding-inline: var(--gutter);
   border-bottom: 1px solid var(--border);
-  background: var(--card);
-  font-size: 0.8125rem;
+  background: var(--bg);
+  font-size: var(--text-xs);
+  line-height: 1.4;
 }
-.welcome-head .brand { padding-right: 0; font-size: 1.0625rem; }
+.welcome-head .brand { padding-right: 0; font-size: var(--text-lg); }
 .welcome-head .avatar { width: 36px; height: 36px; }
 
-.welcome-stage { position: relative; min-height: 520px; overflow: hidden; }
-.welcome-stage::before {   /* the ground colour under the words, fading out before Dr. Green */
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  background: linear-gradient(90deg, var(--bg) 0, var(--bg) 36%, transparent 56%);
+.welcome-stage {
+  display: grid;
+  grid-template-columns: minmax(min(27rem, 100%), 4fr) minmax(0, 9fr);   /* the words keep a column wide enough for both actions side by side; the picture takes the rest */
+  grid-template-areas: "copy figure";
+  align-items: center;
+  align-content: center;
+  gap: var(--space-2xl);
+  width: min(100% - 2 * var(--gutter), 1400px);
+  margin-inline: auto;
+  padding-block: var(--space-xl);
 }
-.welcome-figure { position: absolute; top: 0; right: 0; height: 100%; aspect-ratio: 1600 / 893; margin: 0; }
-.welcome-art {
-  position: absolute;
-  inset: 0;
-  background: url("img/dr-green-wide.png") center / cover no-repeat;
-  -webkit-mask-image: linear-gradient(to right, transparent 0, #000 22%);
-  mask-image: linear-gradient(to right, transparent 0, #000 22%);
+.welcome-figure {   /* a film in its mount: the corners on the ground, the picture inside them */
+  --mount-len: 24px;
+  position: relative;
+  grid-area: figure;
+  margin: 0;
+  padding: var(--space-xs);
 }
+.welcome-art { aspect-ratio: 1600 / 893; border-radius: var(--radius-film); background: url("img/dr-green-wide.png") center / cover no-repeat; }
 .speech {   /* "Hi, I'm Dr. Green.": what he says, to the left of his head (74% across the picture, 11% to 37% down), level with his brow and
-               above the film; the tail points at him */
+               above the film; the tail points at him. It lies over the picture, so it is lifted by its shadow alone. */
   position: absolute;
   top: 6%;
   right: 33%;
-  z-index: 3;
+  z-index: 1;
   margin: 0;
-  padding: 12px 18px;
-  border: 1px solid var(--border);
+  padding: var(--space-sm) var(--space-md);
   border-radius: 14px;
   background: var(--card);
   color: var(--fg);
-  font-size: clamp(1.125rem, 1.6vw, 1.5rem);
+  font-size: var(--text-xl);
   font-weight: 700;
+  line-height: 1.3;
   white-space: nowrap;
-  box-shadow: var(--shadow);   /* it lies over the picture */
+  box-shadow: var(--shadow);
 }
 .speech::after {
   content: "";
   position: absolute;
   top: 50%;
-  right: -9px;
-  width: 16px;
-  height: 16px;
-  border-top: 1px solid var(--border);
-  border-right: 1px solid var(--border);
+  right: -7px;
+  width: 14px;
+  height: 14px;
   background: var(--card);
   transform: translateY(-50%) rotate(45deg);
 }
 .welcome-copy {
-  position: relative;
-  z-index: 2;
+  grid-area: copy;
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  gap: 14px;
-  width: min(32rem, 40%);
-  min-height: 100%;
-  margin-left: max(var(--gutter), 6vw);
-  padding: 40px 0;
+  gap: var(--space-md);
+  min-width: 0;
 }
-.welcome-copy h1 { margin: 0; font-size: clamp(2.44rem, 5vw, 3.8rem); font-weight: 800; letter-spacing: -0.02em; line-height: 1.05; }
+.welcome-copy h1 { margin: 0; font-size: var(--text-display-l); font-weight: 700; letter-spacing: -0.02em; line-height: 1.05; }
 .welcome-copy h1, .welcome-lead, #welcome-what { text-wrap: balance; }   /* "chest X-rays" is not broken at its hyphen on a line of its own */
-.welcome-lead { margin: 0; font-size: 1.25rem; font-weight: 600; line-height: 1.4; }
-#welcome-what { margin: 0; max-width: 34ch; color: var(--muted); font-size: 1.0625rem; }
-.welcome-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
-.welcome-actions button { min-height: 48px; padding: 10px 22px; font-size: 1.0625rem; }
+.welcome-lead { margin: 0; font-size: var(--text-xl); font-weight: 600; line-height: 1.4; }
+#welcome-what { margin: 0; max-width: 40ch; color: var(--muted); font-size: var(--text-lg); }
+.welcome-actions { display: flex; flex-wrap: wrap; gap: var(--space-sm); margin-top: var(--space-xs); }
+.welcome-actions button { min-height: 48px; padding: var(--space-xs) var(--space-lg); font-size: var(--text-lg); }
 #welcome-start { border-color: var(--accent); background: var(--accent); color: var(--on-accent); }
 #welcome-start:hover:not(:disabled) { background: var(--accent); filter: brightness(1.1); }
-.welcome-note { margin: 4px 0 0; max-width: 40ch; color: var(--muted); font-size: 0.875rem; }
+#welcome-start:active:not(:disabled) { background: var(--accent); filter: brightness(0.92); }
+.welcome-note { margin: 0; max-width: 40ch; color: var(--muted); font-size: var(--text-sm); }
+@media (max-height: 720px) {   /* a short landscape window: less air above and below the stage, so that it fits without a scroll */
+  .welcome-stage { padding-block: var(--space-md); }
+}
 
 @media (max-width: 859.98px), (max-aspect-ratio: 1 / 1) {
-  .welcome-stage { display: flex; flex-direction: column; min-height: 0; overflow: visible; }
-  .welcome-stage::before { display: none; }
-  .welcome-figure { position: relative; flex: none; width: 100%; height: 46vh; height: clamp(240px, 52svh, 110vw); aspect-ratio: auto; }
-  .welcome-art {
-    background: url("img/dr-green-tall.png") 50% 34% / cover no-repeat;
-    -webkit-mask-image: linear-gradient(to bottom, #000 72%, transparent);
-    mask-image: linear-gradient(to bottom, #000 72%, transparent);
-  }
-  /* at the foot of the band, on the right, where the picture fades: clear of his face and of the film; the tail points up at him */
-  .speech { top: auto; right: var(--gutter); bottom: 34px; font-size: 1.125rem; }
-  .speech::after { top: -9px; right: 38%; transform: rotate(-45deg); }
-  .welcome-copy { flex: none; justify-content: flex-start; width: auto; min-height: 0; margin: -24px var(--gutter) 0; padding: 0 0 32px; }
-  .welcome-copy h1 { font-size: 2.44rem; }
-  .welcome-lead { font-size: 1.125rem; }
+  .welcome-stage { display: flex; flex-direction: column; align-items: stretch; gap: var(--space-lg); width: auto; margin: 0; padding: var(--space-md) var(--gutter) var(--space-xl); }
+  .welcome-figure { --mount-len: 16px; flex: none; height: 40vh; height: clamp(200px, 40svh, 100vw); margin-top: var(--space-md); }
+  .welcome-art { height: 100%; aspect-ratio: auto; background: url("img/dr-green-tall.png") 50% 34% / cover no-repeat; }
+  /* at the foot of the band, on the right: clear of his face and of the film; the tail points up at him */
+  .speech { top: auto; right: var(--space-lg); bottom: var(--space-lg); font-size: var(--text-lg); }
+  .speech::after { top: -7px; right: 38%; transform: rotate(-45deg); }
+  .welcome-copy h1 { font-size: var(--text-display-s); }
+  .welcome-lead { font-size: var(--text-lg); }
+  #welcome-what { font-size: var(--text-md); }
+}
+@media (max-width: 480px) {   /* a phone: both actions take the row's whole width, the same, so that neither reads as the lesser */
+  .welcome-actions button { flex: 1 1 100%; }
 }
 @media (prefers-color-scheme: dark) {
   .welcome-art { filter: brightness(0.82); }   /* the picture is a bright room: at night it is dimmed to sit in the slate */
@@ -1083,23 +1189,24 @@ body.welcome-open { overflow: hidden; }
     align-items: center;
     justify-content: center;
     width: 40px;
-    margin: 0 0 0 -6px;   /* no vertical margin: it would clip the top of the focus ring */
+    margin: 0 0 0 calc(-1 * var(--space-2xs));   /* no vertical margin: it would clip the top of the focus ring */
     padding: 0;
     background: transparent;
-    font-size: 1.25rem;
+    font-size: var(--text-xl);
     line-height: 1;
   }
-  .banner .brand { padding-right: 4px; }
+  #sidebar-toggle:active { background: var(--border); }
+  .banner { gap: var(--space-3xs) var(--space-xs); line-height: 1.3; }   /* tighter: the banner gives the report and the composer their room */
+  .banner .brand { padding-right: var(--space-2xs); }
   .banner .brand .avatar { width: 28px; height: 28px; }
-  body::before { grid-area: 2 / 1 / 4 / 2; }
-  #conversation:empty { justify-content: flex-end; }   /* Dr. Green's line at the foot, clear of his face */
 
   #sidebar, #drawer { z-index: 30; box-shadow: var(--shadow); }
 
-  #sidebar {   /* over the conversation and the composer, under the banner */
+  #sidebar {   /* over the conversation and the composer, under the banner: a sheet of its own */
     grid-area: 2 / 1 / -1 / 2;
     justify-self: start;
     width: min(var(--sidebar-w), 85%);
+    background: var(--card);
     transform: translateX(-100%);
     visibility: hidden;   /* off-canvas and out of the tab order until body.sidebar-open */
   }
@@ -1112,12 +1219,18 @@ body.welcome-open { overflow: hidden; }
     width: min(var(--drawer-w), 100%);
     border-bottom: 1px solid var(--border);
   }
-  .card { padding: 14px; }
+  .thumb { width: 120px; height: 120px; }   /* the turn's film, smaller where the column is narrow */
+  .card { padding: var(--space-md); }
+  .neighbors .neighbor-grid { grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); }   /* two to a row on a phone, as wide as it allows */
+}
+@media (max-width: 480px) {   /* a phone: the banner is the identity, the disclaimer, then the status lines (mode, state, how long a chat is kept) */
+  .banner .disclaimer { flex-basis: 100%; }
 }
 
 /* ---- short: the page scrolls, and nothing is pinned or capped (WCAG 1.4.10, 400% zoom) ------------------------ */
 
 @media (max-height: 480px) {
+  html { overflow-y: visible; }   /* the viewport scrolls the page down; it still clips sideways */
   body {
     grid-template-rows: auto 1fr auto;
     height: auto;
@@ -1127,13 +1240,12 @@ body.welcome-open { overflow: hidden; }
   }
   #conversation, #sidebar, #drawer { min-height: auto; overflow: visible; }
   #composer { overflow: visible; }
-  .drawer-actions { position: static; margin: 16px 0 0; padding: 0; border-top: 0; }   /* the page scrolls, and Save is at the end of the form */
+  .drawer-actions { position: static; margin: var(--space-md) 0 0; padding: 0; border-top: 0; }   /* the page scrolls, and Save is at the end of the form */
   /* The viewer stays on the screen, under the banner (viewer.js says where the banner ends), and scrolls inside itself: each picture keeps a
      height of its own, so that its pane and every control can be scrolled to however little room the page has. */
   #viewer { position: fixed; top: var(--viewer-top, 0px); right: 0; bottom: 0; left: 0; overflow-y: auto; }
   .viewer-panes, .viewer-stage { flex: none; }
   .viewer-stage { height: max(120px, 60vh); }
-  .welcome-stage { min-height: 360px; }
 }
 @media (max-height: 480px) and (max-width: 699.98px) {
   .viewer-pane { flex: none; }   /* stacked, in a viewer that scrolls: each pane is as tall as its picture and its footer */
@@ -1143,10 +1255,13 @@ body.welcome-open { overflow: hidden; }
   .viewer-stage { height: max(64px, 50cqh); }
 }
 
-/* ---- motion: one moment per screen, and none for a reader who asked for less --------------------------------------- */
+/* ---- motion: state changes, one moment per screen, and none for a reader who asked for less ---------------------------- */
 
 @media (prefers-reduced-motion: no-preference) {
-  #sidebar { transition: transform 0.2s ease, visibility 0.2s; }
+  /* The phone's sidebar slides in and slides out: its visibility turns at the start of the slide in and at the end of the slide out, so it is in
+     sight for the whole move. A page that has just started draws it closed from its first frame, so nothing slides then. Colours change at once
+     everywhere (no fades): a change of theme is then never caught half-way, with text of the one theme on the ground of the other. */
+  #sidebar { transition: transform var(--dur-short) var(--ease-out), visibility var(--dur-short); }
   .timeline > li[data-state="running"]::before, .reading-steps > li[data-state="running"]::before { animation: pulse 1.2s ease-in-out infinite; }
   @keyframes pulse { 50% { opacity: 0.35; } }
 
@@ -1161,8 +1276,9 @@ body.welcome-open { overflow: hidden; }
   }
   @keyframes scan { from { background-position: 0 -30%; } to { background-position: 0 130%; } }
 
-  /* the ordered reveal (reveal.js): each line of the report is written left to right in its turn, then each part under it comes up */
-  .card[data-reveal="run"] .reveal-line { animation: write 0.42s ease-out both; animation-delay: var(--reveal-at, 0ms); }
+  /* the ordered reveal (reveal.js): each line of the report is written left to right in its turn, then each part under it comes up; the
+     durations sit inside the settle that reveal.js leaves the last one (REVEAL_TIMING.settleMs) */
+  .card[data-reveal="run"] .reveal-line { animation: write var(--dur-long) ease-out both; animation-delay: var(--reveal-at, 0ms); }
   .card[data-reveal="run"] .reveal-part { animation: rise 0.36s ease-out both; animation-delay: var(--reveal-at, 0ms); }
   @keyframes write { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
   @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }

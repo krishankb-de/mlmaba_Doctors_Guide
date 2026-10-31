@@ -29,7 +29,7 @@ import { attachComposer } from './composer.js';
 import { applyEvent, initialView } from './state.js';
 import { openViewer as showViewer } from './viewer.js';
 import {
-  TEST_MODEL, detailTable, el, focusKey, isTestModel, optionChips, ownXraySide, refreshReadingCard, renderAssistantCard, renderReadingCard, renderUserTurn,
+  TEST_MODEL, detailTable, el, focusKey, isTestModel, metaNodes, optionChips, ownXraySide, refreshReadingCard, renderAssistantCard, renderReadingCard, renderUserTurn,
   restoreFocus, scheduleRender, settleClamps, statusText,
 } from './render.js';
 import { DEFAULT_DISPLAY, HOLD_CHOICES, finishReveal, loadDisplay, revealCard, revealPhase, sanitizeDisplay, saveDisplay } from './reveal.js';
@@ -229,6 +229,8 @@ export function pickerAvailable(models) {
 // A study of the picker's list as its button reads: "study 50000007 · PA · test row 1".
 export const studyText = (s) => [s?.study_id != null ? `study ${s.study_id}` : null, typeof s?.view === 'string' && s.view ? s.view : null,
                                  `test row ${s?.test_row}`].filter(Boolean).join(' · ');
+// studyText split at its dots, for the button's markup (metaNodes): the button's text stays studyText's, so what a study reads as is said in one place.
+const studyParts = (s) => studyText(s).split(' · ');
 
 export function retrievalNote(models, model = '') {
   if (serverHas(models, 'retrieval', model)) return null;
@@ -2230,10 +2232,10 @@ export function createApp(env) {
     const studies = (Array.isArray(body?.studies) ? body.studies : []).filter((s) => isObject(s) && Number.isInteger(s.test_row));
     const held = doc.activeElement && ui.pickList.contains(doc.activeElement);
     ui.pickList.replaceChildren(...studies.map((s) => el('li', {}, el('button', {
-      type: 'button', class: 'study', 'data-test-row': String(s.test_row),
+      type: 'button', class: 'study meta-parts', 'data-test-row': String(s.test_row),
       // a button of a list that is gone is no choice: a press that still reaches one (a script, a click on its way) does nothing
       onclick: (event) => { if (ui.pickList.contains(event.currentTarget)) chooseStudy(s.test_row); },
-    }, studyText(s)))));
+    }, ...metaNodes(studyParts(s))))));
     state.pickShown = query;
     if (held) ui.pickSearch.focus();   // the study that had the focus is gone with its list
     const more = studies.length === PICK_LIMIT ? ' (the first; type more of an id to narrow them)' : '';

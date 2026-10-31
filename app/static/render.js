@@ -60,6 +60,7 @@ export function el(tag, attrs = {}, ...children) {
 // ---- small helpers ---------------------------------------------------------------------------------------------------
 
 const NONE = '—';          // what a null or an empty value reads as
+const META_SEP = ' · ';    // between the parts of a meta line: said to a screen reader and in a copy, hidden on the page (the parts are spaced instead)
 const CLIP = 200;          // a string longer than this is clipped in a detail table until "show more"
 const MAX_DEPTH = 4;       // how deep a detail table nests before it shows the rest as JSON text
 
@@ -78,6 +79,11 @@ const reportOf = (text, cx) => (typeof cx?.of === 'string' && cx.of ? `${text} o
 const keyOf = (cx) => (typeof cx?.key === 'string' && DATA_KEY.test(cx.key) ? cx.key : null);
 const path = (...parts) => parts.map(str).filter(Boolean).join(' ');   // "retrieve report_matches 2 report"
 const squeezed = (t) => str(t).split(/\s+/).filter(Boolean).join(' ');   // a text as the dumps have it: its whitespace in single spaces
+// The children of a meta line: a span per part, a hidden separator after each part that something follows (the next part, or `after`, a control that ends it).
+export const metaNodes = (parts, after = null) => [
+  ...parts.flatMap((part, i) => [el('span', { class: 'meta-part' }, part), i < parts.length - 1 || after ? el('span', { class: 'visually-hidden' }, META_SEP) : null]),
+  after,
+];
 
 // The view with every field present: what a builder reads, so a field that is missing is the empty value.
 function whole(view) {
@@ -603,17 +609,17 @@ function scoreBlock(score, marked) {
   const source = typeof score.reference_source === 'string'
     ? (Object.hasOwn(REFERENCES, score.reference_source) ? REFERENCES[score.reference_source] : score.reference_source) : null;
   const caption = [source ? `vs ${source}` : null, 'this report only', marked ? '✓ same as the reference, ✗ different' : null]
-    .filter(Boolean).join(' · ');
+    .filter(Boolean);
   return el('div', { class: 'score-block' },
     el('dl', { class: 'score' }, ...entries.map(([name, value]) => el('div', {}, el('dt', {}, name), el('dd', {}, value)))),
-    caption ? el('p', { class: 'score-source' }, caption) : null);
+    caption.length ? el('p', { class: 'score-source meta-parts' }, ...metaNodes(caption)) : null);
 }
 
 // ---- provenance ----------------------------------------------------------------------------------------------------------
 
 // model · ckpt <first 8 of sha256> · scan <impl>/tfla <impl> · prefix_k <k> · beam <n> · <tokens> tok · <total> ms · <device>
 // A part the card does not have is left out. What ran (the generate detail) wins over what was asked (the options).
-export function provenanceText(view) {
+export function provenanceParts(view) {
   const v = whole(view);
   const card = isObject(v.provenance) ? v.provenance : {};
   const generate = isObject(v.stages.generate?.detail) ? v.stages.generate.detail : {};
@@ -628,21 +634,24 @@ export function provenanceText(view) {
     said('', generate.tokens, ' tok'),
     isNum(v.totalMs) ? `${Math.round(v.totalMs)} ms` : null,
     said('', card.device) ?? said('', generate.device),
-  ].filter(Boolean).join(' · ');
+  ].filter(Boolean);
 }
+
+// The line as one string with the dots in it: the text of the card's paragraph, as read out and copied (the card draws the parts as spans).
+export const provenanceText = (view) => provenanceParts(view).join(META_SEP);
 
 export function renderProvenance(view, ctx) {
   const v = whole(view);
   const cx = ctx ?? {};
   const card = isObject(v.provenance) ? v.provenance : {};
   const generate = isObject(v.stages.generate?.detail) ? v.stages.generate.detail : {};
-  const text = provenanceText(v);
+  const parts = provenanceParts(v);
   const drift = str(card.drift_note) || str(generate.drift_note);
   // A button, not an anchor: a link to a hash would change the page's route.
-  const link = (text || drift) && typeof cx.showModels === 'function'
+  const link = (parts.length || drift) && typeof cx.showModels === 'function'
     ? el('button', { type: 'button', 'data-action': 'models', 'aria-label': named('model details', cx), onclick: () => cx.showModels() }, 'model details') : null;
-  return el('footer', { class: 'provenance', hidden: !text && !drift },
-    text || link ? el('p', {}, text, text && link ? ' · ' : null, link) : null,
+  return el('footer', { class: 'provenance', hidden: !parts.length && !drift },
+    parts.length || link ? el('p', { class: 'meta-parts' }, ...metaNodes(parts, link)) : null,
     drift ? el('p', { class: 'drift' }, drift) : null);
 }
 
