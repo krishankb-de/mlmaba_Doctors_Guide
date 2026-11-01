@@ -33,8 +33,8 @@ venv/bin/python scripts/chat_ui_browser_check.py --no-evidence
 venv/bin/python scripts/chat_ui_features_check.py --no-evidence
 ```
 
-GitHub runs the same checks on every push, plus lint and the push guards (only `main`; each pushed commit passes the hook,
-adds no local-only file and carries the noreply identity): `.github/workflows/checks.yml`.
+GitHub runs the same checks on every push, plus lint and the push guards (any branch but `dev-history-local`; each pushed
+commit passes the hook, adds no local-only file and carries the noreply identity): `.github/workflows/checks.yml`.
 
 When you add a module or a config key, add an assertion to `tests/test_willi_parity.py`.
 
