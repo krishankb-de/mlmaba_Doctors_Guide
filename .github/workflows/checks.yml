@@ -3,7 +3,7 @@
 # Checks only. Nothing is built for anyone, deployed, published or uploaded: no Pages, no artifacts, no secrets, no cache of
 # anything but pip wheels. Every test runs on the tiny stack and synthetic data; no MIMIC-derived byte is needed or fetched (R7).
 #
-#   guards    the push itself: only main is pushed; every pushed commit passes scripts/check_no_restricted_files.sh (the
+#   guards    the push itself: any branch but dev-history-local; every pushed commit passes scripts/check_no_restricted_files.sh (the
 #             pre-commit hook), adds no local-only file and carries the noreply identity and no Co-Authored-By: Claude line;
 #             the whole tree passes the hook; the job wrappers carry @SLURM_*@ placeholders, never site values; checks.yml is
 #             the only workflow
@@ -39,9 +39,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Only main is pushed
+      - name: dev-history-local is never pushed
         run: |
-          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "::error::only main is pushed to this repository, not ${GITHUB_REF#refs/heads/}"; exit 1; }
+          [[ "$GITHUB_REF" != refs/heads/dev-history-local ]] || { echo "::error::dev-history-local stays on the laptop; remove it from GitHub now: git push origin --delete dev-history-local"; exit 1; }
 
       - name: Pushed commits and the tree (hook, local-only files, identity, placeholders, workflows)
         env:
