@@ -1,0 +1,4 @@
+# torch and torchvision for the main venv, CPU builds of the cluster's versions (2.11.0+cu128, 0.26.0+cu128).
+# Installed by scripts/vm_setup.sh from https://download.pytorch.org/whl/cpu, without dependencies (requirements-serve.txt pins them).
+torch==2.11.0+cpu
+torchvision==0.26.0+cpu

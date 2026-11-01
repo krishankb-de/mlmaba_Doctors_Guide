@@ -8045,18 +8045,23 @@ def test_tunnel_sh_reads_chat_sessions_endpoint_once_over_ssh_in_batch_mode_and_
     read = code[_only_line(code, "chat_sessions/endpoint")]
     # P7-C fix 1, item 6: the read's stdin is /dev/null, or a tunnel started in the background of a terminal is stopped by SIGTTIN
     assert read == 'EP=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "${LOGIN}" cat chat_sessions/endpoint 2>/dev/null </dev/null)', read
-    # every ssh call is that read or one of the two forwards; `squeue` is only ever text for the person at the laptop
+    # every ssh call is that read or one of the three forwards (jump, host, login); `squeue` is only ever text for the person at the laptop
     ssh_calls = [l for l in code if re.search(r"(^|[\s(])ssh -", l)]
-    assert len(ssh_calls) == 3 and sum(" -N " in l for l in ssh_calls) == 2, ssh_calls
-    assert all(l.startswith('log "') for l in code if "squeue" in l)
+    assert len(ssh_calls) == 4 and sum(" -N " in l for l in ssh_calls) == 3, ssh_calls
+    # the hint holds it in a string (`local what="..."`, which VIA=host swaps for the vm_remote.sh hint) before it is logged
+    assert all(l.startswith(('log "', 'local what="')) for l in code if "squeue" in l)
     assert "BatchMode" not in "\n".join(l for l in code if l not in (read,)), "BatchMode is the read's: the forwards may prompt"
 
 
 def test_tunnel_sh_supports_both_paths_and_the_host_key_relaxation_is_on_the_jump_path_only():
     code = "\n".join(_tunnel_code())
-    match = re.search(r'if \[ "\$\{VIA\}" = "jump" \]; then\n(.*?)\nelse\n(.*?)\nfi\n', code, re.S)
-    assert match, "the forward is `if VIA = jump ... else ... fi`"
-    jump, login = match.group(1), match.group(2)
+    match = re.search(r'if \[ "\$\{VIA\}" = "jump" \]; then\n(.*?)\nelif \[ "\$\{VIA\}" = "host" \]; then\n(.*?)\nelse\n(.*?)\nfi\n', code, re.S)
+    assert match, "the forward is `if VIA = jump ... elif VIA = host ... else ... fi`"
+    jump, host, login = match.group(1), match.group(2), match.group(3)
+    # VIA=host: the server is on the ssh host itself, so the forward is to its own loopback, straight to LOGIN
+    assert host.endswith('-L "${LOCAL_PORT}:127.0.0.1:${PORT}" "${LOGIN}" &'), host
+    for relaxed in ("-J", "StrictHostKeyChecking", "accept-new", "known_hosts", "CLUSTER_USER", "${NODE}"):
+        assert relaxed not in host, relaxed
     assert '-J "${LOGIN}"' in jump and '-L "${LOCAL_PORT}:127.0.0.1:${PORT}"' in jump and '"${CLUSTER_USER}@${NODE}"' in jump
     assert "-o StrictHostKeyChecking=accept-new" in jump
     assert '-o "UserKnownHostsFile=\\"${NODES_KNOWN_HOSTS}\\""' in jump, "the path in double quotes for ssh: a HOME with a space is one file"
@@ -8064,7 +8069,7 @@ def test_tunnel_sh_supports_both_paths_and_the_host_key_relaxation_is_on_the_jum
     for relaxed in ("-J", "StrictHostKeyChecking", "accept-new", "known_hosts", "127.0.0.1", "CLUSTER_USER"):
         assert relaxed not in login, relaxed
     assert code.count("accept-new") == 1 and code.count("UserKnownHostsFile") == 1, "nowhere but on the jump path"
-    for branch in (jump, login):
+    for branch in (jump, host, login):
         # a background job (the loop that watches it needs its pid), not a command the script waits for
         assert branch.startswith("ssh -N ") and branch.endswith("&"), branch
         for option in ("ExitOnForwardFailure=yes", "ServerAliveInterval=30", "ServerAliveCountMax=3", "ConnectTimeout=10", "GatewayPorts=no"):
@@ -10593,3 +10598,67 @@ def test_dr_green_how_a_turn_is_shown_is_a_setting_of_the_page_and_never_reaches
     assert not {"reveal", "hold_s", "display"} & set(Options.model_fields)
     assert Options.model_config.get("extra") == "forbid"
     assert "welcome: true }" in app_js[app_js.index("export function browserEnv"):]
+
+
+# ---- the VM way to run the same server (always on, private, loopback) -------------------------------------------------------------------
+
+def _vm_text(*parts: str) -> str:
+    return REPO_ROOT.joinpath(*parts).read_text()
+
+
+def test_vm_files_exist():
+    for rel in ("scripts/vm_remote.sh", "scripts/vm_setup.sh", "scripts/chat_vm.env.example", "scripts/vm/cxr-chat.service.in"):
+        assert (REPO_ROOT / rel).is_file(), rel
+
+
+def test_vm_env_example_has_exactly_the_three_keys_and_the_real_env_is_git_ignored():
+    keys = [line.split("=", 1)[0] for line in _vm_text("scripts", "chat_vm.env.example").splitlines()
+            if re.match(r"^[A-Z_]+=", line)]
+    assert sorted(keys) == ["VM_HOST", "VM_REPO", "VM_SERVICE"], keys
+    if not (REPO_ROOT / ".git").exists():   # a synced copy has no .git
+        return
+    import subprocess
+    ignored = subprocess.run(["git", "check-ignore", "-q", "scripts/chat_vm.env"], cwd=str(REPO_ROOT))
+    assert ignored.returncode == 0, "scripts/chat_vm.env must be git-ignored"
+
+
+def test_tunnel_sh_accepts_via_host():
+    text = _tunnel_text()
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    found = re.search(r'case "\$\{VIA\}" in ([^)]*)\) ;; \*\)', code)
+    assert found and found.group(1).split("|") == ["jump", "login", "host"], "VIA validation must accept exactly jump|login|host"
+    branch = code[code.index('elif [ "${VIA}" = "host" ]'):]
+    branch = branch[:branch.index("else")]
+    assert branch.rstrip().endswith('-L "${LOCAL_PORT}:127.0.0.1:${PORT}" "${LOGIN}" &'), "host mode forwards to the VM's own loopback"
+    # in host mode LOGIN defaults from VM_HOST, never from the cluster's host: VIA is resolved first, then one if/else picks the file
+    login = re.search(r'\nif \[ "\$\{VIA\}" = "host" \]; then\n\s*(LOGIN=.*)\nelse\n\s*(LOGIN=.*)\nfi\n', code)
+    assert login, "LOGIN's default is chosen by `if VIA = host ... else ... fi`"
+    assert login.group(1) == 'LOGIN="${LOGIN:-$(vm_setting VM_HOST)}"', login.group(1)
+    assert login.group(2) == 'LOGIN="${LOGIN:-$(cluster_setting CLUSTER_HOST)}"', login.group(2)
+    assert code.index('VIA="${VIA:-jump}"') < login.start(), "VIA must be known before LOGIN's default is picked"
+    assert len(re.findall(r"^\s*LOGIN=", code, re.M)) == 2, "no other assignment may change LOGIN"
+
+
+def test_vm_unit_template_is_private_loopback_and_has_no_cors():
+    unit = _vm_text("scripts", "vm", "cxr-chat.service.in")
+    assert re.search(r"MODE=private\b", unit)
+    assert re.search(r"BIND=127\.0\.0\.1\b", unit)
+    assert "SLURM_SUBMIT_DIR" in unit
+    lines = [line.strip() for line in unit.splitlines() if not line.lstrip().startswith("#")]   # a comment may say what it never sets
+    assert [line for line in lines if "CORS_ORIGINS" in line] == ['Environment="CORS_ORIGINS="']
+    for setting in ("Restart=always", "RuntimeMaxSec=1d", "MemoryHigh=@MEMORY_HIGH@", "MemoryMax=@MEMORY_MAX@"):
+        assert setting in lines, setting
+
+
+def test_vm_remote_summary_filter_is_the_same_as_chat_remote():
+    def pattern(name):
+        found = re.search(r"^SUMMARY_PATTERN='(.*)'$", _vm_text("scripts", name), re.M)
+        assert found, name
+        return found.group(1)
+    assert pattern("vm_remote.sh") == pattern("chat_remote.sh")
+
+
+def test_claude_md_and_readme_name_port_8020():
+    assert "8020" in _vm_text("CLAUDE.md")
+    readme = _vm_text("app", "README.md")
+    assert "8020" in readme and "## 10. Run it on a VM" in readme

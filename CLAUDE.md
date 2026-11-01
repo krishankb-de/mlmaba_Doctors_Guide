@@ -51,16 +51,21 @@ When you add a module or a config key, add an assertion to `tests/test_willi_par
   - never publish the GitHub Pages copy (`scripts/pages_build.py`, `scripts/pages_publish.sh`) or enable GitHub Pages;
   - never open a public link (`app/tunnel/public_demo.sh`);
   - never start a server in public mode, with a `BIND` other than `127.0.0.1`, or with `CORS_ORIGINS`;
-  - never add deploy or hosting configuration. The one workflow, `.github/workflows/checks.yml`, only runs the checks on every
+  - never add deploy or hosting configuration, except the private, loopback-only systemd unit template for your own VM (`scripts/vm/cxr-chat.service.in`); nothing that serves anyone else. The one workflow, `.github/workflows/checks.yml`, only runs the checks on every
     push (no deploy, no secrets, no uploads).
-  The server runs in private mode on its compute node's loopback, reached only through your own SSH tunnel; the laptop dev server
-  listens on 127.0.0.1.
-- **Ports:** 8000 is the laptop dev server and 8010 the tunnel to the cluster server. Tests start their own servers on free ports.
+  The server runs in private mode on its compute node's loopback or on the VM's loopback, reached only through your own SSH
+  tunnel; the laptop dev server listens on 127.0.0.1.
+- **Ports:** 8000 is the laptop dev server and 8010 the tunnel to the cluster server, 8020 the tunnel to the VM server. Tests start their own servers on free ports.
 - **Defaults reproduce the published decoding protocol** (`app/schemas.py` `Options`). Keep them, and keep `scan_impl` and `tfla_impl` pinned explicitly in every model yaml.
 - **Cluster:**
   - Changes are additive only: never delete or overwrite a cluster file or directory you did not create.
   - Write down a prediction before every job.
   - Never run two servers on one `CHAT_HOME`.
+- **VM** (always-on private server, `app/README.md` section 10):
+  - The door is `scripts/vm_remote.sh`; settings live in the git-ignored `scripts/chat_vm.env`.
+  - MIMIC data reaches the VM only from the cluster, never through the laptop.
+  - Read VM logs only through `bash scripts/vm_remote.sh summary`.
+  - Changes are additive only; never run two servers on one `CHAT_HOME`.
 
 <!-- antislop:start -->
 ## antislop

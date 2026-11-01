@@ -19,6 +19,9 @@
 #   % in HOME or in that path is refused (ssh could not read the path).
 # VIA=login: the forward goes to NODE:PORT from the login node. That works only for a server started with a BIND other than 127.0.0.1,
 #   which needs a token (R6).
+# VIA=host: the server runs on LOGIN itself (a VM that is the ssh host), bound to its 127.0.0.1. The forward goes to 127.0.0.1:PORT on LOGIN.
+#   The endpoint's host is only logged, never a target, and CLUSTER_USER and the nodes' known_hosts file do not apply.
+#   LOGIN then defaults to VM_HOST of scripts/chat_vm.env, never to CLUSTER_HOST: the cluster's login node must not be forwarded to by mistake.
 #
 # While a forward runs, the file is read again every RECHECK_S seconds (the same read, the same checks) and compared with the host, port and
 # mode the forward was started for. A requeue puts the server on another node, or with --port 0 on another port, and an ssh forward to the
@@ -35,10 +38,11 @@
 # then a new read.
 #
 # Settings, from the environment:
-#   LOGIN          ssh host name or alias of the login node (default: CLUSTER_HOST of scripts/chat_cluster.env)
+#   LOGIN          ssh host name or alias of the login node (default: CLUSTER_HOST of scripts/chat_cluster.env; with VIA=host, VM_HOST of
+#                  scripts/chat_vm.env, read from CHAT_VM_ENV when set)
 #   LOCAL_PORT     the port on this machine (default 8000); the tunnel stops with a message when something already uses it
-#   VIA            jump (default) | login
-#   CLUSTER_USER   the user on the compute node, for VIA=jump (default: CLUSTER_USER of scripts/chat_cluster.env)
+#   VIA            jump (default) | login | host
+#   CLUSTER_USER   the user on the compute node, for VIA=jump and VIA=login (default: CLUSTER_USER of scripts/chat_cluster.env)
 #   CHAT_CLUSTER_ENV  the settings file to read those two defaults, and CLUSTER_KNOWN_HOSTS, from (default scripts/chat_cluster.env, which
 #                  git ignores; copy scripts/chat_cluster.env.example). Without LOGIN or CLUSTER_USER from either place, the script stops
 #                  with a message.
@@ -69,9 +73,20 @@ cluster_setting() {   # the value of $1 in the settings file, or nothing when th
   sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1=[\"']?([^\"'#[:space:]]*).*$/\2/p" "${CHAT_CLUSTER_ENV}" 2>/dev/null | tail -n 1
 }
 
-LOGIN="${LOGIN:-$(cluster_setting CLUSTER_HOST)}"
+# The VM settings file, read the same way (VIA=host only).
+CHAT_VM_ENV="${CHAT_VM_ENV:-$(cd "$(dirname "$0")/../.." && pwd)/scripts/chat_vm.env}"
+vm_setting() {   # the value of $1 in the VM settings file, or nothing when the file or the key is absent
+  [ -f "${CHAT_VM_ENV}" ] || return 0
+  sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1=[\"']?([^\"'#[:space:]]*).*$/\2/p" "${CHAT_VM_ENV}" 2>/dev/null | tail -n 1
+}
+
+VIA="${VIA:-jump}"                                   # jump (loopback bind, P1-B) | login | host (the server runs on LOGIN)
+if [ "${VIA}" = "host" ]; then
+  LOGIN="${LOGIN:-$(vm_setting VM_HOST)}"
+else
+  LOGIN="${LOGIN:-$(cluster_setting CLUSTER_HOST)}"
+fi
 LOCAL_PORT="${LOCAL_PORT:-8000}"
-VIA="${VIA:-jump}"                                   # jump (loopback bind, P1-B) | login
 CLUSTER_USER="${CLUSTER_USER:-$(cluster_setting CLUSTER_USER)}"
 NODES_KNOWN_HOSTS="$(cluster_setting CLUSTER_KNOWN_HOSTS)"   # the nodes' own known_hosts file (VIA=jump); ~/ is this machine's home
 case "${NODES_KNOWN_HOSTS}" in "~/"*) NODES_KNOWN_HOSTS="${HOME}/${NODES_KNOWN_HOSTS#"~/"}" ;; esac
@@ -126,12 +141,13 @@ is_port() {   # a whole number from 1 to 65535: no sign, no leading zero, nothin
   [ "${#1}" -le 5 ] && [ "$1" -le 65535 ]
 }
 
+[ -n "${LOGIN}" ] || [ "${VIA}" != "host" ] || die "LOGIN is not set: set LOGIN, or VM_HOST in scripts/chat_vm.env (copy scripts/chat_vm.env.example)"
 [ -n "${LOGIN}" ] || die "LOGIN is not set: set LOGIN, or CLUSTER_HOST in scripts/chat_cluster.env (copy scripts/chat_cluster.env.example)"
-[ -n "${CLUSTER_USER}" ] || die "CLUSTER_USER is not set: set CLUSTER_USER, or CLUSTER_USER in scripts/chat_cluster.env (copy scripts/chat_cluster.env.example)"
+[ "${VIA}" = "host" ] || [ -n "${CLUSTER_USER}" ] || die "CLUSTER_USER is not set: set CLUSTER_USER, or CLUSTER_USER in scripts/chat_cluster.env (copy scripts/chat_cluster.env.example)"
 is_port "${LOCAL_PORT}" || die "LOCAL_PORT must be a number from 1 to 65535"
-case "${VIA}" in jump|login) ;; *) die "VIA must be jump or login" ;; esac
+case "${VIA}" in jump|login|host) ;; *) die "VIA must be jump, login or host" ;; esac
 case "${LOGIN}" in ''|-*|*[!A-Za-z0-9._@-]*) die "LOGIN must be an ssh host name or alias" ;; esac
-case "${CLUSTER_USER}" in ''|-*|*[!A-Za-z0-9._-]*) die "CLUSTER_USER must be a plain user name" ;; esac
+[ "${VIA}" = "host" ] || case "${CLUSTER_USER}" in ''|-*|*[!A-Za-z0-9._-]*) die "CLUSTER_USER must be a plain user name" ;; esac
 # The nodes' known_hosts path goes to ssh in double quotes, so a HOME with a space is one file; a double quote, a backslash or a % in it cannot be quoted.
 [ "${VIA}" != "jump" ] || case "${HOME}" in *[\"\\%]*) die "HOME must not contain a double quote, a backslash or a percent sign: ssh could not read the path of the nodes' known_hosts file" ;; esac
 [ "${VIA}" != "jump" ] || case "${NODES_KNOWN_HOSTS}" in *[\"\\%]*) die "CLUSTER_KNOWN_HOSTS must not contain a double quote, a backslash or a percent sign: ssh could not read the path of the nodes' known_hosts file" ;; esac
@@ -179,10 +195,12 @@ read_endpoint() {
 
 # Nothing to forward to: the hint, with a note when the read itself failed in ssh ($1 is the status of the read).
 hint() {
+  local what="is the job running? (ssh ${LOGIN} squeue --me)"
+  [ "${VIA}" != "host" ] || what="is the service running? (bash scripts/vm_remote.sh status)"
   if [ "$1" -eq 255 ]; then
-    log "no endpoint yet; is the job running? (ssh ${LOGIN} squeue --me); ssh itself failed (exit 255): check the connection and that your key is loaded"
+    log "no endpoint yet; ${what}; ssh itself failed (exit 255): check the connection and that your key is loaded"
   else
-    log "no endpoint yet; is the job running? (ssh ${LOGIN} squeue --me)"
+    log "no endpoint yet; ${what}"
   fi
 }
 
@@ -240,6 +258,9 @@ attempt() {
     ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=10 \
         -o GatewayPorts=no -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=\"${NODES_KNOWN_HOSTS}\"" \
         -J "${LOGIN}" -L "${LOCAL_PORT}:127.0.0.1:${PORT}" "${CLUSTER_USER}@${NODE}" &
+  elif [ "${VIA}" = "host" ]; then
+    ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=10 \
+        -o GatewayPorts=no -L "${LOCAL_PORT}:127.0.0.1:${PORT}" "${LOGIN}" &
   else
     ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=10 \
         -o GatewayPorts=no -L "${LOCAL_PORT}:${NODE}:${PORT}" "${LOGIN}" &

@@ -1,0 +1,53 @@
+# The chat server as a systemd service on the VM: the SLURM wrapper scripts/serve_chat_h100.sh, unchanged, kept running.
+# `bash scripts/vm_setup.sh unit` fills in the user, the repo path, CHAT_HOME and the other settings and prints the result; a refusal
+# goes to stderr and leaves stdout empty. Install it with
+#   bash scripts/vm_setup.sh unit > ~/cxr-chat.service && sudo install -m 0644 ~/cxr-chat.service /etc/systemd/system/cxr-chat.service && sudo systemctl daemon-reload
+#   sudo systemctl enable --now cxr-chat
+# Private mode on loopback only: no token, no other BIND. Reach it through your own SSH tunnel.
+[Unit]
+Description=CXR report chat server (private, loopback only)
+After=network-online.target
+Wants=network-online.target
+# Restart=always below would loop for ever on a server that cannot start: a start that keeps failing stops after 5 tries in an hour.
+# Then `sudo systemctl reset-failed cxr-chat` before starting it again.
+StartLimitIntervalSec=3600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@REPO@
+# The wrapper's first line is `cd "${SLURM_SUBMIT_DIR}/hybrid_model_mamba_xlstm" 2>/dev/null || cd "${SLURM_SUBMIT_DIR:-.}"`
+# under `set -u`, so outside SLURM the variable must exist. It names the repo, so the fallback cd lands there.
+Environment="SLURM_SUBMIT_DIR=@REPO@"
+# The wrapper reads SLURM_CPUS_PER_TASK for OMP_NUM_THREADS, MKL_NUM_THREADS and --threads, and for nothing else.
+Environment="SLURM_CPUS_PER_TASK=@THREADS@"
+Environment="CHAT_HOME=@CHAT_HOME@"
+Environment="SCRATCH_ROOT=@SCRATCH_ROOT@"
+Environment="MODELS=@MODELS@"
+Environment="DRIFT_NOTE=@DRIFT_NOTE@"
+Environment="MODE=private"
+Environment="BIND=127.0.0.1"
+# Pinned empty against a CORS_ORIGINS that comes from the systemd manager's environment (`systemctl set-environment`, DefaultEnvironment=).
+# A drop-in is parsed after this file and could still override it, so none may be added.
+Environment="CORS_ORIGINS="
+ExecStart=/bin/bash scripts/serve_chat_h100.sh
+StandardOutput=append:@REPO@/logs/chat_server_vm.log
+StandardError=append:@REPO@/logs/chat_server_vm.log
+# mixed: SIGTERM goes to the wrapper alone. Its trap forwards it to the API and the labeller and waits, the same drain as a
+# SLURM requeue. The sweep of what is left in the cgroup (SIGKILL) follows as soon as the wrapper exits, or after TimeoutStopSec
+# when it hangs.
+KillMode=mixed
+TimeoutStopSec=90
+# The wrapper exits 0 on a SIGTERM and on a clean end, so on-failure would leave a stopped server down: always brings it back.
+Restart=always
+RestartSec=30
+# The same 24 h cycle as the cluster job (--time=24:00:00, --requeue): a daily restart, so a leak never lasts more than a day.
+RuntimeMaxSec=1d
+# Past MemoryHigh the kernel throttles the service and pushes its pages to swap; MemoryMax, the OOM kill, is the last stop.
+MemoryHigh=@MEMORY_HIGH@
+MemoryMax=@MEMORY_MAX@
+
+[Install]
+WantedBy=multi-user.target

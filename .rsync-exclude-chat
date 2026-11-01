@@ -1,4 +1,4 @@
-# rsync rules for scripts/chat_remote.sh sync. No --delete is ever used (R8).
+# rsync rules for scripts/chat_remote.sh sync and scripts/vm_remote.sh sync. No --delete is ever used (R8).
 /.git/
 /venv/
 /.venv/
@@ -15,6 +15,7 @@
 /Master Thesis/
 /.superpowers/
 /scripts/chat_cluster.env
+/scripts/chat_vm.env
 # local notes and plans, and Claude Code's personal memory file: never shipped
 /.local/
 /.staging/

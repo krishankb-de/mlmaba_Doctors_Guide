@@ -292,7 +292,7 @@ class Box:
         env = {"PATH": "{}:/usr/bin:/bin".format(self.bin), "HOME": str(self.home), "STUB_DIR": str(self.stubs),
                "REAL_PYTHON": sys.executable, "PYTHONDONTWRITEBYTECODE": "1", "LOGIN": LOGIN, "LOCAL_PORT": str(self.port),
                "RETRY_SLEEP": "0", "MAX_ATTEMPTS": "3", "CLUSTER_USER": CLUSTER_USER,
-               "CHAT_CLUSTER_ENV": str(self.root / "no-cluster-settings")}
+               "CHAT_CLUSTER_ENV": str(self.root / "no-cluster-settings"), "CHAT_VM_ENV": str(self.root / "no-vm-settings")}
         env.update(extra)
         return {k: v for k, v in env.items() if v is not None}
 
@@ -305,6 +305,8 @@ class Box:
         assert env.get("LOCAL_PORT") not in (None, "", "8000"), "a rehearsal never meets port 8000"
         settings = env.get("CHAT_CLUSTER_ENV", "")
         assert settings.startswith(str(self.root) + os.sep), "a rehearsal reads a settings file of its own box, never the real one"
+        vm_settings = env.get("CHAT_VM_ENV", "")
+        assert vm_settings.startswith(str(self.root) + os.sep), "a rehearsal reads a VM settings file of its own box, never the real one"
         assert (env["PATH"] == str(self.bin) or env["PATH"].startswith(str(self.bin) + ":")
                 or env["PATH"] == str(self.root / "tools")), "the fakes come first"
         return env
@@ -428,6 +430,11 @@ def login_forward(box: Box, node: str = "node01.example", port: int = 43211) -> 
             "-o", "ConnectTimeout=10", "-o", "GatewayPorts=no", "-L", "{}:{}:{}".format(box.port, node, port), LOGIN]
 
 
+def host_forward(box: Box, port: int = 43211) -> List[str]:
+    return ["-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
+            "-o", "ConnectTimeout=10", "-o", "GatewayPorts=no", "-L", "{}:127.0.0.1:{}".format(box.port, port), LOGIN]
+
+
 def reads(box: Box) -> List[List[str]]:
     """The calls of `ssh LOGIN cat chat_sessions/endpoint` so far: the first read of each attempt, and every re-read."""
     return [c for c in box.calls("ssh") if "-N" not in c]
@@ -520,6 +527,101 @@ def test_via_login_forwards_to_the_node_from_the_login_node_and_says_what_it_nee
     notes = [l for l in done.lines if "BIND" in l]
     assert len(notes) == 1 and "127.0.0.1" in notes[0] and "token" in notes[0] and "R6" in notes[0], done.out
     assert [l for l in done.lines if "forwarding" in l and "via login" in l]
+
+
+def test_via_host_forwards_to_loopback_on_the_login_host_whatever_host_the_endpoint_names(box):
+    box.read(box.endpoint(host="node01.example", port=43211, mode="private"))
+    box.forward("0")
+    done = box.run(TUNNEL, MAX_ATTEMPTS="1", VIA="host")
+    assert done.rc == 0, done.out
+    assert box.calls("ssh") == [READ, host_forward(box)]
+    forward = box.calls("ssh")[1]
+    assert "-J" not in forward and not [a for a in forward if "known_hosts" in a or "StrictHostKeyChecking" in a or "@" in a]
+    assert "node01.example" not in forward, "the endpoint's host is logged, never a target"
+    (line,) = [l for l in done.lines if "forwarding" in l]
+    assert re.match(STAMPED + r"forwarding localhost:{} -> node01\.example:43211 via host \(mode private\)$".format(box.port), line), done.out
+    assert not [l for l in done.lines if "BIND" in l], "the note is for VIA=login"
+
+
+def test_via_host_needs_no_cluster_user_and_ignores_a_bad_one(box):
+    box.read(box.endpoint())
+    box.forward("0")
+    for user in (None, "a b"):
+        done = box.run(TUNNEL, MAX_ATTEMPTS="1", VIA="host", CLUSTER_USER=user)
+        assert done.rc == 0, done.out
+    assert box.calls("ssh") == [READ, host_forward(box)] * 2
+    box.run(TUNNEL, MAX_ATTEMPTS="1", CLUSTER_USER=None)        # jump still needs one
+    assert len(box.calls("ssh")) == 4, "refused before anything was asked"
+
+
+def test_via_host_defaults_login_to_vm_host_never_to_cluster_host(box):
+    cluster, vm = box.root / "cluster.env", box.root / "vm.env"
+    cluster.write_text("CLUSTER_HOST=settings-login.invalid\nCLUSTER_USER=settings.user\n")
+    vm.write_text('# the vm\nexport VM_HOST="vm-host.invalid"   # a comment\nVM_REPO=/srv/repo\n')
+    box.read(box.endpoint())
+    box.forward("0")
+    done = box.run(TUNNEL, MAX_ATTEMPTS="1", VIA="host", LOGIN=None, CHAT_CLUSTER_ENV=str(cluster), CHAT_VM_ENV=str(vm))
+    read, forward = box.calls("ssh")
+    assert done.rc == 0 and read == [("vm-host.invalid" if a == LOGIN else a) for a in READ], done.out
+    assert forward[-1] == "vm-host.invalid" and "settings-login.invalid" not in forward
+
+
+def test_via_host_without_login_or_vm_host_stops_with_status_2_and_runs_no_ssh(box):
+    cluster, vm = box.root / "cluster.env", box.root / "vm.env"
+    cluster.write_text("CLUSTER_HOST=settings-login.invalid\n")
+    vm.write_text("VM_REPO=/srv/repo\n")
+    message = "LOGIN is not set: set LOGIN, or VM_HOST in scripts/chat_vm.env (copy scripts/chat_vm.env.example)"
+    for vm_file in (vm, box.root / "absent-vm.env"):
+        done = box.run(TUNNEL, VIA="host", LOGIN=None, CHAT_CLUSTER_ENV=str(cluster), CHAT_VM_ENV=str(vm_file))
+        assert done.rc == 2 and done.lines == [message], done.out
+    assert box.calls("ssh") == []
+
+
+def test_via_host_explicit_login_wins_over_vm_host(box):
+    vm = box.root / "vm.env"
+    vm.write_text("VM_HOST=vm-host.invalid\n")
+    box.read(box.endpoint())
+    box.forward("0")
+    done = box.run(TUNNEL, MAX_ATTEMPTS="1", VIA="host", CHAT_VM_ENV=str(vm))
+    assert done.rc == 0 and box.calls("ssh") == [READ, host_forward(box)], done.out
+
+
+@pytest.mark.parametrize("via", ["jump", "login"])
+def test_jump_and_login_default_login_to_cluster_host_and_ignore_vm_host(box, via):
+    cluster, vm = box.root / "cluster.env", box.root / "vm.env"
+    cluster.write_text("CLUSTER_HOST=settings-login.invalid\n")
+    vm.write_text("VM_HOST=vm-host.invalid\n")
+    box.read(box.endpoint())
+    box.forward("0")
+    done = box.run(TUNNEL, MAX_ATTEMPTS="1", VIA=via, LOGIN=None, CHAT_CLUSTER_ENV=str(cluster), CHAT_VM_ENV=str(vm))
+    read, forward = box.calls("ssh")
+    assert done.rc == 0 and "settings-login.invalid" in read and "settings-login.invalid" in forward, done.out
+    assert "vm-host.invalid" not in read and "vm-host.invalid" not in forward
+
+
+def test_via_host_hint_names_the_service_status_command(box):
+    done = box.run(TUNNEL, MAX_ATTEMPTS="2", VIA="host")
+    hints = [l for l in done.lines if "no endpoint yet" in l]
+    assert len(hints) == 2 and all(re.match(
+        STAMPED + re.escape("no endpoint yet; is the service running? (bash scripts/vm_remote.sh status)") + "$", l) for l in hints), done.out
+    assert not [l for l in done.lines if "squeue" in l]
+    box.read("", rc=255)
+    done = box.run(TUNNEL, MAX_ATTEMPTS="1", VIA="host")
+    (line,) = [l for l in done.lines if "no endpoint yet" in l]
+    assert re.match(STAMPED + re.escape("no endpoint yet; is the service running? (bash scripts/vm_remote.sh status)")
+                    + r"; ssh itself failed \(exit 255\)", line), line
+    assert box.calls("ssh")[-1] == READ and not forwards(box)
+
+
+def test_via_host_follows_a_changed_endpoint_to_the_new_port(box):
+    box.read(box.endpoint(host="vm01", port=43001), n=1)
+    box.read(box.endpoint(host="vm01", port=43002))
+    box.forward("sleep", n=1)
+    box.forward("0", n=2)
+    done = box.run(TUNNEL, timeout=20, VIA="host", RECHECK_S="1", RETRY_SLEEP="30", MAX_ATTEMPTS="2")
+    assert done.rc == 0, done.out
+    assert box.calls("ssh") == [READ, host_forward(box, 43001), READ, READ, host_forward(box, 43002)], done.out
+    assert not alive(forward_pid(box, 1)) and [l for l in done.lines if "endpoint changed: vm01:43001" in l]
 
 
 def test_the_jump_path_keeps_the_host_key_relaxation_to_itself_and_to_the_nodes_file(box):
@@ -619,10 +721,10 @@ def test_the_forward_is_never_bound_beyond_loopback_whatever_the_ssh_config_says
     """R6: a `GatewayPorts yes` in ~/.ssh/config would bind the forwarded port on every interface; the command line wins over the config."""
     box.read(box.endpoint())
     box.forward("0")
-    for via in ("jump", "login"):
+    for via in ("jump", "login", "host"):
         box.run(TUNNEL, MAX_ATTEMPTS="1", VIA=via)
     forwards = [c for c in box.calls("ssh") if "-N" in c]
-    assert len(forwards) == 2 and all("GatewayPorts=no" in c for c in forwards)
+    assert len(forwards) == 3 and all("GatewayPorts=no" in c for c in forwards)
 
 
 def test_the_tunnel_reads_the_file_the_server_writes(box, monkeypatch):
@@ -1104,8 +1206,9 @@ def test_ctrl_c_on_a_terminal_during_the_re_check_loop_stops_tunnel_sh_and_the_s
 
 RECHECK_MESSAGE = "RECHECK_S must be a whole number of seconds from 1 to 99999"
 BAD_SETTINGS = [
-    ({"VIA": "tunnel"}, "VIA must be jump or login"),
-    ({"VIA": "Jump"}, "VIA must be jump or login"),
+    ({"VIA": "tunnel"}, "VIA must be jump, login or host"),
+    ({"VIA": "Jump"}, "VIA must be jump, login or host"),
+    ({"VIA": "foo"}, "VIA must be jump, login or host"),
     ({"LOCAL_PORT": "abc"}, BAD_PORT),
     ({"LOCAL_PORT": "0"}, BAD_PORT),
     ({"LOCAL_PORT": "65536"}, BAD_PORT),

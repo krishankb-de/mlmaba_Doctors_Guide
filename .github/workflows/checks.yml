@@ -62,7 +62,7 @@ jobs:
           # project skill's own SKILL.md and VERSION (instructions anyone who clones the repository uses); its local settings, locks and anything
           # else stay home.
           local_only() {
-            grep -E '^(\.local/|\.staging/|CLAUDE\.local\.md$|scripts/chat_cluster\.env$|\.sync_stamp$|venv/|\.venv/|graphify-out/|node_modules/|\.claude/)|(^|/)\.?physionet_session$' \
+            grep -E '^(\.local/|\.staging/|CLAUDE\.local\.md$|scripts/chat_cluster\.env$|scripts/chat_vm\.env$|\.sync_stamp$|venv/|\.venv/|graphify-out/|node_modules/|\.claude/)|(^|/)\.?physionet_session$' \
               | grep -v -x -E '\.claude/settings\.json|\.claude/skills/[A-Za-z0-9_-]+/(SKILL\.md|VERSION)' || true
           }
           # HEAD = the commit's parent (unborn for a root commit) and the index = the commit: the hook then sees what committing it

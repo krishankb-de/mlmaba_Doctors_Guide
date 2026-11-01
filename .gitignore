@@ -109,6 +109,7 @@ legacy_gallery_hashes.txt
 
 # The per-user cluster settings, and the stamp `chat_remote.sh sync` writes before each rsync.
 scripts/chat_cluster.env
+scripts/chat_vm.env
 .sync_stamp
 
 # Playwright (npm, local only): the scaffold `npm init playwright` writes, its output, and the workflow it adds (the only CI here is

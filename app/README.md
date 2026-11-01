@@ -12,7 +12,7 @@ there, through `chat_remote.sh submit` or by hand with `sbatch`, carries them.
 
 ## 1. The data rules (MIMIC-CXR DUA)
 
-- **Everything MIMIC-derived stays on the cluster.** That covers:
+- **Everything MIMIC-derived stays on the cluster or on your VM (section 10).** That covers:
   - the dataset, under `dataset/mimic_full`;
   - the checkpoints: `outputs/` of the thesis checkout, and `models/` in `CHAT_HOME`;
   - the server's home, `CHAT_HOME` (by default `/sc/home/$USER/chat_sessions/`): the gallery, the session database, uploads and logs.
@@ -184,6 +184,8 @@ How public mode works:
 
 ## 6. Stop, restart, requeue
 
+This section is the cluster job. For the VM service, see section 10.
+
 - **Stop the server:** `ssh "$CLUSTER_HOST" scancel <jobid>`.
   - The API removes the endpoint file first.
   - It then ends a running turn as an error with `server_restart`, and exits 0.
@@ -204,7 +206,9 @@ How public mode works:
 - **Deleting a session in the page** hides it and removes its uploaded images at once. Its stored rows stay until the session reaches its retention age. On a private server, those rows include the event log with the report text.
 - **A saved export** (`exports/`, written by `POST /v1/sessions/{id}/export/save`, private mode only) is deleted once the time in its file name is older than the private retention days: 45 by default, or the server's own `RETENTION_DAYS` on a private server. Its session's age does not matter. A leftover temporary file from an interrupted save is deleted after 1 day. The sweep removes only file names the save route writes: it never follows a symbolic link and never enters a subdirectory.
 
-## 8. What is stored (all on the cluster, under `CHAT_HOME`)
+## 8. What is stored (on the cluster or the VM, under `CHAT_HOME`)
+
+The VM keeps the same layout (section 10).
 
 | Path | What |
 |---|---|
@@ -246,3 +250,93 @@ The turn streams Server-Sent Events, in this order:
 3. `message_stop`, which carries the report.
 
 While no event comes, a `: ping` comment arrives every 15 s. Every route is documented at `$B/docs`.
+
+## 10. Run it on a VM (always on, private)
+
+Same server, same wrapper (`scripts/serve_chat_h100.sh`), run as a systemd service on a Linux VM instead of a SLURM job.
+- **Why.** No SLURM queue: the server stays up, and systemd restarts it on failure and once a day (see Restarts below).
+- **Private only.** It binds `127.0.0.1` in private mode. You reach it through an SSH tunnel on local port 8020. Nothing else is opened.
+- **Settings.** `scripts/chat_vm.env` (git-ignored; copy `scripts/chat_vm.env.example`):
+  - `VM_HOST`: the ssh alias of the VM;
+  - `VM_REPO`: the absolute path of the VM's copy of this repository;
+  - `VM_SERVICE`: the systemd unit name (`cxr-chat`).
+
+**One-time setup.**
+
+1. Fill in `scripts/chat_vm.env`, then copy the tree: `bash scripts/vm_remote.sh sync`.
+2. Add a swap file on the VM (see Memory below), with your own sudo.
+3. Mirror the image path. The gallery's parquets hold the resolved absolute image paths, so the images must sit at the same resolved absolute path on the VM as on the cluster. Create that directory on the VM.
+4. Copy the inputs from the cluster to the VM, **directly between the two, never through the laptop**. Names are relative to the cluster checkout or to `CHAT_HOME`:
+   - `outputs/h100_report_gen_m3_tower13d_s42/`: `checkpoints/last.ckpt` (the m3 checkpoint) and `run_metadata.json`;
+   - `models/report_gen_m3_eos_s42/` in `CHAT_HOME`: `checkpoints/last.ckpt`, `DONE`, `run_metadata.json`;
+   - `gallery/g13d_m3_v1/` in `CHAT_HOME`;
+   - `results/report_gen_m3_test_split_s42/` and `results/retrieval_floor_test_split/`: the published dumps;
+   - the images, at the mirrored path from step 3.
+5. On the VM, in `VM_REPO`:
+   ```bash
+   bash scripts/vm_setup.sh install    # uv, CPython 3.11, .venv and .venv_chexbert (CPU torch), overlays, the CheXbert weights, gpt2 and BiomedCLIP prefetch; creates logs/chat_server_vm.log
+   bash scripts/vm_setup.sh check      # inputs present; prints "images present N/M", counts only
+   ```
+   Do not go on until `check` ends well and `images present N/M` shows N equal to M. A smaller N means the mirrored path is wrong.
+   `install` also fetches the public CheXbert weights (StanfordAIMI/RRG_scorers, sha256-pinned), because f1chexbert's own downloader fails with the pinned huggingface_hub.
+   If a pin file changes later, `install` stops with an ERROR: move the venv aside and run it again.
+6. Install and start the unit:
+   ```bash
+   bash scripts/vm_setup.sh unit > ~/cxr-chat.service && sudo install -m 0644 ~/cxr-chat.service /etc/systemd/system/cxr-chat.service && sudo systemctl daemon-reload
+   sudo systemctl enable --now cxr-chat       # the first time; after a later change: bash scripts/vm_remote.sh restart
+   ```
+   - Render to a file first and install it only when the render succeeded. A refused render must never replace a working unit: `unit` prints its error on stderr and writes nothing to stdout.
+   - The file name follows `VM_SERVICE`. Run `unit` as your own user, not root. It refuses a `CHAT_HOME` other than `$HOME/chat_sessions`.
+   - Use the same `SCRATCH_ROOT`, `GALLERY` and `MODELS` for `install`, `check` and `unit`. Only `unit` writes `MODELS` into the service. `check` checks the m3 and m3eos inputs. Compare mode needs `13d` and its checkpoint, which the copy list above does not include.
+7. Measure the drift note. `unit` writes a default `DRIFT_NOTE` that says the CPU decode was not probed. Once the service runs, on the VM:
+   ```bash
+   venv/bin/python scripts/chat_realturn_probe.py http://localhost:8020 --rows 0-19   # numbers only; published_equal true: every live report equals the published GPU dump
+   ```
+   Then render the unit again with `DRIFT_NOTE="CPU decode; matched the published GPU decode on 20/20 probe studies"` (use the count you measured) and install it as in step 6.
+
+Defaults on the VM: `CHAT_HOME=$HOME/chat_sessions`, `SCRATCH_ROOT=$HOME/vm_scratch`, `MODELS=m3eos,m3`. `vm_setup.sh` is additive and idempotent, and needs no sudo.
+
+**What the unit sets.**
+- Private mode, `BIND=127.0.0.1`, and `CORS_ORIGINS` pinned empty.
+- The thread count is the VM's CPU count (`SLURM_CPUS_PER_TASK`).
+
+**Every day**, from the laptop:
+
+```bash
+bash scripts/vm_remote.sh sync                                   # rsync the tree to VM_REPO (never --delete)
+bash scripts/vm_remote.sh restart                                # needed after a code change
+bash scripts/vm_remote.sh status                                 # the unit's state (no sudo)
+bash scripts/vm_remote.sh summary logs/chat_server_vm.log        # start-up lines, same filter as chat_remote.sh
+bash scripts/vm_remote.sh healthz                                # the server's /healthz
+bash scripts/vm_remote.sh mem                                    # memory numbers in MiB
+VIA=host LOCAL_PORT=8020 bash app/tunnel/tunnel.sh              # LOGIN defaults to VM_HOST; then open http://localhost:8020
+```
+
+- Files under `app/static` are read on every request: after a sync they need no restart.
+- Any other change needs `restart`. A restart ends a running turn as an error with `server_restart`, as on the cluster.
+- `healthz` exits 1 when the server answers with an error. It needs curl 7.76 or newer on the VM (Ubuntu 24.04 has 8.5).
+- `VIA=host` forwards to `127.0.0.1:PORT` on the VM itself. After a restart, the tunnel re-attaches without help.
+- `vm_remote.sh` prints no log and no file. `start`, `stop` and `restart` use `sudo -n systemctl`, so the VM user needs passwordless sudo for that command. `status` needs none.
+
+**Data rules on the VM.** The same as the cluster (section 1).
+- MIMIC-derived files stay on the cluster or the VM. They never go to the laptop.
+- Read logs only through `bash scripts/vm_remote.sh summary logs/chat_server_vm.log`.
+- The VM is not backed up. `CHAT_HOME` holds the session database; the inputs can be copied again from the cluster.
+- Only one server uses a `CHAT_HOME` at a time. Never start the cluster job and the VM service on the same home.
+
+**Restarts.**
+- `Restart=always`, 30 s apart. A start that keeps failing stops after 5 tries in an hour. After you fix the cause, run `sudo systemctl reset-failed cxr-chat` on the VM, then `bash scripts/vm_remote.sh start`.
+- `RuntimeMaxSec=1d`: the unit restarts once a day, like the cluster's 24 h job cycle. A turn running at that moment ends as a `server_restart` error, as on a requeue.
+
+**Memory.** Two models served at once peaked at up to 13 GiB RSS on the cluster. Give the VM a swap file for that peak.
+- The unit sets `MemoryHigh` and `MemoryMax` to 75% and 90% of the VM's RAM, so the excess goes to swap before any OOM kill. Override them with `MEMORY_HIGH` and `MEMORY_MAX` when you run `unit`.
+- If it is still too tight, set `MODELS=m3eos` when you run `unit` to serve one model, then install the unit as in step 6 and run `restart`.
+- Compare mode needs `13d` in `MODELS`. It is off with `m3eos` alone and with the default `m3eos,m3`.
+
+**Stop it.**
+
+```bash
+bash scripts/vm_remote.sh stop                  # the unit stops; the API ends a running turn as server_restart
+```
+
+To keep it from starting at boot, run `sudo systemctl disable cxr-chat` on the VM. Stop the tunnel with Ctrl-C.

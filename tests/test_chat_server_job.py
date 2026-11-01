@@ -273,13 +273,14 @@ class ServeBox(wr.JobBox):
     def set_mode(self, name: str, value: str) -> None:
         (self.stubs / name).write_text(value + "\n")
 
-    def start(self, script: str = "", **extra_env) -> Running:
-        """Start the wrapper (or another script of the tree's scripts directory, for the cleanup's own test) in a session of its own."""
+    def start(self, script: str = "", cwd=None, **extra_env) -> Running:
+        """Start the wrapper (or another script of the tree's scripts directory, for the cleanup's own test) in a session of its own, in the
+        directory `cwd` (default: the tree's root, outside the repo, as sbatch runs it)."""
         env = self.base_env()
         env.update(extra_env)
         env = {k: v for k, v in env.items() if v is not None}
         log = open(str(self.root / "job.log"), "ab")
-        proc = subprocess.Popen([wr.BASH, str(self.repo / "scripts" / (script or self.WRAPPER))], cwd=str(self.root), env=env,
+        proc = subprocess.Popen([wr.BASH, str(self.repo / "scripts" / (script or self.WRAPPER))], cwd=str(cwd or self.root), env=env,
                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         run = Running(proc, log)
         self.runs.append(run)
@@ -401,6 +402,37 @@ def test_a_start_and_a_stop_print_only_safe_lines_and_keep_the_raw_output_in_cha
     assert "SECRET" not in text and "12345678" not in text and "/sc/home/someone" not in text
     assert "SECRET REPORT TEXT" in box.server_log(), "the API's stderr is in the server log under CHAT_HOME"
     assert "SECRET HF progress" in (box.chat / "logs" / "labeler_{}.log".format(JOB_ID)).read_text(), "so are both streams of the labeller"
+
+
+def test_the_wrapper_runs_as_the_systemd_unit_runs_it_without_a_slurm_job(tmp_path):
+    """scripts/vm/cxr-chat.service.in starts the wrapper with no SLURM_JOB_ID, SLURM_SUBMIT_DIR naming the repo, SLURM_CPUS_PER_TASK as the
+    thread count and the repo as the working directory. The log names then end in `local`, the banner says job=?, and a SIGTERM to the
+    wrapper alone (KillMode=mixed) is the whole drain: the wrapper's trap stops the API and the labeller itself."""
+    box = ServeBox(tmp_path)
+    try:
+        run = box.start(cwd=box.repo, SLURM_JOB_ID=None, SLURM_CPUS_PER_TASK="4", SLURM_SUBMIT_DIR=str(box.repo), MODE="private",
+                        BIND="127.0.0.1", CORS_ORIGINS="")
+        box.wait_ready(run)
+        run.signal()
+        box.stopped_cleanly(run)
+        lines = box.job_lines()
+        assert lines[0] == SYNC_LINE and "=== labeller up ===" in lines and "[server] stub api up" in lines
+        node = [l for l in lines if l.startswith("=== chat server: ")]
+        assert len(node) == 1 and re.fullmatch(
+            r"=== chat server: node=\S+ mode=private bind=127\.0\.0\.1 device=cpu gallery=g13d_m3_v1 job=\? ===", node[0]), node
+        assert lines.index("=== signal received: stopping ===") < lines.index("[server] stub api: SIGTERM")
+        assert lines[-1] == "=== chat server stopped ==="
+        assert not [l for l in lines if not LINE_OK.match(l)], lines
+        logs = sorted(p.name for p in (box.chat / "logs").iterdir())
+        assert logs == ["labeler_local.log", "server_local.log"], logs
+        assert "SECRET REPORT TEXT" in (box.chat / "logs" / "server_local.log").read_text()
+        (call,) = box.api_calls()
+        opts = pairs(call[2:])
+        assert opts["--threads"] == "4" and opts["--mode"] == "private" and opts["--host"] == "127.0.0.1" and "--cors-origin" not in call
+        env = box.read_json("api.env")
+        assert env["OMP_NUM_THREADS"] == "4" and env["MKL_NUM_THREADS"] == "4" and env["cwd"] == os.path.realpath(str(box.repo))
+    finally:
+        box.cleanup()
 
 
 def test_the_api_is_started_with_the_plans_arguments_and_the_labeller_url(box):

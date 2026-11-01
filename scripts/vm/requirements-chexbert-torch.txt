@@ -1,0 +1,2 @@
+# torch for the CheXbert venv: the cluster's own CPU build. Installed by scripts/vm_setup.sh from https://download.pytorch.org/whl/cpu, without dependencies.
+torch==2.13.0+cpu
